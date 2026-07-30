@@ -30,9 +30,39 @@ impl Default for ScreenContext {
 pub fn execute_with_context(name: &str, arguments: &str, screen_context: ScreenContext) -> String {
     let result = execute_inner(name, arguments, screen_context)
         .unwrap_or_else(|error| json!({"ok": false, "error": format!("{error:#}")}));
+    let result = apply_assistant_reply_policy(name, result);
     serde_json::to_string(&result).unwrap_or_else(|error| {
         format!(r#"{{"ok":false,"error":"Could not encode tool result: {error}"}}"#)
     })
+}
+
+fn is_pointer_tool(name: &str) -> bool {
+    matches!(name, "move_pointer" | "click_screen")
+}
+
+fn apply_assistant_reply_policy(name: &str, mut result: Value) -> Value {
+    if !is_pointer_tool(name) {
+        return result;
+    }
+    let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    if let Some(object) = result.as_object_mut() {
+        if ok {
+            object.insert(
+                "assistant_reply".to_owned(),
+                Value::String("Done".to_owned()),
+            );
+            object.insert("assistant_reply_exact".to_owned(), Value::Bool(true));
+            object.insert("speak_before_tool".to_owned(), Value::Bool(false));
+        } else {
+            object.insert(
+                "assistant_reply_policy".to_owned(),
+                Value::String(
+                    "Briefly report the real pointer-tool failure; do not say Done".to_owned(),
+                ),
+            );
+        }
+    }
+    result
 }
 
 fn execute_inner(name: &str, arguments: &str, screen_context: ScreenContext) -> Result<Value> {
@@ -428,8 +458,10 @@ fn terminate_process_group(child_id: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ScreenContext, execute_with_context, map_click_to_global};
-    use serde_json::Value;
+    use super::{
+        ScreenContext, apply_assistant_reply_policy, execute_with_context, map_click_to_global,
+    };
+    use serde_json::{Value, json};
 
     #[test]
     fn bash_tool_returns_output_and_exit_code() {
@@ -450,6 +482,35 @@ mod tests {
         let result: Value = serde_json::from_str(&raw).expect("valid tool JSON");
         assert_eq!(result["ok"], false);
         assert!(result["error"].as_str().unwrap().contains("Unknown tool"));
+    }
+
+    #[test]
+    fn successful_pointer_result_requires_exact_done_reply() {
+        let result = apply_assistant_reply_policy("move_pointer", json!({"ok": true}));
+        assert_eq!(result["assistant_reply"], "Done");
+        assert_eq!(result["assistant_reply_exact"], true);
+        assert_eq!(result["speak_before_tool"], false);
+    }
+
+    #[test]
+    fn failed_pointer_result_forbids_done_reply() {
+        let result = apply_assistant_reply_policy(
+            "click_screen",
+            json!({"ok": false, "error": "permission denied"}),
+        );
+        assert!(
+            result["assistant_reply_policy"]
+                .as_str()
+                .unwrap()
+                .contains("do not say Done")
+        );
+        assert!(result.get("assistant_reply").is_none());
+    }
+
+    #[test]
+    fn non_pointer_result_is_not_forced_to_say_done() {
+        let result = apply_assistant_reply_policy("run_bash", json!({"ok": true}));
+        assert!(result.get("assistant_reply").is_none());
     }
 
     #[test]

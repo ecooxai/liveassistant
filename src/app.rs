@@ -4,7 +4,10 @@ use crate::{
     codex_account::{self, CodexAccountInfo, CodexUsageInfo, RateLimitWindow},
     live_pointer,
     media::{self, Attachment},
-    realtime::{Command, ConnectOptions, Event, RealtimeBackend, RealtimeClient, ToolOutput},
+    realtime::{
+        Command, ConnectOptions, Event, RealtimeBackend, RealtimeClient, ToolOutput,
+        shared_system_prompt,
+    },
     tools,
 };
 use anyhow::Context as _;
@@ -513,6 +516,8 @@ pub struct LiveAssistantApp {
     speaker: Option<Speaker>,
     settings: Settings,
     api_key: String,
+    active_system_prompt: Option<String>,
+    active_system_prompt_backend: Option<RealtimeBackend>,
     show_settings: bool,
     state: ConnectionState,
     status: String,
@@ -656,6 +661,8 @@ impl LiveAssistantApp {
             speaker,
             settings,
             api_key,
+            active_system_prompt: None,
+            active_system_prompt_backend: None,
             show_settings: false,
             state: ConnectionState::Offline,
             status: "Ready".to_owned(),
@@ -769,15 +776,23 @@ impl LiveAssistantApp {
         };
         match self.resolve_credentials() {
             Ok((api_key, chatgpt_account_id)) => {
+                let system_prompt = shared_system_prompt(&self.settings.instructions, screen_info);
                 let options = ConnectOptions {
                     backend: self.settings.backend,
                     api_key,
                     chatgpt_account_id,
                     model: self.settings.model.clone(),
                     voice: self.settings.voice.clone(),
-                    instructions: self.settings.instructions.clone(),
+                    system_prompt: system_prompt.clone(),
                     screen_info,
                 };
+                eprintln!(
+                    "[live-assistant prompt] backend={:?} bytes={} shared=true pointer_reply=Done exact=true",
+                    self.settings.backend,
+                    system_prompt.len()
+                );
+                self.active_system_prompt = Some(system_prompt);
+                self.active_system_prompt_backend = Some(self.settings.backend);
                 let _ = self.realtime.commands.send(Command::Connect(options));
                 self.state = ConnectionState::Connecting;
                 self.status = "Connecting…".to_owned();
@@ -796,6 +811,8 @@ impl LiveAssistantApp {
             let _ = speaker.clear();
         }
         self.state = ConnectionState::Offline;
+        self.active_system_prompt = None;
+        self.active_system_prompt_backend = None;
         self.active_response_id = None;
         self.last_assistant_item_id = None;
         self.active_assistant_message = None;
@@ -902,6 +919,8 @@ impl LiveAssistantApp {
                         let _ = speaker.clear();
                     }
                     self.state = ConnectionState::Offline;
+                    self.active_system_prompt = None;
+                    self.active_system_prompt_backend = None;
                     self.active_response_id = None;
                     self.last_assistant_item_id = None;
                     self.active_assistant_message = None;
@@ -1305,6 +1324,8 @@ impl LiveAssistantApp {
                     self.error = Some(message);
                     if self.state != ConnectionState::Live {
                         self.state = ConnectionState::Offline;
+                        self.active_system_prompt = None;
+                        self.active_system_prompt_backend = None;
                     }
                 }
             }
@@ -1821,6 +1842,55 @@ impl LiveAssistantApp {
                 ui.label("＋ Images & audio");
             });
         });
+    }
+
+    fn draw_active_system_prompt(&self, ui: &mut egui::Ui) {
+        let Some(prompt) = self.active_system_prompt.as_deref() else {
+            return;
+        };
+        egui::Frame::new()
+            .fill(Color32::from_rgb(239, 245, 252))
+            .stroke(Stroke::new(1.0, Color32::from_rgb(196, 211, 230)))
+            .corner_radius(9.0)
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("SYSTEM PROMPT · CURRENT CONNECTION")
+                            .small()
+                            .strong()
+                            .color(Color32::from_rgb(52, 83, 124)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new(match self.active_system_prompt_backend {
+                                Some(RealtimeBackend::OpenAiRealtime) => "OpenAI Realtime",
+                                Some(RealtimeBackend::CodexGptLive) => "GPT-Live",
+                                None => "Current connection",
+                            })
+                            .small()
+                            .weak(),
+                        );
+                    });
+                });
+                ui.add_space(5.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("active-system-prompt")
+                    .max_height(160.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(prompt)
+                                    .monospace()
+                                    .small()
+                                    .color(Color32::from_rgb(48, 57, 70)),
+                            )
+                            .selectable(true),
+                        );
+                    });
+            });
     }
 
     fn draw_messages(&mut self, ui: &mut egui::Ui) {
@@ -2822,6 +2892,10 @@ impl eframe::App for LiveAssistantApp {
                     .inner_margin(egui::Margin::symmetric(22, 18)),
             )
             .show(ctx, |ui| {
+                if self.active_system_prompt.is_some() {
+                    self.draw_active_system_prompt(ui);
+                    ui.add_space(12.0);
+                }
                 if self.messages.is_empty() {
                     self.draw_empty(ui);
                 } else {

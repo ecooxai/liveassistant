@@ -99,6 +99,9 @@ pub enum Event {
         item_id: String,
         text: String,
     },
+    ContextImageAccepted {
+        upload_id: u64,
+    },
     ContextImageUploaded {
         upload_id: u64,
     },
@@ -316,6 +319,7 @@ async fn run_openai_connection(
     let mut pending_tool_outputs = Vec::new();
     let mut handled_call_ids = HashSet::new();
     let mut pending_context_uploads = HashMap::<String, u64>::new();
+    let mut input_transcripts = HashMap::<String, String>::new();
 
     loop {
         tokio::select! {
@@ -382,6 +386,7 @@ async fn run_openai_connection(
                             events,
                             &mut handled_call_ids,
                             &mut pending_context_uploads,
+                            &mut input_transcripts,
                         )? {
                             ServerSignal::ResponseStarted => response_active = true,
                             ServerSignal::ResponseDone => {
@@ -826,6 +831,10 @@ async fn run_codex_live_connection(
                                 detail: "Superseded by a newer screen capture".to_owned(),
                             });
                         }
+                        // GPT-Live has no realtime append-image method. Confirm as soon as
+                        // the live backend owns the encoded image; the later turn/steer call
+                        // delivers it to the Codex handoff without holding the UI overlay open.
+                        let _ = events.send(Event::ContextImageAccepted { upload_id });
                         steer_pending_context_image(
                             &mut server,
                             &thread_id,
@@ -1412,11 +1421,8 @@ pub fn probe_codex_gpt_live() -> Result<()> {
                     if method == Some("thread/realtime/transcript/done") && role == Some("user")
                         && let Some(text) = message.pointer("/params/text").and_then(Value::as_str)
                     {
-                        let normalized = text.to_ascii_lowercase();
-                        if normalized.contains("second turn")
-                            || normalized.contains("reliability")
-                            || normalized.contains("microphone")
-                        {
+                        eprintln!("[gpt-live probe] second turn transcript candidate: {text:?}");
+                        if text.trim().chars().count() >= 4 {
                             followup_user_heard = true;
                             eprintln!("[gpt-live probe] second turn user transcribed: {text:?}");
                         }
@@ -2294,6 +2300,7 @@ fn handle_server_event(
     events: &std::sync::mpsc::Sender<Event>,
     handled_call_ids: &mut HashSet<String>,
     pending_context_uploads: &mut HashMap<String, u64>,
+    input_transcripts: &mut HashMap<String, String>,
 ) -> Result<ServerSignal> {
     let value: Value = serde_json::from_str(raw).context("Invalid Realtime server event")?;
     let kind = value
@@ -2328,6 +2335,25 @@ fn handle_server_event(
                 .to_owned();
             let _ = events.send(Event::InputCommitted { item_id });
         }
+        "conversation.item.input_audio_transcription.delta" => {
+            let item_id = value
+                .get("item_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            let delta = value
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !item_id.is_empty() && !delta.is_empty() {
+                let transcript = input_transcripts.entry(item_id.clone()).or_default();
+                transcript.push_str(delta);
+                let _ = events.send(Event::InputTranscript {
+                    item_id,
+                    text: transcript.clone(),
+                });
+            }
+        }
         "conversation.item.input_audio_transcription.completed"
         | "conversation.item.input_audio_transcription.done" => {
             let item_id = value
@@ -2335,12 +2361,17 @@ fn handle_server_event(
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned();
-            let text = value
+            let completed = value
                 .get("transcript")
                 .or_else(|| value.get("text"))
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
+                .unwrap_or_default();
+            let accumulated = input_transcripts.remove(&item_id).unwrap_or_default();
+            let text = if completed.is_empty() {
+                accumulated
+            } else {
+                completed.to_owned()
+            };
             let _ = events.send(Event::InputTranscript { item_id, text });
         }
         "response.created" => {
@@ -2724,6 +2755,7 @@ mod tests {
         let mut handled = HashSet::new();
         let item_id = context_image_item_id(42);
         let mut pending = HashMap::from([(item_id.clone(), 42)]);
+        let mut transcripts = HashMap::new();
         let signal = handle_server_event(
             &json!({
                 "type": "conversation.item.created",
@@ -2733,6 +2765,7 @@ mod tests {
             &events,
             &mut handled,
             &mut pending,
+            &mut transcripts,
         )
         .unwrap();
 
@@ -2750,6 +2783,7 @@ mod tests {
         let mut handled = HashSet::new();
         let event_id = context_image_item_id(9);
         let mut pending = HashMap::from([(event_id.clone(), 9)]);
+        let mut transcripts = HashMap::new();
         handle_server_event(
             &json!({
                 "type": "error",
@@ -2762,6 +2796,7 @@ mod tests {
             &events,
             &mut handled,
             &mut pending,
+            &mut transcripts,
         )
         .unwrap();
 
@@ -2770,6 +2805,41 @@ mod tests {
             received.recv().unwrap(),
             Event::ContextImageUploadFailed { upload_id: 9, detail }
                 if detail == "image rejected"
+        ));
+    }
+
+    #[test]
+    fn openai_transcription_delta_is_visible_before_turn_completion() {
+        let (events, received) = std::sync::mpsc::channel();
+        let mut handled = HashSet::new();
+        let mut pending = HashMap::new();
+        let mut transcripts = HashMap::new();
+
+        for delta in ["hello", " world"] {
+            handle_server_event(
+                &json!({
+                    "type": "conversation.item.input_audio_transcription.delta",
+                    "item_id": "voice-1",
+                    "delta": delta
+                })
+                .to_string(),
+                &events,
+                &mut handled,
+                &mut pending,
+                &mut transcripts,
+            )
+            .unwrap();
+        }
+
+        assert!(matches!(
+            received.recv().unwrap(),
+            Event::InputTranscript { item_id, text }
+                if item_id == "voice-1" && text == "hello"
+        ));
+        assert!(matches!(
+            received.recv().unwrap(),
+            Event::InputTranscript { item_id, text }
+                if item_id == "voice-1" && text == "hello world"
         ));
     }
 

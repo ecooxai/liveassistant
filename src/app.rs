@@ -12,6 +12,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use eframe::egui::{self, Color32, RichText, Stroke};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     path::Path,
     sync::{
         Arc,
@@ -529,6 +530,7 @@ pub struct LiveAssistantApp {
     screenshot_capture_in_flight: Option<u64>,
     screenshot_message_index: Option<usize>,
     next_context_upload_id: u64,
+    captured_transcript_items: HashSet<String>,
     deferred_voice_response: bool,
     screenshot_result_tx: Sender<SpeechScreenshotResult>,
     screenshot_result_rx: Receiver<SpeechScreenshotResult>,
@@ -671,6 +673,7 @@ impl LiveAssistantApp {
             screenshot_capture_in_flight: None,
             screenshot_message_index: None,
             next_context_upload_id: 0,
+            captured_transcript_items: HashSet::new(),
             deferred_voice_response: false,
             screenshot_result_tx,
             screenshot_result_rx,
@@ -799,6 +802,7 @@ impl LiveAssistantApp {
         self.assistant_group_deadline = None;
         self.assistant_text_needs_separator = false;
         self.speech_screenshot_gate.end();
+        self.captured_transcript_items.clear();
         self.cancel_speech_screenshot();
         self.active_voice_message = None;
         self.tool_calls_running = 0;
@@ -902,6 +906,7 @@ impl LiveAssistantApp {
                     self.last_assistant_item_id = None;
                     self.active_assistant_message = None;
                     self.speech_screenshot_gate.end();
+                    self.captured_transcript_items.clear();
                     self.cancel_speech_screenshot();
                     self.active_voice_message = None;
                     self.tool_calls_running = 0;
@@ -1022,6 +1027,9 @@ impl LiveAssistantApp {
                         recent_voice_continuation_index(&self.messages, now)
                             .filter(|index| self.messages[*index].server_item_id.is_none())
                     });
+                    if self.speech_screenshot_gate.sent && !item_id.trim().is_empty() {
+                        self.captured_transcript_items.insert(item_id.clone());
+                    }
                     if let Some(index) = index {
                         register_voice_item(&mut self.messages[index], item_id, now);
                     }
@@ -1053,7 +1061,26 @@ impl LiveAssistantApp {
                     let continuing_existing_item =
                         !message_owns_voice_item(&self.messages[index], &item_id)
                             && !self.messages[index].text.trim().is_empty();
+                    let transcript_has_text = !text.trim().is_empty();
+                    let transcript_key = if item_id.trim().is_empty() {
+                        format!("local-transcript-turn-{}", self.speech_turn_id)
+                    } else {
+                        item_id.clone()
+                    };
                     update_voice_transcript(&mut self.messages[index], item_id, text, now);
+                    if transcript_has_text
+                        && !self.captured_transcript_items.contains(&transcript_key)
+                    {
+                        let already_captured = self.speech_screenshot_gate.sent;
+                        let capture_started = if already_captured {
+                            false
+                        } else {
+                            self.start_speech_screenshot(ctx, index, "first-transcript")
+                        };
+                        if already_captured || capture_started {
+                            self.captured_transcript_items.insert(transcript_key);
+                        }
+                    }
                     if continuing_existing_item {
                         eprintln!(
                             "[live-assistant user-group] merged transcript continuation into message={} window_seconds={}",
@@ -1063,6 +1090,15 @@ impl LiveAssistantApp {
                     }
                     self.status = "Mic on · Hearing you…".to_owned();
                     self.should_scroll = true;
+                }
+                Event::ContextImageAccepted { upload_id } => {
+                    if let Some(image) = self.context_image_mut(upload_id) {
+                        image.finish_upload();
+                        self.status = "Mic on · Hearing you… · Screen queued".to_owned();
+                        self.should_scroll = true;
+                        ctx.request_repaint();
+                        eprintln!("[live-assistant image] backend accepted upload_id={upload_id}");
+                    }
                 }
                 Event::ContextImageUploaded { upload_id } => {
                     if let Some(image) = self.context_image_mut(upload_id) {
@@ -1078,6 +1114,7 @@ impl LiveAssistantApp {
                             "Screen uploaded".to_owned()
                         };
                         self.should_scroll = true;
+                        ctx.request_repaint();
                         eprintln!("[live-assistant image] upload confirmed upload_id={upload_id}");
                     }
                 }
@@ -1088,6 +1125,7 @@ impl LiveAssistantApp {
                     self.error = Some(format!("Screenshot upload failed: {detail}"));
                     self.status = "Screenshot upload failed".to_owned();
                     self.should_scroll = true;
+                    ctx.request_repaint();
                     eprintln!(
                         "[live-assistant image] upload failed upload_id={upload_id}: {detail}"
                     );
@@ -1185,6 +1223,9 @@ impl LiveAssistantApp {
                 }
                 Event::AssistantDone { response_id } => {
                     if self.response_is_active(&response_id) {
+                        if let Some(speaker) = &mut self.speaker {
+                            speaker.finish_assistant_response();
+                        }
                         self.active_response_id = None;
                         self.touch_assistant_group(Instant::now());
                         if self.tool_calls_running > 0 {
@@ -1554,42 +1595,34 @@ impl LiveAssistantApp {
         }
     }
 
-    fn maybe_send_speech_screenshot(&mut self, ctx: &egui::Context) {
+    fn start_speech_screenshot(
+        &mut self,
+        ctx: &egui::Context,
+        message_index: usize,
+        trigger: &'static str,
+    ) -> bool {
         if self.state != ConnectionState::Live
             || !self.settings.send_screenshot
             || self.screenshot_capture_in_flight.is_some()
+            || self.speech_screenshot_gate.sent
         {
-            return;
+            return false;
         }
-        let (server_speech_is_active, loud_speech_samples) = self
-            .microphone
-            .as_ref()
-            .map(|microphone| (microphone.in_speech(), microphone.loud_speech_samples()))
-            .unwrap_or_default();
-
-        // GPT-Live V3 often starts streaming transcript deltas without a dedicated
-        // speech_started item. Open the local user turn from the AEC microphone after
-        // one continuous second above the loud threshold, then capture immediately.
-        if !self.speech_screenshot_gate.speech_active
-            && loud_speech_samples > SPEECH_SCREENSHOT_SAMPLE_TARGET
-        {
-            self.ensure_active_voice_message();
-        }
-        let speech_is_active = server_speech_is_active || self.active_voice_message.is_some();
-        if !self
-            .speech_screenshot_gate
-            .should_capture(loud_speech_samples, speech_is_active)
-        {
-            return;
+        if !self.speech_screenshot_gate.speech_active {
+            self.speech_turn_id = self.speech_turn_id.wrapping_add(1);
+            self.speech_screenshot_gate.begin();
         }
 
         self.speech_screenshot_gate.mark_sent();
-        let message_index = self.ensure_active_voice_message();
         let turn_id = self.speech_turn_id;
         self.screenshot_capture_in_flight = Some(turn_id);
         self.screenshot_message_index = Some(message_index);
         self.status = "Mic on · Hearing you… · Capturing screen".to_owned();
         self.should_scroll = true;
+        eprintln!(
+            "[live-assistant image] capture triggered trigger={} turn={} message={}",
+            trigger, turn_id, message_index
+        );
 
         let target_width = self.settings.screenshot_width;
         let target_height = self.settings.screenshot_height;
@@ -1608,6 +1641,39 @@ impl LiveAssistantApp {
             let _ = result_tx.send(SpeechScreenshotResult { turn_id, result });
             repaint.request_repaint();
         });
+        true
+    }
+
+    fn maybe_send_speech_screenshot(&mut self, ctx: &egui::Context) {
+        if self.state != ConnectionState::Live
+            || !self.settings.send_screenshot
+            || self.screenshot_capture_in_flight.is_some()
+        {
+            return;
+        }
+        let (server_speech_is_active, loud_speech_samples) = self
+            .microphone
+            .as_ref()
+            .map(|microphone| (microphone.in_speech(), microphone.loud_speech_samples()))
+            .unwrap_or_default();
+
+        // Transcript deltas are the primary trigger. This audio path is only a fallback
+        // for speech that has not produced its first transcription token yet.
+        if !self.speech_screenshot_gate.speech_active
+            && loud_speech_samples > SPEECH_SCREENSHOT_SAMPLE_TARGET
+        {
+            self.ensure_active_voice_message();
+        }
+        let speech_is_active = server_speech_is_active || self.active_voice_message.is_some();
+        if !self
+            .speech_screenshot_gate
+            .should_capture(loud_speech_samples, speech_is_active)
+        {
+            return;
+        }
+
+        let message_index = self.ensure_active_voice_message();
+        self.start_speech_screenshot(ctx, message_index, "audio-fallback");
     }
 
     fn discard_active_voice_message_if_empty(&mut self) {
@@ -3268,7 +3334,7 @@ mod tests {
     }
 
     #[test]
-    fn speech_screenshot_gate_waits_for_one_second_of_loud_audio_and_fires_once() {
+    fn speech_screenshot_audio_fallback_waits_for_one_second_and_fires_once() {
         let mut gate = SpeechScreenshotGate::default();
 
         assert_eq!(SPEECH_SCREENSHOT_SAMPLE_TARGET, 24_000);

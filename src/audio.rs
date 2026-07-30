@@ -11,7 +11,7 @@ use std::{
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
     thread::{self, JoinHandle},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use sys_voice::{AecConfig, CaptureHandle, Channels};
 use tokio::sync::mpsc::UnboundedSender;
@@ -20,17 +20,45 @@ const PRE_ROLL_SAMPLES: usize = 24_000 * 3;
 /// Capture at 48 kHz through the OS AEC path, then resample to 24 kHz for Realtime.
 const AEC_CAPTURE_RATE: u32 = 48_000;
 const PLAYBACK_RATE: u32 = 24_000;
-/// Roughly -40 dBFS: high enough to reject room noise after VoiceProcessingIO,
-/// while still counting normal close-mic speech.
-const LOUD_SPEECH_RMS: f32 = 0.01;
-const PLAYBACK_PREBUFFER_MS: u32 = 100;
+/// Roughly -48 dBFS after VoiceProcessingIO. This is intentionally sensitive
+/// enough for normal conversational speech while AEC removes speaker/system echo.
+const LOUD_SPEECH_RMS: f32 = 0.004;
+/// Do not reset the one-second speech timer for tiny natural gaps between syllables.
+const LOUD_SPEECH_QUIET_TOLERANCE_SAMPLES: usize = 24_000 / 5; // 200 ms at 24 kHz
+const PLAYBACK_BUFFER_LOW_MS: u32 = 500;
+const PLAYBACK_RECHECK_MS: u64 = 1_000;
 
 #[derive(Default)]
 struct TurnBuffer {
     pre_roll: VecDeque<i16>,
     current: Vec<i16>,
     continuous_loud_samples: usize,
+    continuous_quiet_samples: usize,
     in_speech: bool,
+}
+
+fn update_continuous_loud_speech(buffer: &mut TurnBuffer, rms: f32, sample_count: usize) {
+    if rms >= LOUD_SPEECH_RMS {
+        buffer.continuous_loud_samples =
+            buffer.continuous_loud_samples.saturating_add(sample_count);
+        buffer.continuous_quiet_samples = 0;
+        return;
+    }
+
+    if buffer.continuous_loud_samples == 0 {
+        buffer.continuous_quiet_samples = 0;
+        return;
+    }
+
+    buffer.continuous_quiet_samples = buffer.continuous_quiet_samples.saturating_add(sample_count);
+    if buffer.continuous_quiet_samples <= LOUD_SPEECH_QUIET_TOLERANCE_SAMPLES {
+        // Count short gaps as part of the same natural speech run.
+        buffer.continuous_loud_samples =
+            buffer.continuous_loud_samples.saturating_add(sample_count);
+    } else {
+        buffer.continuous_loud_samples = 0;
+        buffer.continuous_quiet_samples = 0;
+    }
 }
 
 /// Shared tokio runtime for sys-voice (it spawns tasks during capture setup).
@@ -113,12 +141,7 @@ impl Microphone {
                                 // VoiceProcessingIO already performs acoustic echo cancellation.
                                 // Keep the microphone fully duplex while assistant audio plays so
                                 // realtime translation and overlapping user speech reach GPT-Live.
-                                if rms >= LOUD_SPEECH_RMS {
-                                    buffer.continuous_loud_samples =
-                                        buffer.continuous_loud_samples.saturating_add(pcm.len());
-                                } else {
-                                    buffer.continuous_loud_samples = 0;
-                                }
+                                update_continuous_loud_speech(&mut buffer, rms, pcm.len());
                                 if buffer.in_speech {
                                     buffer.current.extend_from_slice(&pcm);
                                 } else {
@@ -164,6 +187,7 @@ impl Microphone {
         if let Ok(mut buffer) = self.turn.lock() {
             buffer.in_speech = false;
             buffer.continuous_loud_samples = 0;
+            buffer.continuous_quiet_samples = 0;
             return std::mem::take(&mut buffer.current);
         }
         Vec::new()
@@ -175,6 +199,7 @@ impl Microphone {
             buffer.current.clear();
             buffer.pre_roll.clear();
             buffer.continuous_loud_samples = 0;
+            buffer.continuous_quiet_samples = 0;
         }
     }
 
@@ -222,7 +247,13 @@ pub struct Speaker {
 struct PlaybackBuffer {
     samples_native: VecDeque<f32>,
     playing: bool,
-    start_threshold_samples: usize,
+    streaming_assistant: bool,
+    response_complete: bool,
+    low_watermark_samples: usize,
+    resume_check_at: Option<Instant>,
+    resume_check_interval: Duration,
+    native_sample_rate: u32,
+    played_assistant_samples_native: u64,
 }
 
 impl Speaker {
@@ -239,20 +270,27 @@ impl Speaker {
         let playback = Arc::new(Mutex::new(PlaybackBuffer {
             samples_native: VecDeque::new(),
             playing: false,
-            start_threshold_samples: (config.sample_rate.0 as usize
-                * PLAYBACK_PREBUFFER_MS as usize)
+            streaming_assistant: false,
+            response_complete: true,
+            low_watermark_samples: (config.sample_rate.0 as usize
+                * PLAYBACK_BUFFER_LOW_MS as usize)
                 / 1_000,
+            resume_check_at: None,
+            resume_check_interval: Duration::from_millis(PLAYBACK_RECHECK_MS),
+            native_sample_rate: config.sample_rate.0,
+            played_assistant_samples_native: 0,
         }));
         let stream = build_output_stream(&device, &config, sample_format, playback.clone())?;
         stream.play().context("Could not start the audio output")?;
         let output_resampler = StreamingResampler::new(PLAYBACK_RATE, config.sample_rate.0)?;
         eprintln!(
-            "[live-assistant speaker] device={:?} rate={} channels={} format={:?} gain=unity prebuffer_ms={}",
+            "[live-assistant speaker] device={:?} rate={} channels={} format={:?} gain=unity buffer_low_ms={} recheck_ms={}",
             device.name().ok(),
             config.sample_rate.0,
             config.channels,
             sample_format,
-            PLAYBACK_PREBUFFER_MS
+            PLAYBACK_BUFFER_LOW_MS,
+            PLAYBACK_RECHECK_MS
         );
 
         Ok(Self {
@@ -266,12 +304,29 @@ impl Speaker {
     }
 
     pub fn begin_assistant_response(&mut self) {
-        // Reset conversion/filter history without clearing already queued audio.
-        // Separate backend responses should never bleed resampler state together.
+        // Reset conversion/filter history without blocking transcript or tool events.
+        // Only the native speaker queue is gated by the jitter-buffer state below.
         self.assistant_started_at = None;
         self.assistant_received_samples = 0;
         self.assistant_logged_seconds = 0;
         self.output_resampler.reset();
+        if let Ok(mut playback) = self.playback.lock() {
+            playback.streaming_assistant = true;
+            playback.response_complete = false;
+            playback.playing = false;
+            playback.played_assistant_samples_native = 0;
+            playback.resume_check_at = Some(Instant::now() + playback.resume_check_interval);
+        }
+    }
+
+    pub fn finish_assistant_response(&mut self) {
+        if let Ok(mut playback) = self.playback.lock() {
+            playback.response_complete = true;
+            playback.resume_check_at = None;
+            // Flush the final tail even when it is shorter than the 0.5-second
+            // streaming watermark. No more network audio is expected for this reply.
+            playback.playing = !playback.samples_native.is_empty();
+        }
     }
 
     pub fn append_assistant(&mut self, samples: Vec<i16>) {
@@ -301,6 +356,14 @@ impl Speaker {
         match self.output_resampler.process(&normalized) {
             Ok(native) => {
                 if let Ok(mut playback) = self.playback.lock() {
+                    if !playback.streaming_assistant {
+                        playback.streaming_assistant = true;
+                        playback.response_complete = false;
+                        playback.playing = false;
+                        playback.played_assistant_samples_native = 0;
+                        playback.resume_check_at =
+                            Some(Instant::now() + playback.resume_check_interval);
+                    }
                     playback.samples_native.extend(native);
                 }
             }
@@ -341,14 +404,18 @@ impl Speaker {
     }
 
     fn assistant_played_ms(&self) -> Option<u32> {
-        let started = self.assistant_started_at?;
+        self.assistant_started_at?;
         let total_ms =
             (self.assistant_received_samples as u64 * 1_000).div_ceil(PLAYBACK_RATE as u64);
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        if elapsed_ms >= total_ms {
+        let playback = self.playback.lock().ok()?;
+        let played_ms = playback
+            .played_assistant_samples_native
+            .saturating_mul(1_000)
+            / u64::from(playback.native_sample_rate.max(1));
+        if played_ms >= total_ms {
             return None;
         }
-        Some(elapsed_ms.min(u32::MAX as u64) as u32)
+        Some(played_ms.min(u32::MAX as u64) as u32)
     }
 
     fn reset_assistant_clock(&mut self) {
@@ -362,8 +429,13 @@ impl Speaker {
         if let Ok(mut playback) = self.playback.lock() {
             playback.samples_native.clear();
             playback.samples_native.extend(samples.iter().copied());
-            playback.playing =
-                !samples.is_empty() && samples.len() < playback.start_threshold_samples;
+            // Manual WAV playback is already complete, so it must not wait for the
+            // streaming jitter-buffer watermark or one-second retry timer.
+            playback.streaming_assistant = false;
+            playback.response_complete = true;
+            playback.playing = !samples.is_empty();
+            playback.resume_check_at = None;
+            playback.played_assistant_samples_native = 0;
         }
     }
 }
@@ -417,9 +489,15 @@ fn write_output_f32(output: &mut [f32], channels: usize, playback: &Mutex<Playba
         output.fill(0.0);
         return;
     };
-    for frame in output.chunks_mut(channels) {
-        frame.fill(next_native_sample(&mut playback));
+    let now = Instant::now();
+    if !playback_ready_for_callback(&mut playback, now) {
+        output.fill(0.0);
+        return;
     }
+    for frame in output.chunks_mut(channels) {
+        frame.fill(pop_native_sample(&mut playback));
+    }
+    finish_output_callback(&mut playback, now);
 }
 
 fn write_output_i16(output: &mut [i16], channels: usize, playback: &Mutex<PlaybackBuffer>) {
@@ -427,10 +505,16 @@ fn write_output_i16(output: &mut [i16], channels: usize, playback: &Mutex<Playba
         output.fill(0);
         return;
     };
+    let now = Instant::now();
+    if !playback_ready_for_callback(&mut playback, now) {
+        output.fill(0);
+        return;
+    }
     for frame in output.chunks_mut(channels) {
-        let value = next_native_sample(&mut playback).clamp(-1.0, 1.0);
+        let value = pop_native_sample(&mut playback).clamp(-1.0, 1.0);
         frame.fill((value * i16::MAX as f32).round() as i16);
     }
+    finish_output_callback(&mut playback, now);
 }
 
 fn write_output_u16(output: &mut [u16], channels: usize, playback: &Mutex<PlaybackBuffer>) {
@@ -438,24 +522,78 @@ fn write_output_u16(output: &mut [u16], channels: usize, playback: &Mutex<Playba
         output.fill(u16::MAX / 2);
         return;
     };
+    let now = Instant::now();
+    if !playback_ready_for_callback(&mut playback, now) {
+        output.fill(u16::MAX / 2);
+        return;
+    }
     for frame in output.chunks_mut(channels) {
-        let value = next_native_sample(&mut playback).clamp(-1.0, 1.0);
+        let value = pop_native_sample(&mut playback).clamp(-1.0, 1.0);
         frame.fill(((value * 0.5 + 0.5) * u16::MAX as f32).round() as u16);
     }
+    finish_output_callback(&mut playback, now);
 }
 
-fn next_native_sample(playback: &mut PlaybackBuffer) -> f32 {
-    if !playback.playing {
-        if playback.samples_native.len() < playback.start_threshold_samples {
-            return 0.0;
-        }
-        playback.playing = true;
-    }
-    let sample = playback.samples_native.pop_front().unwrap_or(0.0);
+fn playback_ready_for_callback(playback: &mut PlaybackBuffer, now: Instant) -> bool {
     if playback.samples_native.is_empty() {
         playback.playing = false;
+        if playback.streaming_assistant && !playback.response_complete {
+            playback.resume_check_at = Some(now + playback.resume_check_interval);
+        }
+        return false;
+    }
+
+    // Complete clips and completed assistant tails play immediately.
+    if !playback.streaming_assistant || playback.response_complete {
+        playback.playing = true;
+        playback.resume_check_at = None;
+        return true;
+    }
+
+    if playback.playing {
+        if playback.samples_native.len() < playback.low_watermark_samples {
+            playback.playing = false;
+            playback.resume_check_at = Some(now + playback.resume_check_interval);
+            return false;
+        }
+        return true;
+    }
+
+    let Some(check_at) = playback.resume_check_at else {
+        playback.resume_check_at = Some(now + playback.resume_check_interval);
+        return false;
+    };
+    if now < check_at {
+        return false;
+    }
+    if playback.samples_native.len() > playback.low_watermark_samples {
+        playback.playing = true;
+        playback.resume_check_at = None;
+        return true;
+    }
+
+    playback.resume_check_at = Some(now + playback.resume_check_interval);
+    false
+}
+
+fn pop_native_sample(playback: &mut PlaybackBuffer) -> f32 {
+    let Some(sample) = playback.samples_native.pop_front() else {
+        return 0.0;
+    };
+    if playback.streaming_assistant {
+        playback.played_assistant_samples_native =
+            playback.played_assistant_samples_native.saturating_add(1);
     }
     sample
+}
+
+fn finish_output_callback(playback: &mut PlaybackBuffer, now: Instant) {
+    if playback.samples_native.is_empty() {
+        playback.playing = false;
+        if playback.streaming_assistant && !playback.response_complete {
+            playback.resume_check_at = Some(now + playback.resume_check_interval);
+        }
+    }
 }
 
 fn downsample_capture_to_24k(input: &[f32], pending: &mut Option<f32>) -> Vec<i16> {
@@ -493,23 +631,106 @@ mod tests {
         assert_eq!(PRE_ROLL_SAMPLES, 24_000 * 3);
     }
 
-    #[test]
-    fn speaker_waits_for_jitter_prebuffer_without_modifying_samples() {
-        let mut playback = PlaybackBuffer {
-            samples_native: VecDeque::from([0.25, -0.5]),
+    fn test_playback(samples: impl IntoIterator<Item = f32>) -> PlaybackBuffer {
+        PlaybackBuffer {
+            samples_native: samples.into_iter().collect(),
             playing: false,
-            start_threshold_samples: 3,
-        };
-        assert_eq!(next_native_sample(&mut playback), 0.0);
-        playback.samples_native.push_back(0.75);
-        assert_eq!(next_native_sample(&mut playback), 0.25);
-        assert_eq!(next_native_sample(&mut playback), -0.5);
-        assert_eq!(next_native_sample(&mut playback), 0.75);
+            streaming_assistant: true,
+            response_complete: false,
+            low_watermark_samples: 3,
+            resume_check_at: None,
+            resume_check_interval: Duration::from_secs(1),
+            native_sample_rate: 48_000,
+            played_assistant_samples_native: 0,
+        }
+    }
+
+    #[test]
+    fn speaker_rebuffers_below_half_second_and_rechecks_once_per_second() {
+        let now = Instant::now();
+        let mut playback = test_playback([0.25, -0.5]);
+        playback.playing = true;
+
+        assert!(!playback_ready_for_callback(&mut playback, now));
+        assert_eq!(playback.samples_native.len(), 2);
+        playback.samples_native.extend([0.75, 0.5]);
+        assert!(!playback_ready_for_callback(
+            &mut playback,
+            now + Duration::from_millis(999)
+        ));
+        assert!(playback_ready_for_callback(
+            &mut playback,
+            now + Duration::from_secs(1)
+        ));
+        assert_eq!(pop_native_sample(&mut playback), 0.25);
+    }
+
+    #[test]
+    fn speaker_does_not_resume_at_exactly_half_second() {
+        let now = Instant::now();
+        let mut playback = test_playback([0.25, -0.5, 0.75]);
+        playback.resume_check_at = Some(now);
+        assert!(!playback_ready_for_callback(&mut playback, now));
+        playback.samples_native.push_back(0.5);
+        assert!(!playback_ready_for_callback(
+            &mut playback,
+            now + Duration::from_millis(999)
+        ));
+        assert!(playback_ready_for_callback(
+            &mut playback,
+            now + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn completed_assistant_response_flushes_short_tail_immediately() {
+        let now = Instant::now();
+        let mut playback = test_playback([0.25, -0.5]);
+        playback.response_complete = true;
+        assert!(playback_ready_for_callback(&mut playback, now));
+        assert_eq!(pop_native_sample(&mut playback), 0.25);
+    }
+
+    #[test]
+    fn complete_manual_clip_bypasses_streaming_watermark() {
+        let now = Instant::now();
+        let mut playback = test_playback([0.25]);
+        playback.streaming_assistant = false;
+        playback.response_complete = true;
+        assert!(playback_ready_for_callback(&mut playback, now));
+        assert_eq!(pop_native_sample(&mut playback), 0.25);
+    }
+
+    #[test]
+    fn speaker_buffer_policy_uses_half_second_and_one_second_checks() {
+        assert_eq!(PLAYBACK_BUFFER_LOW_MS, 500);
+        assert_eq!(PLAYBACK_RECHECK_MS, 1_000);
     }
 
     #[test]
     fn speaker_conversion_is_unity_gain() {
         assert!((pcm_i16_to_f32(16_384) - 0.5).abs() < 0.0001);
         assert_eq!(f32_to_pcm_i16(0.5), 16_384);
+    }
+
+    #[test]
+    fn continuous_loud_speech_accepts_normal_voice_and_short_dips() {
+        let mut buffer = TurnBuffer::default();
+        update_continuous_loud_speech(&mut buffer, LOUD_SPEECH_RMS, 12_000);
+        update_continuous_loud_speech(
+            &mut buffer,
+            LOUD_SPEECH_RMS / 2.0,
+            LOUD_SPEECH_QUIET_TOLERANCE_SAMPLES,
+        );
+        update_continuous_loud_speech(&mut buffer, LOUD_SPEECH_RMS, 8_000);
+        assert!(buffer.continuous_loud_samples > 24_000);
+    }
+
+    #[test]
+    fn continuous_loud_speech_resets_after_a_real_quiet_gap() {
+        let mut buffer = TurnBuffer::default();
+        update_continuous_loud_speech(&mut buffer, LOUD_SPEECH_RMS, 12_000);
+        update_continuous_loud_speech(&mut buffer, 0.0, LOUD_SPEECH_QUIET_TOLERANCE_SAMPLES + 1);
+        assert_eq!(buffer.continuous_loud_samples, 0);
     }
 }

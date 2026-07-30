@@ -56,7 +56,10 @@ pub enum Command {
         text: String,
         attachments: Vec<Attachment>,
     },
-    SendContextImage(Attachment),
+    SendContextImage {
+        upload_id: u64,
+        image: Attachment,
+    },
     TruncateAssistant {
         item_id: String,
         audio_end_ms: u32,
@@ -95,6 +98,13 @@ pub enum Event {
     InputTranscript {
         item_id: String,
         text: String,
+    },
+    ContextImageUploaded {
+        upload_id: u64,
+    },
+    ContextImageUploadFailed {
+        upload_id: u64,
+        detail: String,
     },
     AssistantResponseStarted {
         response_id: String,
@@ -188,7 +198,7 @@ async fn supervisor(
                                     Command::AudioChunk(_)
                                     | Command::CreateResponse
                                     | Command::SendTurn { .. }
-                                    | Command::SendContextImage(_)
+                                    | Command::SendContextImage { .. }
                                     | Command::TruncateAssistant { .. }
                                     | Command::ToolOutputs(_) => {}
                                 }
@@ -305,6 +315,7 @@ async fn run_openai_connection(
     let mut response_active = false;
     let mut pending_tool_outputs = Vec::new();
     let mut handled_call_ids = HashSet::new();
+    let mut pending_context_uploads = HashMap::<String, u64>::new();
 
     loop {
         tokio::select! {
@@ -327,8 +338,16 @@ async fn run_openai_connection(
                     Some(Command::SendTurn { text, attachments }) => {
                         send_user_turn(&mut writer, text, attachments, true).await?;
                     }
-                    Some(Command::SendContextImage(image)) => {
-                        send_user_turn(&mut writer, String::new(), vec![image], false).await?;
+                    Some(Command::SendContextImage { upload_id, image }) => {
+                        let item_id = context_image_item_id(upload_id);
+                        pending_context_uploads.insert(item_id.clone(), upload_id);
+                        if let Err(error) = send_context_image_item(&mut writer, &item_id, image).await {
+                            pending_context_uploads.remove(&item_id);
+                            let _ = events.send(Event::ContextImageUploadFailed {
+                                upload_id,
+                                detail: format!("{error:#}"),
+                            });
+                        }
                     }
                     Some(Command::TruncateAssistant {
                         item_id,
@@ -362,6 +381,7 @@ async fn run_openai_connection(
                             text.as_ref(),
                             events,
                             &mut handled_call_ids,
+                            &mut pending_context_uploads,
                         )? {
                             ServerSignal::ResponseStarted => response_active = true,
                             ServerSignal::ResponseDone => {
@@ -724,7 +744,7 @@ async fn run_codex_live_connection(
     let _ = events.send(Event::Connected);
     let mut state = CodexLiveState::default();
     let mut handoff_state = CodexHandoffState::default();
-    let mut pending_context_image: Option<Attachment> = None;
+    let mut pending_context_image: Option<PendingContextImage> = None;
     let mut pending_dynamic_tools: HashMap<String, Value> = HashMap::new();
     let mut response_watchdog: Option<Instant> = None;
     // GPT-Live's RTP track is continuous. Keep a small packet pre-roll while
@@ -779,7 +799,7 @@ async fn run_codex_live_connection(
                             }
                         }
                     }
-                    Some(Command::SendContextImage(image)) => {
+                    Some(Command::SendContextImage { upload_id, image }) => {
                         if let Attachment::Image {
                             name,
                             width,
@@ -797,12 +817,21 @@ async fn run_codex_live_connection(
                         // listening. That interrupted V3 handoff generation and left the
                         // voice model with no reply. Keep the newest screen and steer it
                         // into the delegated Codex turn as soon as that turn exists.
-                        pending_context_image = Some(image);
+                        if let Some(previous) = pending_context_image.replace(PendingContextImage {
+                            upload_id,
+                            image,
+                        }) {
+                            let _ = events.send(Event::ContextImageUploadFailed {
+                                upload_id: previous.upload_id,
+                                detail: "Superseded by a newer screen capture".to_owned(),
+                            });
+                        }
                         steer_pending_context_image(
                             &mut server,
                             &thread_id,
                             &handoff_state,
                             &mut pending_context_image,
+                            events,
                         )
                         .await?;
                     }
@@ -1431,6 +1460,11 @@ pub fn probe_codex_gpt_live() -> Result<()> {
     })
 }
 
+struct PendingContextImage {
+    upload_id: u64,
+    image: Attachment,
+}
+
 fn codex_context_image_steer_params(thread_id: &str, turn_id: &str, image: &Attachment) -> Value {
     let attachments = [image.clone()];
     json!({
@@ -1447,14 +1481,17 @@ async fn steer_pending_context_image(
     server: &mut CodexAppServer,
     thread_id: &str,
     handoff_state: &CodexHandoffState,
-    pending_context_image: &mut Option<Attachment>,
+    pending_context_image: &mut Option<PendingContextImage>,
+    events: &std::sync::mpsc::Sender<Event>,
 ) -> Result<bool> {
     let Some(turn_id) = handoff_state.active_turn_id.as_deref() else {
         return Ok(false);
     };
-    let Some(image) = pending_context_image.take() else {
+    let Some(pending) = pending_context_image.take() else {
         return Ok(false);
     };
+    let upload_id = pending.upload_id;
+    let image = pending.image;
     let (name, width, height, byte_size) = match &image {
         Attachment::Image {
             name,
@@ -1470,16 +1507,19 @@ async fn steer_pending_context_image(
     match result {
         Ok(_) => {
             eprintln!(
-                "[live-assistant image] steered name={name:?} turn={turn_id} size={}x{} bytes={}",
+                "[live-assistant image] uploaded upload_id={upload_id} name={name:?} turn={turn_id} size={}x{} bytes={}",
                 width, height, byte_size
             );
+            let _ = events.send(Event::ContextImageUploaded { upload_id });
             Ok(true)
         }
         Err(error) => {
             // Preserve the image for a later handoff if steering raced with turn end.
             // A visual-context failure must never disconnect the live audio session.
-            eprintln!("[live-assistant image] steer failed turn={turn_id}: {error:#}");
-            *pending_context_image = Some(image);
+            eprintln!(
+                "[live-assistant image] upload retry upload_id={upload_id} turn={turn_id}: {error:#}"
+            );
+            *pending_context_image = Some(PendingContextImage { upload_id, image });
             Ok(false)
         }
     }
@@ -1491,7 +1531,7 @@ async fn handle_codex_handoff_message(
     message: &Value,
     events: &std::sync::mpsc::Sender<Event>,
     state: &mut CodexHandoffState,
-    pending_context_image: &mut Option<Attachment>,
+    pending_context_image: &mut Option<PendingContextImage>,
 ) -> Result<bool> {
     let method = message
         .get("method")
@@ -1504,7 +1544,8 @@ async fn handle_codex_handoff_message(
                 .and_then(Value::as_str)
                 .map(str::to_owned);
             state.response_text.clear();
-            steer_pending_context_image(server, thread_id, state, pending_context_image).await?;
+            steer_pending_context_image(server, thread_id, state, pending_context_image, events)
+                .await?;
             Ok(true)
         }
         "item/agentMessage/delta" => {
@@ -2103,6 +2144,38 @@ where
     }
 }
 
+fn context_image_item_id(upload_id: u64) -> String {
+    format!("screen_upload_{upload_id}")
+}
+
+fn context_image_upload_id(item_id: &str) -> Option<u64> {
+    item_id.strip_prefix("screen_upload_")?.parse().ok()
+}
+
+async fn send_context_image_item<S>(writer: &mut S, item_id: &str, image: Attachment) -> Result<()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let Attachment::Image { data_url, .. } = image else {
+        bail!("Context image upload requires an image attachment");
+    };
+    send_json(
+        writer,
+        json!({
+            "type": "conversation.item.create",
+            "event_id": item_id,
+            "item": {
+                "id": item_id,
+                "type": "message",
+                "role": "user",
+                "content": [input_image_content(data_url)]
+            }
+        }),
+    )
+    .await
+}
+
 async fn send_user_turn<S>(
     writer: &mut S,
     text: String,
@@ -2220,6 +2293,7 @@ fn handle_server_event(
     raw: &str,
     events: &std::sync::mpsc::Sender<Event>,
     handled_call_ids: &mut HashSet<String>,
+    pending_context_uploads: &mut HashMap<String, u64>,
 ) -> Result<ServerSignal> {
     let value: Value = serde_json::from_str(raw).context("Invalid Realtime server event")?;
     let kind = value
@@ -2228,6 +2302,18 @@ fn handle_server_event(
         .unwrap_or_default();
     let mut signal = ServerSignal::None;
     match kind {
+        "conversation.item.created" => {
+            let item_id = value
+                .pointer("/item/id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if let Some(upload_id) = pending_context_uploads
+                .remove(item_id)
+                .or_else(|| context_image_upload_id(item_id))
+            {
+                let _ = events.send(Event::ContextImageUploaded { upload_id });
+            }
+        }
         "input_audio_buffer.speech_started" => {
             let _ = events.send(Event::SpeechStarted);
         }
@@ -2353,7 +2439,22 @@ fn handle_server_event(
                 .pointer("/error/message")
                 .and_then(Value::as_str)
                 .unwrap_or("Unknown Realtime API error");
-            let _ = events.send(Event::Error(message.to_owned()));
+            let event_id = value
+                .pointer("/error/event_id")
+                .or_else(|| value.get("event_id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if let Some(upload_id) = pending_context_uploads
+                .remove(event_id)
+                .or_else(|| context_image_upload_id(event_id))
+            {
+                let _ = events.send(Event::ContextImageUploadFailed {
+                    upload_id,
+                    detail: message.to_owned(),
+                });
+            } else {
+                let _ = events.send(Event::Error(message.to_owned()));
+            }
         }
         _ => {}
     }
@@ -2407,16 +2508,19 @@ impl Drop for RealtimeClient {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::{
+        collections::{HashMap, HashSet},
+        time::{Duration, Instant},
+    };
 
     use super::{
-        CodexLiveState, ConnectOptions, Event, RealtimeBackend, ToolCall,
+        CodexLiveState, ConnectOptions, Event, RealtimeBackend, ServerSignal, ToolCall,
         build_session_instructions, codex_context_image_steer_params, codex_live_prompt,
         codex_live_start_error, codex_live_thread_start_params,
         codex_message_is_assistant_transcript, codex_message_starts_reply, codex_tool_instructions,
-        codex_turn_input, decode_audio_to_24k_mono, dynamic_tool_request, encode_pcm,
-        extract_function_call_event, extract_function_calls, handle_codex_live_message,
-        input_image_content,
+        codex_turn_input, context_image_item_id, context_image_upload_id, decode_audio_to_24k_mono,
+        dynamic_tool_request, encode_pcm, extract_function_call_event, extract_function_calls,
+        handle_codex_live_message, handle_server_event, input_image_content,
     };
     use crate::media::{Attachment, ScreenInfo};
     use serde_json::json;
@@ -2612,6 +2716,68 @@ mod tests {
         assert!(tools.iter().any(|tool| tool["name"] == "run_bash"));
         assert!(tools.iter().any(|tool| tool["name"] == "insert_text"));
         assert!(tools.iter().all(|tool| tool.get("inputSchema").is_some()));
+    }
+
+    #[test]
+    fn openai_context_image_ack_confirms_matching_upload() {
+        let (events, received) = std::sync::mpsc::channel();
+        let mut handled = HashSet::new();
+        let item_id = context_image_item_id(42);
+        let mut pending = HashMap::from([(item_id.clone(), 42)]);
+        let signal = handle_server_event(
+            &json!({
+                "type": "conversation.item.created",
+                "item": {"id": item_id}
+            })
+            .to_string(),
+            &events,
+            &mut handled,
+            &mut pending,
+        )
+        .unwrap();
+
+        assert_eq!(signal, ServerSignal::None);
+        assert!(pending.is_empty());
+        assert!(matches!(
+            received.recv().unwrap(),
+            Event::ContextImageUploaded { upload_id: 42 }
+        ));
+    }
+
+    #[test]
+    fn openai_context_image_error_fails_matching_upload() {
+        let (events, received) = std::sync::mpsc::channel();
+        let mut handled = HashSet::new();
+        let event_id = context_image_item_id(9);
+        let mut pending = HashMap::from([(event_id.clone(), 9)]);
+        handle_server_event(
+            &json!({
+                "type": "error",
+                "error": {
+                    "event_id": event_id,
+                    "message": "image rejected"
+                }
+            })
+            .to_string(),
+            &events,
+            &mut handled,
+            &mut pending,
+        )
+        .unwrap();
+
+        assert!(pending.is_empty());
+        assert!(matches!(
+            received.recv().unwrap(),
+            Event::ContextImageUploadFailed { upload_id: 9, detail }
+                if detail == "image rejected"
+        ));
+    }
+
+    #[test]
+    fn context_image_upload_item_ids_round_trip() {
+        let item_id = context_image_item_id(1234);
+        assert_eq!(context_image_upload_id(&item_id), Some(1234));
+        assert_eq!(context_image_upload_id("unrelated"), None);
     }
 
     #[test]

@@ -1,0 +1,41 @@
+[package]
+name = "live-assistant"
+version = "0.1.0"
+edition = "2024"
+description = "A native macOS/Linux voice and screen assistant for the OpenAI Realtime API"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+arboard = "3.5"
+base64 = "0.22"
+bytes = "1.10"
+cpal = "0.15"
+device_query = "4.0"
+dirs = "6.0"
+eframe = { version = "0.31", features = ["default_fonts", "glow", "persistence"] }
+futures-util = "0.3"
+hound = "3.5"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+libc = "0.2"
+opus = "0.3.0"
+rfd = "0.15"
+rubato = "0.16"
+screenshots = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+symphonia = { version = "0.5", features = ["all"] }
+sys-voice = "0.2"
+tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+ureq = { version = "2.12", features = ["json"] }
+webrtc = "0.17.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.23"
+objc2-app-kit = { version = "0.2.2", features = ["NSApplication", "NSColor", "NSResponder", "NSWindow"] }
+objc2-foundation = "0.2.2"
+
+[profile.release]
+lto = "thin"
+strip = true

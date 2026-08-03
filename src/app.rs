@@ -674,6 +674,7 @@ struct TabSession {
     captured_transcript_items: HashSet<String>,
     deferred_voice_response: bool,
     active_voice_message: Option<usize>,
+    latest_screen_image: Option<Attachment>,
     image_viewer: Option<(usize, usize)>,
     should_scroll: bool,
     tool_calls_running: usize,
@@ -705,6 +706,7 @@ impl TabSession {
             captured_transcript_items: HashSet::new(),
             deferred_voice_response: false,
             active_voice_message: None,
+            latest_screen_image: None,
             image_viewer: None,
             should_scroll: false,
             tool_calls_running: 0,
@@ -755,6 +757,7 @@ pub struct LiveAssistantApp {
     screenshot_result_tx: Sender<SpeechScreenshotResult>,
     screenshot_result_rx: Receiver<SpeechScreenshotResult>,
     active_voice_message: Option<usize>,
+    latest_screen_image: Option<Attachment>,
     image_viewer: Option<(usize, usize)>,
     should_scroll: bool,
     tool_calls_running: usize,
@@ -908,6 +911,7 @@ impl LiveAssistantApp {
             screenshot_result_tx,
             screenshot_result_rx,
             active_voice_message: None,
+            latest_screen_image: None,
             image_viewer: None,
             should_scroll: false,
             tool_calls_running: 0,
@@ -960,6 +964,7 @@ impl LiveAssistantApp {
             captured_transcript_items: mem::take(&mut self.captured_transcript_items),
             deferred_voice_response: mem::take(&mut self.deferred_voice_response),
             active_voice_message: self.active_voice_message.take(),
+            latest_screen_image: self.latest_screen_image.take(),
             image_viewer: self.image_viewer.take(),
             should_scroll: mem::take(&mut self.should_scroll),
             tool_calls_running: mem::replace(&mut self.tool_calls_running, 0),
@@ -990,6 +995,7 @@ impl LiveAssistantApp {
         self.captured_transcript_items = session.captured_transcript_items;
         self.deferred_voice_response = session.deferred_voice_response;
         self.active_voice_message = session.active_voice_message;
+        self.latest_screen_image = session.latest_screen_image;
         self.image_viewer = session.image_viewer;
         self.should_scroll = session.should_scroll;
         self.tool_calls_running = session.tool_calls_running;
@@ -1362,6 +1368,7 @@ impl LiveAssistantApp {
         self.confirmed_context_uploads.clear();
         self.fail_pending_context_uploads();
         self.cancel_speech_screenshot();
+        self.latest_screen_image = None;
         self.active_voice_message = None;
         self.tool_calls_running = 0;
         self.pending_tool_reply = false;
@@ -1497,6 +1504,7 @@ impl LiveAssistantApp {
                     self.confirmed_context_uploads.clear();
                     self.cancel_speech_screenshot();
                     self.active_voice_message = None;
+                    self.latest_screen_image = None;
                     self.tool_calls_running = 0;
                     self.pending_tool_reply = false;
                     self.status = "Offline".to_owned();
@@ -1874,17 +1882,33 @@ impl LiveAssistantApp {
                     self.should_scroll = true;
                     self.status =
                         format!("Running {count} tool{}…", if count == 1 { "" } else { "s" });
-                    let ask_calls = calls
+                    let delegated_calls = calls
                         .iter()
-                        .filter(|call| call.name == "ask_text_model")
+                        .filter(|call| call.name == "ask_text_model" || call.name == "click_screen")
                         .cloned()
                         .collect::<Vec<_>>();
-                    for call in ask_calls {
-                        self.start_ask_text_model(call, self.active_tab);
+                    for call in delegated_calls {
+                        if call.name == "click_screen" {
+                            let delegated = crate::realtime::ToolCall {
+                                call_id: call.call_id,
+                                name: "ask_text_model".to_owned(),
+                                arguments: serde_json::json!({
+                                    "prompt": format!(
+                                        "Use the attached newest screen capture to determine and perform the user's requested click. The voice layer proposed these coordinates, but inspect the image yourself and do not trust them without visual verification: {}",
+                                        call.arguments
+                                    ),
+                                    "include_screenshot": true,
+                                })
+                                .to_string(),
+                            };
+                            self.start_ask_text_model(delegated, self.active_tab);
+                        } else {
+                            self.start_ask_text_model(call, self.active_tab);
+                        }
                     }
                     let local_calls = calls
                         .into_iter()
-                        .filter(|call| call.name != "ask_text_model")
+                        .filter(|call| call.name != "ask_text_model" && call.name != "click_screen")
                         .collect::<Vec<_>>();
                     if local_calls.is_empty() {
                         continue;
@@ -2183,6 +2207,12 @@ impl LiveAssistantApp {
                     if self.state == ConnectionState::Offline {
                         continue;
                     }
+                    // Keep the exact captured attachment available for a
+                    // subsequent ask_text_model delegation. Click requests
+                    // force a fresh capture below, while visual questions can
+                    // reuse this newest ready image without touching the
+                    // realtime transport again.
+                    self.latest_screen_image = Some(image.clone());
                     let message_index = screenshot_message_index.unwrap_or_else(|| {
                         self.append_user_message(ChatMessage::user_voice(Vec::new(), None))
                     });
@@ -2501,6 +2531,7 @@ impl LiveAssistantApp {
         &mut self,
         tab_index: usize,
         prompt: String,
+        attachments: Vec<Attachment>,
         thinking_level: ThinkingLevel,
     ) {
         if tab_index >= self.tabs.len() || prompt.trim().is_empty() {
@@ -2515,7 +2546,7 @@ impl LiveAssistantApp {
             let placement = append_user_message_before_active_assistant(
                 &mut session.messages,
                 &mut session.active_assistant_message,
-                ChatMessage::user_text(prompt.clone(), &[]),
+                ChatMessage::user_text(prompt.clone(), &attachments),
             );
             session.active_voice_message = None;
             session.active_response_id = None;
@@ -2523,7 +2554,7 @@ impl LiveAssistantApp {
             session.pending_tool_reply = false;
             session.pending_turns.push_back(PendingTurn {
                 text: prompt,
-                attachments: Vec::new(),
+                attachments,
                 thinking_level: thinking_level.wire_value().to_owned(),
             });
             session.should_scroll = true;
@@ -2636,6 +2667,20 @@ impl LiveAssistantApp {
         }
     }
 
+    fn capture_screen_for_delegation(&mut self) -> anyhow::Result<Attachment> {
+        let screen = media::primary_screen_info()?;
+        self.settings.screenshot_width = screen.logical_width;
+        self.settings.screenshot_height = screen.logical_height;
+        let image = media::capture_screenshot(
+            screen.logical_width,
+            screen.logical_height,
+            self.settings.show_live_pointer,
+            self.pointer_overlay.snapshot(),
+        )?;
+        self.latest_screen_image = Some(image.clone());
+        Ok(image)
+    }
+
     fn start_ask_text_model(&mut self, call: crate::realtime::ToolCall, origin_tab: usize) {
         let arguments = match serde_json::from_str::<serde_json::Value>(&call.arguments) {
             Ok(arguments) => arguments,
@@ -2675,6 +2720,73 @@ impl LiveAssistantApp {
             );
             return;
         };
+        let screen_click = prompt_requires_screen_click(&prompt);
+        let include_screenshot = arguments
+            .get("include_screenshot")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            || screen_click;
+        let mut attachments = Vec::new();
+        if let Some(data_url) = arguments
+            .get("image")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|data_url| !data_url.is_empty())
+        {
+            match media::image_from_data_url("ask_text_model image", data_url) {
+                Ok(image) => attachments.push(image),
+                Err(error) => {
+                    self.queue_voice_tool_output(
+                        origin_tab,
+                        ToolOutput {
+                            call_id: call.call_id,
+                            output: serde_json::json!({
+                                "ok": false,
+                                "error": format!("ask_text_model image was invalid: {error:#}"),
+                            })
+                            .to_string(),
+                        },
+                    );
+                    return;
+                }
+            }
+        }
+        if include_screenshot {
+            let screenshot = if screen_click {
+                // A click must always be grounded in a fresh capture, even if
+                // automatic voice screenshots are disabled or an older image
+                // is still visible in the voice transcript.
+                self.capture_screen_for_delegation()
+            } else if let Some(image) = &self.latest_screen_image {
+                Ok(image.clone())
+            } else {
+                self.capture_screen_for_delegation()
+            };
+            match screenshot {
+                Ok(image) => attachments.push(image),
+                Err(error) => {
+                    self.queue_voice_tool_output(
+                        origin_tab,
+                        ToolOutput {
+                            call_id: call.call_id,
+                            output: serde_json::json!({
+                                "ok": false,
+                                "error": format!("Could not capture the screen for ask_text_model: {error:#}"),
+                            })
+                            .to_string(),
+                        },
+                    );
+                    return;
+                }
+            }
+        }
+        let prompt = if screen_click {
+            format!(
+                "Inspect the attached newest screen capture and complete this click task with click_screen. Return the real tool result: {prompt}"
+            )
+        } else {
+            prompt
+        };
         let model = arguments
             .get("model")
             .and_then(serde_json::Value::as_str)
@@ -2692,7 +2804,7 @@ impl LiveAssistantApp {
         self.pending_ask_calls
             .insert(call_id.clone(), (tab_index, origin_tab));
         self.pending_ask_order.push_back(call_id);
-        self.start_background_text_request(tab_index, prompt, thinking_level);
+        self.start_background_text_request(tab_index, prompt, attachments, thinking_level);
     }
 
     fn queue_voice_tool_output(&mut self, origin_tab: usize, output: ToolOutput) {
@@ -3991,7 +4103,7 @@ impl LiveAssistantApp {
                                 ui.label(RichText::new("Available tools").strong());
                                 ui.label(
                                     RichText::new(
-                                        "Voice and Live models can use these tools. Text tabs use the computer tools and deliberately omit ask_text_model to prevent recursive text sessions.",
+                                        "Voice and Live models use ask_text_model for screen clicks; the delegated text tab receives the newest screenshot and uses click_screen. Text tabs omit ask_text_model to prevent recursive text sessions.",
                                     )
                                     .small()
                                     .weak(),
@@ -4522,6 +4634,10 @@ fn audio_attachment_names(attachments: &[Attachment]) -> Vec<String> {
             Attachment::Image { .. } => None,
         })
         .collect()
+}
+
+fn prompt_requires_screen_click(prompt: &str) -> bool {
+    prompt.to_ascii_lowercase().contains("click")
 }
 
 fn should_split_assistant_wav(sample_count: usize) -> bool {

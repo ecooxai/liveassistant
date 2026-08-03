@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use base64::Engine;
 use image::{DynamicImage, ImageFormat, codecs::jpeg::JpegEncoder, imageops::FilterType};
 use std::{fs::File, io::Cursor, path::Path};
 use symphonia::core::{
@@ -56,6 +57,26 @@ pub fn image_from_clipboard() -> Result<Attachment> {
         "Pasted image.jpg".to_owned(),
         DynamicImage::ImageRgba8(rgba),
     )
+}
+
+/// Decode an image data URL supplied by a model tool call and normalize it to
+/// the same bounded JPEG attachment used by clipboard, drag-and-drop, and
+/// screen-capture images.
+pub fn image_from_data_url(name: impl Into<String>, data_url: &str) -> Result<Attachment> {
+    let (header, encoded) = data_url
+        .trim()
+        .split_once(',')
+        .context("Image input must be a data URL")?;
+    anyhow::ensure!(
+        header.starts_with("data:image/") && header.ends_with(";base64"),
+        "Image input must be a base64-encoded image data URL"
+    );
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .context("Image data URL contained invalid base64")?;
+    anyhow::ensure!(!bytes.is_empty(), "Image data URL was empty");
+    let image = image::load_from_memory(&bytes).context("Image data URL could not be decoded")?;
+    image_attachment(name.into(), image)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -422,8 +443,9 @@ pub fn wav_file_size(sample_count: usize) -> usize {
 mod tests {
     use super::{
         Attachment, DynamicImage, MAX_JPEG_UPLOAD_BYTES, encode_image_attachment,
-        jpeg_animal_probe_attachments, jpeg_attachment_name, jpeg_latest_image_probe_attachments,
-        jpeg_upload_probe_attachment, resample_to_24k, save_image, wav_file_size,
+        image_from_data_url, jpeg_animal_probe_attachments, jpeg_attachment_name,
+        jpeg_latest_image_probe_attachments, jpeg_upload_probe_attachment, resample_to_24k,
+        save_image, wav_file_size,
     };
     use base64::{Engine, engine::general_purpose::STANDARD};
     use image::{ImageFormat, Rgba, RgbaImage};
@@ -476,6 +498,33 @@ mod tests {
         assert_eq!(&bytes[..2], &[0xff, 0xd8]);
         assert_eq!(&bytes[bytes.len() - 2..], &[0xff, 0xd9]);
         assert_eq!(image::guess_format(&thumbnail).unwrap(), ImageFormat::Png);
+    }
+
+    #[test]
+    fn model_image_data_url_is_normalized_to_a_bounded_attachment() {
+        let pixels = RgbaImage::from_pixel(8, 6, Rgba([12, 34, 56, 255]));
+        let source =
+            encode_image_attachment("source.png".to_owned(), DynamicImage::ImageRgba8(pixels))
+                .unwrap();
+        let Attachment::Image { data_url, .. } = source else {
+            panic!("expected an image attachment");
+        };
+
+        let Attachment::Image {
+            name,
+            data_url,
+            width,
+            height,
+            byte_size,
+            ..
+        } = image_from_data_url("tool image", &data_url).unwrap()
+        else {
+            panic!("expected an image attachment");
+        };
+        assert_eq!(name, "tool image.jpg");
+        assert_eq!((width, height), (8, 6));
+        assert!(data_url.starts_with("data:image/jpeg;base64,"));
+        assert!(byte_size <= MAX_JPEG_UPLOAD_BYTES);
     }
 
     #[test]

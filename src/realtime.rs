@@ -106,6 +106,9 @@ pub struct ConnectOptions {
     pub chatgpt_account_id: Option<String>,
     pub model: String,
     pub voice: String,
+    /// Codex reasoning effort for text turns (for example `low`, `medium`, or
+    /// `high`). Voice transports currently ignore this field.
+    pub thinking_level: String,
     pub system_prompt: String,
     pub screen_info: ScreenInfo,
 }
@@ -120,6 +123,7 @@ pub enum Command {
     SendTurn {
         text: String,
         attachments: Vec<Attachment>,
+        thinking_level: String,
     },
     SendContextImage {
         upload_id: u64,
@@ -401,7 +405,7 @@ async fn run_openai_connection(
                     "voice": options.voice
                 }
             },
-            "tools": computer_tools(options.screen_info),
+            "tools": voice_tools(options.screen_info),
             "tool_choice": "auto"
         }
     });
@@ -467,7 +471,11 @@ async fn run_openai_connection(
                                 .extend(blockers);
                         }
                     }
-                    Some(Command::SendTurn { text, attachments }) => {
+                    Some(Command::SendTurn {
+                        text,
+                        attachments,
+                        ..
+                    }) => {
                         send_user_turn(&mut writer, text, attachments, true).await?;
                     }
                     Some(Command::SendContextImage { upload_id, image, deadline }) => {
@@ -986,7 +994,11 @@ async fn run_codex_live_connection(
                             peer.send_pcm24k(&samples).await?;
                         }
                     }
-                    Some(Command::SendTurn { text, attachments }) => {
+                    Some(Command::SendTurn {
+                        text,
+                        attachments,
+                        ..
+                    }) => {
                         let has_image = attachments
                             .iter()
                             .any(|attachment| matches!(attachment, Attachment::Image { .. }));
@@ -1458,17 +1470,23 @@ async fn run_codex_text_connection(
         tokio::select! {
             command = commands.recv() => {
                 match command {
-                    Some(Command::SendTurn { text, attachments }) => {
+                    Some(Command::SendTurn {
+                        text,
+                        attachments,
+                        thinking_level,
+                    }) => {
                         if text.trim().is_empty() && attachments.is_empty() {
                             continue;
                         }
                         server
                             .call(
                                 "turn/start",
-                                json!({
-                                    "threadId": thread_id,
-                                    "input": codex_turn_input(&text, &attachments),
-                                }),
+                                codex_text_turn_start_params(
+                                    &thread_id,
+                                    &text,
+                                    &attachments,
+                                    &thinking_level,
+                                ),
                             )
                             .await?;
                     }
@@ -1582,9 +1600,23 @@ fn codex_text_thread_start_params(
         "model": options.model,
         "baseInstructions": system_prompt,
         "dynamicTools": codex_dynamic_tools(options.screen_info),
+        "reasoningEffort": options.thinking_level,
         "config": {
             "suppress_unstable_features_warning": true,
         }
+    })
+}
+
+fn codex_text_turn_start_params(
+    thread_id: &str,
+    text: &str,
+    attachments: &[Attachment],
+    thinking_level: &str,
+) -> Value {
+    json!({
+        "threadId": thread_id,
+        "input": codex_turn_input(text, attachments),
+        "effort": thinking_level,
     })
 }
 
@@ -1754,7 +1786,9 @@ fn codex_live_thread_start_params(
         "approvalPolicy": "never",
         "sandbox": "read-only",
         "baseInstructions": system_prompt,
-        "dynamicTools": codex_dynamic_tools(options.screen_info),
+        "dynamicTools": codex_dynamic_tools_with_tools(
+            voice_tools(options.screen_info),
+        ),
         "config": {
             "features.realtime_conversation": true,
             "suppress_unstable_features_warning": true,
@@ -1824,6 +1858,7 @@ fn probe_context_image_upload_backend(
             }
         }
         .to_owned(),
+        thinking_level: "low".to_owned(),
         system_prompt: shared_system_prompt(
             "This is an automated multi-turn latest-screen test. Do not respond when a screen image is added. Each time the user asks what animal is visible, inspect only the highest-numbered screen capture and answer with only the lowercase English animal name.",
             screen_info,
@@ -1935,6 +1970,7 @@ fn probe_ask_latest_image_question(
             .send(Command::SendTurn {
                 text: question.to_owned(),
                 attachments: Vec::new(),
+                thinking_level: "low".to_owned(),
             })
             .context("Could not ask OpenAI Realtime to inspect the latest JPEG"),
         RealtimeBackend::CodexGptLive => {
@@ -2795,7 +2831,10 @@ fn codex_message_summary(message: &Value) -> String {
 }
 
 fn codex_dynamic_tools(screen: ScreenInfo) -> Value {
-    let tools = computer_tools(screen);
+    codex_dynamic_tools_with_tools(computer_tools(screen))
+}
+
+fn codex_dynamic_tools_with_tools(tools: Value) -> Value {
     Value::Array(
         tools
             .as_array()
@@ -2811,6 +2850,62 @@ fn codex_dynamic_tools(screen: ScreenInfo) -> Value {
             })
             .collect(),
     )
+}
+
+/// Return the tools that are available to a voice-capable model. Text tabs
+/// intentionally use `codex_dynamic_tools` above, which omits this delegation
+/// tool so a text model cannot recursively ask another text model.
+fn voice_tools(screen: ScreenInfo) -> Value {
+    let mut tools = computer_tools(screen)
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    tools.push(ask_text_model_tool());
+    Value::Array(tools)
+}
+
+fn ask_text_model_tool() -> Value {
+    json!({
+        "type": "function",
+        "name": "ask_text_model",
+        "description": "Ask a text model to analyze a question or the current task. The request runs in a separate background text-model tab. If model or thinking_level is omitted, use the app's configured defaults.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "The complete question or task for the text model."
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional text model id, for example gpt-5.6-luna."
+                },
+                "thinking_level": {
+                    "type": "string",
+                    "enum": ["minimal", "low", "medium", "high", "xhigh", "ultra"],
+                    "description": "Optional reasoning effort. Use low for light, medium for medium, high for high, or a more intensive value when needed."
+                }
+            },
+            "required": ["prompt"],
+            "additionalProperties": false
+        }
+    })
+}
+
+/// The settings panel uses the same live definitions as the transports, so a
+/// newly added tool cannot silently disappear from the UI documentation.
+pub(crate) fn available_tool_descriptions(screen: ScreenInfo) -> Vec<(String, String)> {
+    voice_tools(screen)
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            Some((
+                tool.get("name")?.as_str()?.to_owned(),
+                tool.get("description")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect()
 }
 
 fn codex_turn_input(text: &str, attachments: &[Attachment]) -> Vec<Value> {
@@ -3860,18 +3955,18 @@ mod tests {
         CodexHandoffAction, CodexHandoffState, CodexLiveState, CodexTextState, ConnectOptions,
         Event, InFlightContextImage, OPENAI_VAD_SILENCE_MS, PendingAudioBuffer,
         PendingOpenAiContextUpload, RealtimeBackend, ServerSignal, ToolCall,
-        codex_context_image_inject_params, codex_live_start_error, codex_live_thread_start_params,
-        codex_message_is_assistant_transcript, codex_message_starts_reply,
-        codex_text_thread_start_params, codex_turn_input, context_image_item_event,
-        context_image_item_id, context_image_upload_id, decode_audio_to_24k_mono,
-        dynamic_tool_request, encode_pcm, expire_codex_context_images,
+        codex_context_image_inject_params, codex_dynamic_tools, codex_live_start_error,
+        codex_live_thread_start_params, codex_message_is_assistant_transcript,
+        codex_message_starts_reply, codex_text_thread_start_params, codex_text_turn_start_params,
+        codex_turn_input, context_image_item_event, context_image_item_id, context_image_upload_id,
+        decode_audio_to_24k_mono, dynamic_tool_request, encode_pcm, expire_codex_context_images,
         expire_openai_context_uploads, extract_function_call_event, extract_function_calls,
         gpt_live_context_image_failed_params, gpt_live_context_image_pending_params,
         gpt_live_context_image_ready_params, handle_codex_context_image_response,
         handle_codex_handoff_message, handle_codex_live_message, handle_codex_text_message,
         handle_context_image_server_value, handle_server_event, input_image_content,
         openai_context_response_blockers, openai_deferred_response_is_ready, shared_system_prompt,
-        take_latest_ready_codex_context_image,
+        take_latest_ready_codex_context_image, voice_tools,
     };
     use crate::media::{Attachment, ScreenInfo, jpeg_upload_probe_attachment};
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -4016,6 +4111,7 @@ Call me Ecoo."
             chatgpt_account_id: Some("account-123".to_owned()),
             model: "unused".to_owned(),
             voice: "cove".to_owned(),
+            thinking_level: "low".to_owned(),
             system_prompt: prompt.clone(),
             screen_info: ScreenInfo {
                 origin_x: 0,
@@ -4053,6 +4149,7 @@ Call me Ecoo."
             chatgpt_account_id: Some("account-123".to_owned()),
             model: "unused".to_owned(),
             voice: "cove".to_owned(),
+            thinking_level: "low".to_owned(),
             system_prompt: "shared prompt".to_owned(),
             screen_info: ScreenInfo {
                 origin_x: 0,
@@ -4082,6 +4179,7 @@ Call me Ecoo."
             chatgpt_account_id: Some("account-123".to_owned()),
             model: "unused".to_owned(),
             voice: "ember".to_owned(),
+            thinking_level: "low".to_owned(),
             system_prompt: "shared prompt".to_owned(),
             screen_info: ScreenInfo {
                 origin_x: 0,
@@ -4096,12 +4194,42 @@ Call me Ecoo."
         let params =
             codex_live_thread_start_params(&options, "instructions".to_owned(), "/tmp".to_owned());
         let tools = params["dynamicTools"].as_array().unwrap();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
         assert!(tools.iter().any(|tool| tool["name"] == "move_pointer"));
         assert!(tools.iter().any(|tool| tool["name"] == "click_screen"));
         assert!(tools.iter().any(|tool| tool["name"] == "run_bash"));
         assert!(tools.iter().any(|tool| tool["name"] == "insert_text"));
+        assert!(tools.iter().any(|tool| tool["name"] == "ask_text_model"));
         assert!(tools.iter().all(|tool| tool.get("inputSchema").is_some()));
+    }
+
+    #[test]
+    fn voice_and_text_tool_sets_have_the_expected_delegation_boundary() {
+        let screen = ScreenInfo {
+            origin_x: 0,
+            origin_y: 0,
+            logical_width: 1408,
+            logical_height: 881,
+            backing_width: 2816,
+            backing_height: 1762,
+            scale_factor: 2.0,
+        };
+        let voice = voice_tools(screen).as_array().unwrap().clone();
+        let text = codex_dynamic_tools(screen).as_array().unwrap().clone();
+        assert!(voice.iter().any(|tool| tool["name"] == "ask_text_model"));
+        assert!(voice.iter().any(|tool| tool["name"] == "click_screen"));
+        assert!(text.iter().any(|tool| tool["name"] == "click_screen"));
+        assert!(!text.iter().any(|tool| tool["name"] == "ask_text_model"));
+
+        let ask = voice
+            .iter()
+            .find(|tool| tool["name"] == "ask_text_model")
+            .unwrap();
+        assert_eq!(ask["parameters"]["required"], json!(["prompt"]));
+        assert_eq!(
+            ask["parameters"]["properties"]["thinking_level"]["enum"],
+            json!(["minimal", "low", "medium", "high", "xhigh", "ultra"])
+        );
     }
 
     #[test]
@@ -4866,6 +4994,7 @@ Call me Ecoo."
             chatgpt_account_id: Some("account-123".to_owned()),
             model: "gpt-5.6-sol".to_owned(),
             voice: "unused".to_owned(),
+            thinking_level: "low".to_owned(),
             system_prompt: "shared prompt".to_owned(),
             screen_info: ScreenInfo {
                 origin_x: 0,
@@ -4882,10 +5011,20 @@ Call me Ecoo."
 
         assert_eq!(params["model"], "gpt-5.6-sol");
         assert_eq!(params["baseInstructions"], "instructions");
+        assert_eq!(params["reasoningEffort"], "low");
         let tools = params["dynamicTools"].as_array().unwrap();
         assert_eq!(tools.len(), 4);
         assert!(tools.iter().any(|tool| tool["name"] == "click_screen"));
         assert!(tools.iter().any(|tool| tool["name"] == "run_bash"));
+        assert!(!tools.iter().any(|tool| tool["name"] == "ask_text_model"));
+    }
+
+    #[test]
+    fn text_turn_carries_the_selected_thinking_effort() {
+        let params = codex_text_turn_start_params("thread-1", "click the corner", &[], "high");
+        assert_eq!(params["threadId"], "thread-1");
+        assert_eq!(params["effort"], "high");
+        assert_eq!(params["input"][0]["text"], "click the corner");
     }
 
     #[test]

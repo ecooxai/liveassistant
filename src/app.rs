@@ -3,10 +3,10 @@ use crate::{
     auth,
     codex_account::{self, CodexAccountInfo, CodexUsageInfo, RateLimitWindow},
     live_pointer,
-    media::{self, Attachment},
+    media::{self, Attachment, ScreenInfo},
     realtime::{
         CONTEXT_IMAGE_UPLOAD_TIMEOUT, Command, ConnectOptions, Event, RealtimeBackend,
-        RealtimeClient, ToolOutput, shared_system_prompt,
+        RealtimeClient, ToolOutput, available_tool_descriptions, shared_system_prompt,
     },
     tools,
 };
@@ -15,7 +15,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use eframe::egui::{self, Color32, RichText, Stroke};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet, VecDeque},
     mem,
     path::Path,
     sync::{
@@ -50,6 +50,8 @@ const FALLBACK_TEXT_MODELS: &[(&str, &str)] = &[
     ("gpt-5.6-luna", "GPT-5.6 Luna"),
     ("gpt-5.6", "GPT-5.6"),
 ];
+const LIGHT_BLUE: Color32 = Color32::from_rgb(232, 243, 255);
+const LIGHT_BLUE_SELECTED: Color32 = Color32::from_rgb(201, 226, 255);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 enum AuthMode {
@@ -58,11 +60,82 @@ enum AuthMode {
     CodexApiKey,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ThinkingLevel {
+    Minimal,
+    #[default]
+    Light,
+    Medium,
+    High,
+    ExtraHigh,
+    Ultra,
+}
+
+impl ThinkingLevel {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Minimal => "Minimal",
+            Self::Light => "Light",
+            Self::Medium => "Medium",
+            Self::High => "High",
+            Self::ExtraHigh => "Extra high",
+            Self::Ultra => "Ultra",
+        }
+    }
+
+    fn wire_value(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Light => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::ExtraHigh => "xhigh",
+            Self::Ultra => "ultra",
+        }
+    }
+
+    const VISIBLE: [Self; 3] = [Self::Light, Self::Medium, Self::High];
+    const MORE: [Self; 3] = [Self::Minimal, Self::ExtraHigh, Self::Ultra];
+    const ALL: [Self; 6] = [
+        Self::Minimal,
+        Self::Light,
+        Self::Medium,
+        Self::High,
+        Self::ExtraHigh,
+        Self::Ultra,
+    ];
+}
+
+fn parse_thinking_level(value: &str) -> Option<ThinkingLevel> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "minimal" => Some(ThinkingLevel::Minimal),
+        "light" | "low" => Some(ThinkingLevel::Light),
+        "medium" => Some(ThinkingLevel::Medium),
+        "high" => Some(ThinkingLevel::High),
+        "extra_high" | "extra-high" | "xhigh" => Some(ThinkingLevel::ExtraHigh),
+        "ultra" => Some(ThinkingLevel::Ultra),
+        _ => None,
+    }
+}
+
+fn style_light_blue_popup(ui: &mut egui::Ui) {
+    let visuals = ui.visuals_mut();
+    visuals.window_fill = LIGHT_BLUE;
+    visuals.panel_fill = LIGHT_BLUE;
+    visuals.extreme_bg_color = LIGHT_BLUE;
+    visuals.faint_bg_color = LIGHT_BLUE;
+    visuals.selection.bg_fill = LIGHT_BLUE_SELECTED;
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct Settings {
     backend: RealtimeBackend,
     model: String,
+    default_text_model: String,
+    default_thinking_level: ThinkingLevel,
+    thinking_level: ThinkingLevel,
     voice: String,
     instructions: String,
     auth_mode: AuthMode,
@@ -77,6 +150,9 @@ impl Default for Settings {
         Self {
             backend: RealtimeBackend::OpenAiRealtime,
             model: "gpt-realtime-2.1".to_owned(),
+            default_text_model: "gpt-5.6-luna".to_owned(),
+            default_thinking_level: ThinkingLevel::Light,
+            thinking_level: ThinkingLevel::Light,
             voice: "marin".to_owned(),
             instructions: String::new(),
             auth_mode: AuthMode::ApiKey,
@@ -569,6 +645,13 @@ struct SpeechScreenshotResult {
     result: Result<Attachment, String>,
 }
 
+#[derive(Clone)]
+struct PendingTurn {
+    text: String,
+    attachments: Vec<Attachment>,
+    thinking_level: String,
+}
+
 struct TabSession {
     settings: Settings,
     state: ConnectionState,
@@ -595,6 +678,7 @@ struct TabSession {
     should_scroll: bool,
     tool_calls_running: usize,
     pending_tool_reply: bool,
+    pending_turns: VecDeque<PendingTurn>,
 }
 
 impl TabSession {
@@ -625,6 +709,7 @@ impl TabSession {
             should_scroll: false,
             tool_calls_running: 0,
             pending_tool_reply: false,
+            pending_turns: VecDeque::new(),
         }
     }
 }
@@ -674,8 +759,9 @@ pub struct LiveAssistantApp {
     should_scroll: bool,
     tool_calls_running: usize,
     pending_tool_reply: bool,
-    tool_result_tx: Sender<(String, String)>,
-    tool_result_rx: Receiver<(String, String)>,
+    pending_turns: VecDeque<PendingTurn>,
+    tool_result_tx: Sender<(usize, String, String)>,
+    tool_result_rx: Receiver<(usize, String, String)>,
     codex_info: Option<CodexAccountInfo>,
     codex_info_loading: bool,
     codex_info_error: Option<String>,
@@ -691,6 +777,10 @@ pub struct LiveAssistantApp {
     tabs: Vec<AssistantTab>,
     active_tab: usize,
     show_model_picker: bool,
+    background_text_clients: HashMap<usize, RealtimeClient>,
+    pending_ask_calls: HashMap<String, (usize, usize)>,
+    pending_ask_order: VecDeque<String>,
+    pending_voice_tool_outputs: Vec<(usize, ToolOutput)>,
 }
 
 fn ensure_assistant_message_index(
@@ -822,6 +912,7 @@ impl LiveAssistantApp {
             should_scroll: false,
             tool_calls_running: 0,
             pending_tool_reply: false,
+            pending_turns: VecDeque::new(),
             tool_result_tx,
             tool_result_rx,
             codex_info: None,
@@ -839,6 +930,10 @@ impl LiveAssistantApp {
             tabs: vec![AssistantTab::new(initial_tab_settings)],
             active_tab: 0,
             show_model_picker: false,
+            background_text_clients: HashMap::new(),
+            pending_ask_calls: HashMap::new(),
+            pending_ask_order: VecDeque::new(),
+            pending_voice_tool_outputs: Vec::new(),
         }
     }
 
@@ -869,6 +964,7 @@ impl LiveAssistantApp {
             should_scroll: mem::take(&mut self.should_scroll),
             tool_calls_running: mem::replace(&mut self.tool_calls_running, 0),
             pending_tool_reply: mem::take(&mut self.pending_tool_reply),
+            pending_turns: mem::take(&mut self.pending_turns),
         }
     }
 
@@ -898,6 +994,7 @@ impl LiveAssistantApp {
         self.should_scroll = session.should_scroll;
         self.tool_calls_running = session.tool_calls_running;
         self.pending_tool_reply = session.pending_tool_reply;
+        self.pending_turns = session.pending_turns;
     }
 
     fn reset_session_channels(&mut self) {
@@ -905,9 +1002,9 @@ impl LiveAssistantApp {
             mpsc::channel::<SpeechScreenshotResult>();
         self.screenshot_result_tx = screenshot_result_tx;
         self.screenshot_result_rx = screenshot_result_rx;
-        let (tool_result_tx, tool_result_rx) = mpsc::channel::<(String, String)>();
-        self.tool_result_tx = tool_result_tx;
-        self.tool_result_rx = tool_result_rx;
+        // Tool results are shared by active and background sessions and carry
+        // their tab index, so switching tabs never paints a result into the
+        // wrong transcript.
     }
 
     fn switch_tab(&mut self, index: usize) {
@@ -925,10 +1022,12 @@ impl LiveAssistantApp {
             &mut self.tabs[index].session,
             TabSession::new(Settings::default()),
         );
+        let next_realtime = self.background_text_clients.remove(&index);
         self.install_active_session(next);
-        // Each tab owns its transcript and settings. Only the selected tab owns
-        // a live transport, so switching cannot leak events into another chat.
-        self.realtime = RealtimeClient::spawn();
+        // A text tab used by ask_text_model may already have a live background
+        // transport. Adopt that transport when the user opens the tab instead
+        // of starting a second Codex thread and losing its in-flight events.
+        self.realtime = next_realtime.unwrap_or_else(RealtimeClient::spawn);
         self.reset_session_channels();
         self.show_settings = false;
     }
@@ -938,6 +1037,9 @@ impl LiveAssistantApp {
         settings.backend = backend;
         settings.model = model;
         settings.voice = voice.to_owned();
+        if backend == RealtimeBackend::CodexText {
+            settings.thinking_level = settings.default_thinking_level;
+        }
         self.tabs.push(AssistantTab::new(settings));
         let index = self.tabs.len() - 1;
         self.switch_tab(index);
@@ -972,6 +1074,17 @@ impl LiveAssistantApp {
                 }
             }
         }
+        if !self.settings.default_text_model.trim().is_empty()
+            && seen.insert(self.settings.default_text_model.clone())
+        {
+            let model = self.settings.default_text_model.clone();
+            let display_name = FALLBACK_TEXT_MODELS
+                .iter()
+                .find(|(name, _)| *name == model)
+                .map(|(_, label)| (*label).to_owned())
+                .unwrap_or_else(|| model.clone());
+            choices.push((model, display_name));
+        }
         for (name, display_name) in FALLBACK_TEXT_MODELS {
             if seen.insert((*name).to_owned()) {
                 choices.push(((*name).to_owned(), (*display_name).to_owned()));
@@ -988,7 +1101,10 @@ impl LiveAssistantApp {
         if !choices
             .iter()
             .any(|(model, _)| model == &self.settings.model)
-            && let Some((model, _)) = choices.first()
+            && let Some((model, _)) = choices
+                .iter()
+                .find(|(model, _)| model == &self.settings.default_text_model)
+                .or_else(|| choices.first())
         {
             self.settings.model = model.clone();
         }
@@ -1043,11 +1159,19 @@ impl LiveAssistantApp {
     }
 
     fn resolve_credentials(&self) -> anyhow::Result<(String, Option<String>)> {
-        match self.settings.auth_mode {
+        self.resolve_credentials_for(self.settings.auth_mode, self.settings.backend)
+    }
+
+    fn resolve_credentials_for(
+        &self,
+        auth_mode: AuthMode,
+        backend: RealtimeBackend,
+    ) -> anyhow::Result<(String, Option<String>)> {
+        match auth_mode {
             AuthMode::ApiKey => {
                 let key = self.api_key.trim();
                 if key.is_empty() {
-                    if self.settings.backend == RealtimeBackend::CodexText {
+                    if backend == RealtimeBackend::CodexText {
                         let creds = auth::codex_credentials().context(
                             "No API key is set and no Codex login was found for this text model",
                         )?;
@@ -1105,6 +1229,7 @@ impl LiveAssistantApp {
             chatgpt_account_id,
             model: self.settings.model.clone(),
             voice: self.settings.voice.clone(),
+            thinking_level: self.settings.thinking_level.wire_value().to_owned(),
             system_prompt: system_prompt.clone(),
             screen_info,
         };
@@ -1122,10 +1247,16 @@ impl LiveAssistantApp {
             );
             return;
         }
-        self.messages.push(ChatMessage::system(
-            system_prompt,
-            RealtimeBackend::CodexText,
-        ));
+        if !self
+            .messages
+            .iter()
+            .any(|message| matches!(message.role, Role::System(RealtimeBackend::CodexText)))
+        {
+            self.messages.push(ChatMessage::system(
+                system_prompt,
+                RealtimeBackend::CodexText,
+            ));
+        }
         self.should_scroll = true;
     }
 
@@ -1183,6 +1314,7 @@ impl LiveAssistantApp {
                     chatgpt_account_id,
                     model: self.settings.model.clone(),
                     voice: self.settings.voice.clone(),
+                    thinking_level: self.settings.thinking_level.wire_value().to_owned(),
                     system_prompt: system_prompt.clone(),
                     screen_info,
                 };
@@ -1267,15 +1399,26 @@ impl LiveAssistantApp {
             }
         }
 
-        while let Ok((call_id, output)) = self.tool_result_rx.try_recv() {
-            if let Some(tool) = self
-                .messages
-                .iter_mut()
+        while let Ok((tab_index, call_id, output)) = self.tool_result_rx.try_recv() {
+            if tab_index == self.active_tab {
+                if let Some(tool) = self
+                    .messages
+                    .iter_mut()
+                    .flat_map(|message| message.tool_calls.iter_mut())
+                    .find(|tool| tool.call_id == call_id)
+                {
+                    tool.output = Some(pretty_tool_arguments(&output));
+                    self.should_scroll = true;
+                }
+            } else if let Some(tool) = self
+                .tabs
+                .get_mut(tab_index)
+                .into_iter()
+                .flat_map(|tab| tab.session.messages.iter_mut())
                 .flat_map(|message| message.tool_calls.iter_mut())
                 .find(|tool| tool.call_id == call_id)
             {
                 tool.output = Some(pretty_tool_arguments(&output));
-                self.should_scroll = true;
             }
         }
 
@@ -1314,11 +1457,13 @@ impl LiveAssistantApp {
                     self.state = ConnectionState::Live;
                     self.status = "Ready".to_owned();
                     self.error = None;
+                    self.flush_pending_turn();
                 }
                 Event::Connected if self.microphone.is_some() && self.speaker.is_some() => {
                     self.state = ConnectionState::Live;
                     self.status = "Listening".to_owned();
                     self.error = None;
+                    self.flush_pending_turn();
                 }
                 Event::Connected => match Microphone::start(self.realtime.commands.clone()) {
                     Ok(mic) if self.speaker.is_some() => {
@@ -1326,6 +1471,7 @@ impl LiveAssistantApp {
                         self.state = ConnectionState::Live;
                         self.status = "AEC listening".to_owned();
                         self.error = None;
+                        self.flush_pending_turn();
                     }
                     Ok(_) => {
                         self.error = Some("No audio output device is available".to_owned());
@@ -1685,7 +1831,7 @@ impl LiveAssistantApp {
                         self.touch_assistant_group(Instant::now());
                         if self.tool_calls_running > 0 {
                             self.status = format!(
-                                "Running {} computer action{}…",
+                                "Running {} tool{}…",
                                 self.tool_calls_running,
                                 if self.tool_calls_running == 1 {
                                     ""
@@ -1705,6 +1851,7 @@ impl LiveAssistantApp {
                             } else {
                                 "Listening".to_owned()
                             };
+                            self.flush_pending_turn();
                         }
                     }
                 }
@@ -1725,11 +1872,25 @@ impl LiveAssistantApp {
                             }));
                     }
                     self.should_scroll = true;
-                    self.status = format!(
-                        "Running {count} computer action{}…",
-                        if count == 1 { "" } else { "s" }
-                    );
+                    self.status =
+                        format!("Running {count} tool{}…", if count == 1 { "" } else { "s" });
+                    let ask_calls = calls
+                        .iter()
+                        .filter(|call| call.name == "ask_text_model")
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    for call in ask_calls {
+                        self.start_ask_text_model(call, self.active_tab);
+                    }
+                    let local_calls = calls
+                        .into_iter()
+                        .filter(|call| call.name != "ask_text_model")
+                        .collect::<Vec<_>>();
+                    if local_calls.is_empty() {
+                        continue;
+                    }
                     let commands = self.realtime.commands.clone();
+                    let tab_index = self.active_tab;
                     let screenshot_width = self.settings.screenshot_width;
                     let screenshot_height = self.settings.screenshot_height;
                     let tool_result_tx = self.tool_result_tx.clone();
@@ -1738,7 +1899,7 @@ impl LiveAssistantApp {
                             screenshot_width,
                             screenshot_height,
                         };
-                        let outputs: Vec<_> = calls
+                        let outputs: Vec<_> = local_calls
                             .into_iter()
                             .map(|call| ToolOutput {
                                 call_id: call.call_id,
@@ -1750,8 +1911,11 @@ impl LiveAssistantApp {
                             })
                             .collect();
                         for output in &outputs {
-                            let _ = tool_result_tx
-                                .send((output.call_id.clone(), output.output.clone()));
+                            let _ = tool_result_tx.send((
+                                tab_index,
+                                output.call_id.clone(),
+                                output.output.clone(),
+                            ));
                         }
                         let _ = commands.send(Command::ToolOutputs(outputs));
                     });
@@ -1768,6 +1932,12 @@ impl LiveAssistantApp {
                 }
             }
         }
+
+        // Voice turns can delegate to a text tab that continues while this
+        // active transport waits for the result. Drain those sessions after
+        // the active event loop so a newly-created background client is also
+        // eligible on the same repaint.
+        self.process_background_events(ctx);
 
         let now = Instant::now();
         self.finalize_expired_assistant_group(now);
@@ -2244,27 +2414,732 @@ impl LiveAssistantApp {
         &mut self.messages[index]
     }
 
-    fn send_composer(&mut self) {
+    fn send_turn_now(&mut self, turn: PendingTurn) -> bool {
+        let result = self.realtime.commands.send(Command::SendTurn {
+            text: turn.text,
+            attachments: turn.attachments,
+            thinking_level: turn.thinking_level,
+        });
+        if let Err(error) = result {
+            self.error = Some(format!("Could not send message: {error}"));
+            return false;
+        }
+        self.status = "Thinking…".to_owned();
+        true
+    }
+
+    fn flush_pending_turn(&mut self) {
         if self.state != ConnectionState::Live {
-            self.error = Some(if self.settings.backend == RealtimeBackend::CodexText {
-                "Start the text session before sending a message.".to_owned()
-            } else {
-                "Start the voice session before sending a message.".to_owned()
-            });
             return;
         }
+        if let Some(turn) = self.pending_turns.pop_front()
+            && !self.send_turn_now(turn.clone())
+        {
+            // The command channel can close during a reconnect. Keep the turn
+            // visible and retry on the next successful connection.
+            self.pending_turns.push_front(turn);
+            self.status = "Waiting to send…".to_owned();
+        }
+    }
+
+    fn ensure_text_tab_for_request(&mut self, model: &str, thinking_level: ThinkingLevel) -> usize {
+        if let Some(index) = (0..self.tabs.len()).find(|&index| {
+            let settings = if index == self.active_tab {
+                &self.settings
+            } else {
+                &self.tabs[index].session.settings
+            };
+            settings.backend == RealtimeBackend::CodexText && settings.model == model
+        }) {
+            if index == self.active_tab {
+                self.settings.thinking_level = thinking_level;
+            } else {
+                self.tabs[index].session.settings.thinking_level = thinking_level;
+            }
+            return index;
+        }
+
+        let mut settings = self.settings.clone();
+        settings.backend = RealtimeBackend::CodexText;
+        settings.model = model.to_owned();
+        settings.voice = "marin".to_owned();
+        settings.thinking_level = thinking_level;
+        self.tabs.push(AssistantTab::new(settings));
+        self.tabs.len() - 1
+    }
+
+    fn screen_info_for_settings(settings: &Settings) -> ScreenInfo {
+        ScreenInfo {
+            origin_x: 0,
+            origin_y: 0,
+            logical_width: settings.screenshot_width,
+            logical_height: settings.screenshot_height,
+            backing_width: settings.screenshot_width,
+            backing_height: settings.screenshot_height,
+            scale_factor: 1.0,
+        }
+    }
+
+    fn background_text_screen(&mut self, tab_index: usize) -> ScreenInfo {
+        match media::primary_screen_info() {
+            Ok(screen) => {
+                if let Some(tab) = self.tabs.get_mut(tab_index) {
+                    tab.session.settings.screenshot_width = screen.logical_width;
+                    tab.session.settings.screenshot_height = screen.logical_height;
+                }
+                screen
+            }
+            Err(_) => self
+                .tabs
+                .get(tab_index)
+                .map(|tab| Self::screen_info_for_settings(&tab.session.settings))
+                .unwrap_or_else(|| Self::screen_info_for_settings(&self.settings)),
+        }
+    }
+
+    fn start_background_text_request(
+        &mut self,
+        tab_index: usize,
+        prompt: String,
+        thinking_level: ThinkingLevel,
+    ) {
+        if tab_index >= self.tabs.len() || prompt.trim().is_empty() {
+            return;
+        }
+        let screen_info = self.background_text_screen(tab_index);
+        let settings_snapshot = self.tabs[tab_index].session.settings.clone();
+        let system_prompt = shared_system_prompt(&settings_snapshot.instructions, screen_info);
+        {
+            let session = &mut self.tabs[tab_index].session;
+            session.settings.thinking_level = thinking_level;
+            let placement = append_user_message_before_active_assistant(
+                &mut session.messages,
+                &mut session.active_assistant_message,
+                ChatMessage::user_text(prompt.clone(), &[]),
+            );
+            session.active_voice_message = None;
+            session.active_response_id = None;
+            session.last_assistant_item_id = None;
+            session.pending_tool_reply = false;
+            session.pending_turns.push_back(PendingTurn {
+                text: prompt,
+                attachments: Vec::new(),
+                thinking_level: thinking_level.wire_value().to_owned(),
+            });
+            session.should_scroll = true;
+            if placement.moved_assistant.is_some() {
+                session.assistant_group_deadline = None;
+            }
+            if !session
+                .messages
+                .iter()
+                .any(|message| matches!(message.role, Role::System(RealtimeBackend::CodexText)))
+            {
+                session.messages.push(ChatMessage::system(
+                    system_prompt.clone(),
+                    RealtimeBackend::CodexText,
+                ));
+            }
+        }
+
+        if tab_index == self.active_tab && self.settings.backend == RealtimeBackend::CodexText {
+            if self.state == ConnectionState::Offline {
+                self.start_text();
+            } else if self.state == ConnectionState::Live {
+                self.flush_pending_turn();
+            }
+            return;
+        }
+
+        if self.background_text_clients.contains_key(&tab_index) {
+            if self.tabs[tab_index].session.state == ConnectionState::Live {
+                self.flush_background_turn(tab_index);
+            } else {
+                self.tabs[tab_index].session.status =
+                    "Connecting text model… will send when ready".to_owned();
+            }
+            return;
+        }
+
+        let (api_key, chatgpt_account_id) = match self
+            .resolve_credentials_for(settings_snapshot.auth_mode, RealtimeBackend::CodexText)
+        {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                let session = &mut self.tabs[tab_index].session;
+                session.state = ConnectionState::Offline;
+                session.status = "Text request failed".to_owned();
+                session.error = Some(error.to_string());
+                self.fail_pending_asks_for_tab(tab_index, error.to_string());
+                return;
+            }
+        };
+        let options = ConnectOptions {
+            backend: RealtimeBackend::CodexText,
+            api_key,
+            chatgpt_account_id,
+            model: settings_snapshot.model,
+            voice: settings_snapshot.voice,
+            thinking_level: thinking_level.wire_value().to_owned(),
+            system_prompt,
+            screen_info,
+        };
+        let client = RealtimeClient::spawn();
+        if client.commands.send(Command::Connect(options)).is_err() {
+            let session = &mut self.tabs[tab_index].session;
+            session.state = ConnectionState::Offline;
+            session.status = "Text request failed".to_owned();
+            session.error = Some("Could not start the background text session".to_owned());
+            self.fail_pending_asks_for_tab(
+                tab_index,
+                "Could not start the background text session",
+            );
+            return;
+        }
+        self.background_text_clients.insert(tab_index, client);
+        let session = &mut self.tabs[tab_index].session;
+        session.state = ConnectionState::Connecting;
+        session.status = "Connecting text model… will send when ready".to_owned();
+        session.error = None;
+    }
+
+    fn flush_background_turn(&mut self, tab_index: usize) {
+        if self
+            .tabs
+            .get(tab_index)
+            .is_none_or(|tab| tab.session.state != ConnectionState::Live)
+        {
+            return;
+        }
+        let Some(commands) = self
+            .background_text_clients
+            .get(&tab_index)
+            .map(|client| client.commands.clone())
+        else {
+            return;
+        };
+        let Some(turn) = self.tabs[tab_index].session.pending_turns.pop_front() else {
+            return;
+        };
+        let command = Command::SendTurn {
+            text: turn.text.clone(),
+            attachments: turn.attachments.clone(),
+            thinking_level: turn.thinking_level.clone(),
+        };
+        if commands.send(command).is_err() {
+            self.tabs[tab_index].session.pending_turns.push_front(turn);
+            self.tabs[tab_index].session.state = ConnectionState::Offline;
+            self.tabs[tab_index].session.status = "Text session stopped".to_owned();
+            self.fail_pending_asks_for_tab(tab_index, "The background text session stopped");
+        } else {
+            self.tabs[tab_index].session.status = "Thinking…".to_owned();
+        }
+    }
+
+    fn start_ask_text_model(&mut self, call: crate::realtime::ToolCall, origin_tab: usize) {
+        let arguments = match serde_json::from_str::<serde_json::Value>(&call.arguments) {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                self.queue_voice_tool_output(
+                    origin_tab,
+                    ToolOutput {
+                        call_id: call.call_id,
+                        output: serde_json::json!({
+                            "ok": false,
+                            "error": format!("ask_text_model arguments were invalid: {error}"),
+                        })
+                        .to_string(),
+                    },
+                );
+                return;
+            }
+        };
+        let prompt = arguments
+            .get("prompt")
+            .or_else(|| arguments.get("question"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+            .map(str::to_owned);
+        let Some(prompt) = prompt else {
+            self.queue_voice_tool_output(
+                origin_tab,
+                ToolOutput {
+                    call_id: call.call_id,
+                    output: serde_json::json!({
+                        "ok": false,
+                        "error": "ask_text_model requires a non-empty prompt",
+                    })
+                    .to_string(),
+                },
+            );
+            return;
+        };
+        let model = arguments
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.settings.default_text_model.clone());
+        let thinking_level = arguments
+            .get("thinking_level")
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_thinking_level)
+            .unwrap_or(self.settings.default_thinking_level);
+        let tab_index = self.ensure_text_tab_for_request(&model, thinking_level);
+        let call_id = call.call_id;
+        self.pending_ask_calls
+            .insert(call_id.clone(), (tab_index, origin_tab));
+        self.pending_ask_order.push_back(call_id);
+        self.start_background_text_request(tab_index, prompt, thinking_level);
+    }
+
+    fn queue_voice_tool_output(&mut self, origin_tab: usize, output: ToolOutput) {
+        self.pending_voice_tool_outputs.push((origin_tab, output));
+    }
+
+    fn fail_pending_asks_for_tab(&mut self, tab_index: usize, detail: impl Into<String>) {
+        let detail = detail.into();
+        let call_ids = self
+            .pending_ask_calls
+            .iter()
+            .filter_map(|(call_id, (target, _))| (*target == tab_index).then_some(call_id.clone()))
+            .collect::<Vec<_>>();
+        for call_id in call_ids {
+            let Some((_, origin_tab)) = self.pending_ask_calls.remove(&call_id) else {
+                continue;
+            };
+            self.pending_ask_order.retain(|queued| queued != &call_id);
+            self.queue_voice_tool_output(
+                origin_tab,
+                ToolOutput {
+                    call_id,
+                    output: serde_json::json!({
+                        "ok": false,
+                        "error": detail,
+                    })
+                    .to_string(),
+                },
+            );
+        }
+    }
+
+    fn complete_pending_asks_for_tab(&mut self, tab_index: usize) {
+        let Some(tab) = self.tabs.get(tab_index) else {
+            return;
+        };
+        let response = tab
+            .session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::Assistant)
+            .map(|message| message.text.trim().to_owned())
+            .unwrap_or_default();
+        let model = tab.session.settings.model.clone();
+        let thinking_level = tab.session.settings.thinking_level.wire_value();
+        let Some(order_index) = self.pending_ask_order.iter().position(|call_id| {
+            self.pending_ask_calls
+                .get(call_id)
+                .is_some_and(|(target, _)| *target == tab_index)
+        }) else {
+            return;
+        };
+        let Some(call_id) = self.pending_ask_order.remove(order_index) else {
+            return;
+        };
+        let Some((_, origin_tab)) = self.pending_ask_calls.remove(&call_id) else {
+            return;
+        };
+        self.queue_voice_tool_output(
+            origin_tab,
+            ToolOutput {
+                call_id,
+                output: serde_json::json!({
+                    "ok": true,
+                    "model": model,
+                    "thinking_level": thinking_level,
+                    "response": response,
+                })
+                .to_string(),
+            },
+        );
+    }
+
+    fn process_background_events(&mut self, ctx: &egui::Context) {
+        let indices = self
+            .background_text_clients
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for tab_index in indices {
+            let mut events = Vec::new();
+            if let Some(client) = self.background_text_clients.get(&tab_index) {
+                while let Ok(event) = client.events.try_recv() {
+                    events.push(event);
+                }
+            }
+            for event in events {
+                self.handle_background_text_event(tab_index, event, ctx);
+            }
+        }
+        self.flush_pending_voice_tool_outputs();
+    }
+
+    fn handle_background_text_event(
+        &mut self,
+        tab_index: usize,
+        event: Event,
+        ctx: &egui::Context,
+    ) {
+        if tab_index >= self.tabs.len() {
+            return;
+        }
+        match event {
+            Event::Connecting => {
+                let session = &mut self.tabs[tab_index].session;
+                session.state = ConnectionState::Connecting;
+                session.status = "Connecting text model…".to_owned();
+            }
+            Event::Reconnecting { attempt, reason } => {
+                let session = &mut self.tabs[tab_index].session;
+                session.state = ConnectionState::Connecting;
+                session.status = format!("Reconnecting text model… attempt {attempt}");
+                session.error = Some(reason);
+            }
+            Event::Connected => {
+                let session = &mut self.tabs[tab_index].session;
+                session.state = ConnectionState::Live;
+                session.status = "Ready".to_owned();
+                session.error = None;
+                self.flush_background_turn(tab_index);
+                ctx.request_repaint();
+            }
+            Event::Disconnected => {
+                self.background_text_clients.remove(&tab_index);
+                let session = &mut self.tabs[tab_index].session;
+                session.state = ConnectionState::Offline;
+                session.status = "Offline".to_owned();
+                self.fail_pending_asks_for_tab(
+                    tab_index,
+                    "The background text session disconnected",
+                );
+                ctx.request_repaint();
+            }
+            Event::AssistantResponseStarted { response_id } => {
+                let session = &mut self.tabs[tab_index].session;
+                session.active_response_id = Some(response_id);
+                session.last_assistant_item_id = None;
+                session.active_assistant_message = None;
+                session.assistant_group_deadline = None;
+                session.assistant_text_needs_separator = false;
+                session.pending_tool_reply = false;
+                ensure_assistant_message_index(
+                    &mut session.messages,
+                    &mut session.active_assistant_message,
+                );
+                session.status = "Thinking…".to_owned();
+            }
+            Event::AssistantItem {
+                response_id,
+                item_id,
+            } => {
+                let session = &mut self.tabs[tab_index].session;
+                if session.active_response_id.as_deref() == Some(&response_id) {
+                    session.last_assistant_item_id = Some(item_id.clone());
+                    let index = ensure_assistant_message_index(
+                        &mut session.messages,
+                        &mut session.active_assistant_message,
+                    );
+                    session.messages[index].server_item_id = Some(item_id);
+                }
+            }
+            Event::AssistantTranscriptDelta { response_id, delta } => {
+                let session = &mut self.tabs[tab_index].session;
+                if session.active_response_id.as_deref() != Some(&response_id) {
+                    return;
+                }
+                let index = ensure_assistant_message_index(
+                    &mut session.messages,
+                    &mut session.active_assistant_message,
+                );
+                session.messages[index].text.push_str(&delta);
+                session.status = "Thinking…".to_owned();
+                session.should_scroll = true;
+                ctx.request_repaint();
+            }
+            Event::AssistantDone { response_id } => {
+                let complete = {
+                    let session = &mut self.tabs[tab_index].session;
+                    if session.active_response_id.as_deref() != Some(&response_id) {
+                        false
+                    } else {
+                        session.active_response_id = None;
+                        session.last_assistant_item_id = None;
+                        session.status = if session.tool_calls_running > 0 {
+                            format!(
+                                "Running {} tool{}…",
+                                session.tool_calls_running,
+                                if session.tool_calls_running == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                }
+                            )
+                        } else {
+                            "Ready".to_owned()
+                        };
+                        session.tool_calls_running == 0
+                    }
+                };
+                if complete {
+                    self.complete_pending_asks_for_tab(tab_index);
+                    self.flush_background_turn(tab_index);
+                }
+                ctx.request_repaint();
+            }
+            Event::ToolCalls(calls) => {
+                let count = calls.len();
+                {
+                    let session = &mut self.tabs[tab_index].session;
+                    session.tool_calls_running = session.tool_calls_running.saturating_add(count);
+                    session.pending_tool_reply = true;
+                    let index = ensure_assistant_message_index(
+                        &mut session.messages,
+                        &mut session.active_assistant_message,
+                    );
+                    session.messages[index]
+                        .tool_calls
+                        .extend(calls.iter().map(|call| ToolInvocation {
+                            call_id: call.call_id.clone(),
+                            name: call.name.clone(),
+                            arguments: pretty_tool_arguments(&call.arguments),
+                            output: None,
+                        }));
+                    session.status =
+                        format!("Running {count} tool{}…", if count == 1 { "" } else { "s" });
+                    session.should_scroll = true;
+                }
+                self.start_background_local_tools(tab_index, calls);
+                ctx.request_repaint();
+            }
+            Event::ToolOutputsSubmitted { count } => {
+                let session = &mut self.tabs[tab_index].session;
+                session.tool_calls_running = session.tool_calls_running.saturating_sub(count);
+                session.status = if session.tool_calls_running == 0 {
+                    "Thinking…".to_owned()
+                } else {
+                    format!("Running {} tools…", session.tool_calls_running)
+                };
+                if session.tool_calls_running == 0 && session.active_response_id.is_none() {
+                    self.complete_pending_asks_for_tab(tab_index);
+                    self.flush_background_turn(tab_index);
+                }
+                ctx.request_repaint();
+            }
+            Event::Error(message) => {
+                let transport_exists = self.background_text_clients.contains_key(&tab_index);
+                let session = &mut self.tabs[tab_index].session;
+                session.error = Some(message.clone());
+                session.status = "Text request failed".to_owned();
+                // A failed turn does not necessarily close the app-server
+                // thread. Keep a live background transport reusable; a real
+                // disconnect removes it below and marks the tab offline.
+                if !transport_exists {
+                    session.state = ConnectionState::Offline;
+                }
+                self.fail_pending_asks_for_tab(tab_index, message);
+                ctx.request_repaint();
+            }
+            Event::ContextImageAccepted { .. }
+            | Event::ContextImageUploaded { .. }
+            | Event::ContextImageUploadFailed { .. }
+            | Event::AssistantAudio { .. }
+            | Event::AssistantSegmentDone { .. }
+            | Event::SpeechStarted
+            | Event::SpeechStopped
+            | Event::InputCommitted { .. }
+            | Event::InputTranscript { .. } => {}
+        }
+    }
+
+    fn start_background_local_tools(
+        &mut self,
+        tab_index: usize,
+        calls: Vec<crate::realtime::ToolCall>,
+    ) {
+        let Some(commands) = self
+            .background_text_clients
+            .get(&tab_index)
+            .map(|client| client.commands.clone())
+        else {
+            self.fail_pending_asks_for_tab(
+                tab_index,
+                "The background text transport is unavailable",
+            );
+            return;
+        };
+        let (screenshot_width, screenshot_height) = self
+            .tabs
+            .get(tab_index)
+            .map(|tab| {
+                (
+                    tab.session.settings.screenshot_width,
+                    tab.session.settings.screenshot_height,
+                )
+            })
+            .unwrap_or((1440, 900));
+        let tool_result_tx = self.tool_result_tx.clone();
+        thread::spawn(move || {
+            let screen_context = tools::ScreenContext {
+                screenshot_width,
+                screenshot_height,
+            };
+            let outputs: Vec<_> = calls
+                .into_iter()
+                .map(|call| ToolOutput {
+                    call_id: call.call_id,
+                    output: tools::execute_with_context(
+                        &call.name,
+                        &call.arguments,
+                        screen_context,
+                    ),
+                })
+                .collect();
+            for output in &outputs {
+                let _ =
+                    tool_result_tx.send((tab_index, output.call_id.clone(), output.output.clone()));
+            }
+            let _ = commands.send(Command::ToolOutputs(outputs));
+        });
+    }
+
+    fn flush_pending_voice_tool_outputs(&mut self) {
+        if self.pending_voice_tool_outputs.is_empty()
+            || self.state != ConnectionState::Live
+            || self.settings.backend == RealtimeBackend::CodexText
+        {
+            return;
+        }
+        let active_tab = self.active_tab;
+        let (ready, waiting): (Vec<_>, Vec<_>) = self
+            .pending_voice_tool_outputs
+            .drain(..)
+            .partition(|(origin, _)| *origin == active_tab);
+        self.pending_voice_tool_outputs = waiting;
+        if ready.is_empty() {
+            return;
+        }
+        let outputs = ready
+            .into_iter()
+            .map(|(_, output)| output)
+            .collect::<Vec<_>>();
+        let ui_outputs = outputs
+            .iter()
+            .map(|output| (active_tab, output.call_id.clone(), output.output.clone()))
+            .collect::<Vec<_>>();
+        if self
+            .realtime
+            .commands
+            .send(Command::ToolOutputs(outputs))
+            .is_err()
+        {
+            self.error =
+                Some("Could not return ask_text_model result to the voice model".to_owned());
+            return;
+        }
+        for result in ui_outputs {
+            let _ = self.tool_result_tx.send(result);
+        }
+    }
+
+    fn send_composer(&mut self) {
         if self.composer.trim().is_empty() && self.pending.is_empty() {
             return;
         }
         let text = std::mem::take(&mut self.composer);
         let attachments = std::mem::take(&mut self.pending);
         self.append_user_message(ChatMessage::user_text(text.clone(), &attachments));
-        let _ = self
-            .realtime
-            .commands
-            .send(Command::SendTurn { text, attachments });
-        self.status = "Thinking…".to_owned();
+        self.pending_turns.push_back(PendingTurn {
+            text,
+            attachments,
+            thinking_level: self.settings.thinking_level.wire_value().to_owned(),
+        });
+        if self.state == ConnectionState::Offline {
+            // Text sessions are deliberately lazy: the first Send both opens
+            // the app-server session and waits for Connected before sending.
+            // The same queue makes typed turns on voice tabs auto-connect too.
+            self.start();
+        } else if self.state == ConnectionState::Live {
+            self.flush_pending_turn();
+        } else {
+            self.status = "Connecting… will send when ready".to_owned();
+        }
         self.should_scroll = true;
+    }
+
+    fn draw_thinking_level_controls(&mut self, ui: &mut egui::Ui) {
+        let wide = ui.available_width() >= 520.0;
+        if wide {
+            for level in ThinkingLevel::VISIBLE {
+                let selected = self.settings.thinking_level == level;
+                if ui
+                    .add(egui::Button::new(level.label()).fill(if selected {
+                        LIGHT_BLUE_SELECTED
+                    } else {
+                        Color32::WHITE
+                    }))
+                    .on_hover_text(format!(
+                        "Use {} reasoning for the next request",
+                        level.label()
+                    ))
+                    .clicked()
+                {
+                    self.settings.thinking_level = level;
+                }
+            }
+            let more_selected = ThinkingLevel::MORE.contains(&self.settings.thinking_level);
+            egui::Frame::new()
+                .fill(if more_selected {
+                    LIGHT_BLUE_SELECTED
+                } else {
+                    Color32::WHITE
+                })
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::symmetric(2, 0))
+                .show(ui, |ui| {
+                    egui::ComboBox::from_id_salt("thinking_more")
+                        .selected_text(if more_selected {
+                            self.settings.thinking_level.label()
+                        } else {
+                            "More…"
+                        })
+                        .show_ui(ui, |ui| {
+                            style_light_blue_popup(ui);
+                            for level in ThinkingLevel::MORE {
+                                ui.selectable_value(
+                                    &mut self.settings.thinking_level,
+                                    level,
+                                    level.label(),
+                                );
+                            }
+                        });
+                });
+        } else {
+            egui::ComboBox::from_id_salt("thinking_level_narrow")
+                .selected_text(format!("Think: {}", self.settings.thinking_level.label()))
+                .show_ui(ui, |ui| {
+                    style_light_blue_popup(ui);
+                    for level in ThinkingLevel::ALL {
+                        ui.selectable_value(
+                            &mut self.settings.thinking_level,
+                            level,
+                            level.label(),
+                        );
+                    }
+                });
+        }
     }
 
     fn attach_path(&mut self, path: &Path) {
@@ -2322,23 +3197,27 @@ impl LiveAssistantApp {
                 if ui.button("⚙ Settings").clicked() {
                     self.show_settings = true;
                 }
-                let button = if self.state == ConnectionState::Offline {
-                    let label = if self.settings.backend == RealtimeBackend::CodexText {
-                        "● Start"
-                    } else {
-                        "● Start voice"
-                    };
-                    egui::Button::new(RichText::new(label).color(Color32::WHITE))
-                        .fill(Color32::from_rgb(31, 138, 84))
+                if self.state == ConnectionState::Offline
+                    && self.settings.backend == RealtimeBackend::CodexText
+                {
+                    ui.label(RichText::new("Text starts when you send").small().weak())
+                        .on_hover_text(
+                            "Text tabs connect automatically when the Send button is pressed.",
+                        );
                 } else {
-                    egui::Button::new(RichText::new("■ Stop").color(Color32::WHITE))
-                        .fill(Color32::from_rgb(190, 56, 65))
-                };
-                if ui.add(button).clicked() {
-                    if self.state == ConnectionState::Offline {
-                        self.start();
+                    let button = if self.state == ConnectionState::Offline {
+                        egui::Button::new(RichText::new("● Start voice").color(Color32::WHITE))
+                            .fill(Color32::from_rgb(31, 138, 84))
                     } else {
-                        self.stop();
+                        egui::Button::new(RichText::new("■ Stop").color(Color32::WHITE))
+                            .fill(Color32::from_rgb(190, 56, 65))
+                    };
+                    if ui.add(button).clicked() {
+                        if self.state == ConnectionState::Offline {
+                            self.start();
+                        } else {
+                            self.stop();
+                        }
                     }
                 }
                 ui.separator();
@@ -2365,6 +3244,13 @@ impl LiveAssistantApp {
             .collapsible(false)
             .resizable(false)
             .default_width(380.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(LIGHT_BLUE)
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(183, 211, 241)))
+                    .corner_radius(10.0)
+                    .inner_margin(egui::Margin::same(14)),
+            )
             .show(ctx, |ui| {
                 ui.label("Choose a model for a new conversation tab.");
                 ui.add_space(8.0);
@@ -2787,6 +3673,10 @@ impl LiveAssistantApp {
                             Err(error) => self.error = Some(error.to_string()),
                         }
                     }
+                    if self.settings.backend == RealtimeBackend::CodexText {
+                        ui.separator();
+                        self.draw_thinking_level_controls(ui);
+                    }
                     let level = self
                         .microphone
                         .as_ref()
@@ -2801,7 +3691,7 @@ impl LiveAssistantApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add_enabled(
-                                self.state == ConnectionState::Live,
+                                true,
                                 egui::Button::new(RichText::new("Send  ↑").color(Color32::WHITE))
                                     .fill(Color32::from_rgb(47, 105, 185)),
                             )
@@ -2832,6 +3722,8 @@ impl LiveAssistantApp {
             self.refresh_codex_info();
         }
         self.ensure_text_model_selection();
+        let available_tools =
+            available_tool_descriptions(Self::screen_info_for_settings(&self.settings));
         let mut open = self.show_settings;
         egui::Window::new("Settings")
             .open(&mut open)
@@ -2867,6 +3759,7 @@ impl LiveAssistantApp {
                                         RealtimeBackend::CodexText => "Text · Codex model",
                                     })
                                     .show_ui(ui, |ui| {
+                                        style_light_blue_popup(ui);
                                         ui.selectable_value(
                                             &mut self.settings.backend,
                                             RealtimeBackend::OpenAiRealtime,
@@ -2892,6 +3785,8 @@ impl LiveAssistantApp {
                                     .to_owned();
                                     if self.settings.backend == RealtimeBackend::CodexText {
                                         self.ensure_text_model_selection();
+                                        self.settings.thinking_level =
+                                            self.settings.default_thinking_level;
                                     }
                                 }
                                 ui.end_row();
@@ -2908,6 +3803,7 @@ impl LiveAssistantApp {
                                     egui::ComboBox::from_id_salt("text_model")
                                         .selected_text(&self.settings.model)
                                         .show_ui(ui, |ui| {
+                                            style_light_blue_popup(ui);
                                             for (model, display_name) in text_models {
                                                 ui.selectable_value(
                                                     &mut self.settings.model,
@@ -2920,6 +3816,7 @@ impl LiveAssistantApp {
                                     egui::ComboBox::from_id_salt("model")
                                         .selected_text(&self.settings.model)
                                         .show_ui(ui, |ui| {
+                                            style_light_blue_popup(ui);
                                             ui.selectable_value(
                                                 &mut self.settings.model,
                                                 "gpt-realtime-2.1".to_owned(),
@@ -2932,6 +3829,37 @@ impl LiveAssistantApp {
                                             );
                                         });
                                 }
+                                ui.end_row();
+
+                                ui.label("Default text model");
+                                let default_text_models = self.text_model_choices();
+                                egui::ComboBox::from_id_salt("default_text_model")
+                                    .selected_text(&self.settings.default_text_model)
+                                    .show_ui(ui, |ui| {
+                                        style_light_blue_popup(ui);
+                                        for (model, display_name) in default_text_models {
+                                            ui.selectable_value(
+                                                &mut self.settings.default_text_model,
+                                                model,
+                                                display_name,
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label("Default thinking level");
+                                egui::ComboBox::from_id_salt("default_thinking_level")
+                                    .selected_text(self.settings.default_thinking_level.label())
+                                    .show_ui(ui, |ui| {
+                                        style_light_blue_popup(ui);
+                                        for level in ThinkingLevel::ALL {
+                                            ui.selectable_value(
+                                                &mut self.settings.default_thinking_level,
+                                                level,
+                                                level.label(),
+                                            );
+                                        }
+                                    });
                                 ui.end_row();
 
                                 ui.label(if self.settings.backend == RealtimeBackend::CodexText {
@@ -2970,6 +3898,7 @@ impl LiveAssistantApp {
                                     egui::ComboBox::from_id_salt("voice")
                                         .selected_text(&self.settings.voice)
                                         .show_ui(ui, |ui| {
+                                            style_light_blue_popup(ui);
                                             if !voices.contains(&self.settings.voice) {
                                                 let current = self.settings.voice.clone();
                                                 ui.selectable_value(
@@ -3050,6 +3979,28 @@ impl LiveAssistantApp {
                                 ui.label(
                                     "Text models · Codex app-server threads with the same computer tools and image attachments",
                                 );
+                            });
+
+                        ui.add_space(8.0);
+                        egui::Frame::new()
+                            .fill(LIGHT_BLUE)
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(183, 211, 241)))
+                            .corner_radius(7.0)
+                            .inner_margin(egui::Margin::same(9))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new("Available tools").strong());
+                                ui.label(
+                                    RichText::new(
+                                        "Voice and Live models can use these tools. Text tabs use the computer tools and deliberately omit ask_text_model to prevent recursive text sessions.",
+                                    )
+                                    .small()
+                                    .weak(),
+                                );
+                                for (name, description) in &available_tools {
+                                    ui.add_space(4.0);
+                                    ui.label(RichText::new(format!("⚙ {name}")).strong());
+                                    ui.label(RichText::new(description).small());
+                                }
                             });
 
                         if self.settings.auth_mode == AuthMode::CodexApiKey {
@@ -3857,6 +4808,24 @@ fn configure_style(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_defaults_and_thinking_levels_use_the_expected_wire_values() {
+        let settings = Settings::default();
+        assert_eq!(settings.default_text_model, "gpt-5.6-luna");
+        assert_eq!(settings.default_thinking_level, ThinkingLevel::Light);
+        assert_eq!(settings.thinking_level, ThinkingLevel::Light);
+
+        for level in ThinkingLevel::ALL {
+            assert_eq!(parse_thinking_level(level.wire_value()), Some(level));
+        }
+        assert_eq!(parse_thinking_level("light"), Some(ThinkingLevel::Light));
+        assert_eq!(
+            parse_thinking_level("extra-high"),
+            Some(ThinkingLevel::ExtraHigh)
+        );
+        assert_eq!(parse_thinking_level("not-a-level"), None);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

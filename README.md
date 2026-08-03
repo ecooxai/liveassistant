@@ -43,6 +43,19 @@ This opens a small target window, clicks its center through the production
 `click_screen` implementation, and fails if the target does not receive the
 click or macOS reports a different pointer position.
 
+To verify JPEG screenshot upload and latest-image ordering on both OpenAI
+Realtime and GPT-Live, run:
+
+```sh
+cargo run -- --test-image-upload
+```
+
+The probe keeps one connection open per backend, uploads a real cat JPEG and
+requires the first voice turn to identify the cat, then uploads a real dog JPEG
+and requires the following voice turn to identify the dog rather than the stale
+cat. It fails if either upload exceeds the deadline or either backend sees the
+wrong image.
+
 On Debian/Ubuntu Linux, the typical build dependencies are:
 
 ```sh
@@ -84,10 +97,12 @@ app's built-in instructions.
 
 ## Privacy and behavior
 
-Audio streams while the voice session is live. A screen capture is taken only
-after the server reports the start of speech, not continuously. Disable
-per-turn screenshots in Settings. Press **Stop** to close the WebSocket and
-microphone.
+Microphone capture starts as soon as **Start voice** is clicked. Audio recorded
+while the transport connects is kept in order (up to the latest 60 seconds),
+then flushed when the session is ready before live audio continues. A screen
+capture is taken after roughly half a second of clear speech or the first live
+transcript token, not continuously. Disable per-turn screenshots in Settings.
+Press **Stop** to close the transport and microphone.
 
 Computer tools run with the current user's permissions. The session prompt
 treats screenshot/application text as untrusted content. Bash commands time out
@@ -98,7 +113,10 @@ Assistant speech uses the normal native output device at full fidelity and
 volume. The always-open microphone uses OS voice-processing capture, which
 monitors/links system output as its acoustic echo-cancellation reference. On
 Linux, system-wide AEC requires PulseAudio `module-echo-cancel`; macOS uses
-VoiceProcessingIO and Windows uses WASAPI AEC.
+VoiceProcessingIO and Windows uses WASAPI AEC. On macOS 14 and newer, the app
+requests activity-aware, minimum-level media ducking so other audio is not
+reduced throughout the entire connection; macOS can still apply a small
+reduction while VoiceProcessingIO detects speech.
 
 Uploaded audio is decoded locally, converted to mono 24 kHz PCM, and then sent
 as an `input_audio` conversation item. User voice turns can be replayed or

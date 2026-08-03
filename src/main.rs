@@ -80,6 +80,20 @@ fn main() -> eframe::Result<()> {
             }
         }
     }
+    if std::env::args().any(|argument| argument == "--test-image-upload") {
+        match realtime::probe_context_image_uploads() {
+            Ok(()) => {
+                println!(
+                    "JPEG upload and latest-image ordering probe succeeded for OpenAI Realtime and GPT-Live."
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("JPEG upload probe failed: {error:#}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     let _instance_guard = match SingleInstanceGuard::acquire() {
         Ok(guard) => guard,

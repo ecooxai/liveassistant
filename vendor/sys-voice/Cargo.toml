@@ -1,0 +1,41 @@
+[package]
+name = "sys-voice"
+version = "0.2.0"
+edition = "2021"
+description = "Cross-platform native voice I/O with OS-level Acoustic Echo Cancellation"
+license = "MIT"
+repository = "https://github.com/tigy32/sys-voice"
+keywords = ["audio", "voice", "aec", "echo-cancellation", "cross-platform"]
+categories = ["multimedia::audio"]
+
+[dependencies]
+thiserror = "2"
+rubato = "0.16"
+flume = "0.11"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync"] }
+tracing = "0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+coreaudio-rs = "0.12"
+coreaudio-sys = "0.2"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+# iOS requires objc bridging for AVAudioEngine - manual bindings
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSError", "NSString"] }
+block2 = "0.6"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wasapi = "0.22"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libpulse-binding = "2"
+libpulse-simple-binding = "2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+oboe = "0.6"
+
+[dev-dependencies]
+hound = "3"
+cpal = "0.15"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }

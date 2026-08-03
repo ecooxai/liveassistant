@@ -39,3 +39,6 @@ objc2-foundation = "0.2.2"
 [profile.release]
 lto = "thin"
 strip = true
+
+[patch.crates-io]
+sys-voice = { path = "vendor/sys-voice" }

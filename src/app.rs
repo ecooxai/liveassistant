@@ -5,8 +5,8 @@ use crate::{
     live_pointer,
     media::{self, Attachment},
     realtime::{
-        Command, ConnectOptions, Event, RealtimeBackend, RealtimeClient, ToolOutput,
-        shared_system_prompt,
+        CONTEXT_IMAGE_UPLOAD_TIMEOUT, Command, ConnectOptions, Event, RealtimeBackend,
+        RealtimeClient, ToolOutput, shared_system_prompt,
     },
     tools,
 };
@@ -26,7 +26,9 @@ use std::{
 };
 
 const SETTINGS_KEY: &str = "live_assistant.settings";
-const SPEECH_SCREENSHOT_SAMPLE_TARGET: usize = 24_000;
+/// Capture after roughly half a second of clear 24 kHz speech so the image is
+/// already visible and uploading before the user finishes the sentence.
+const SPEECH_SCREENSHOT_SAMPLE_TARGET: usize = 24_000 / 2;
 const CODEX_USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const ASSISTANT_WAV_SPLIT_MIN_SAMPLES: usize = 24_000 * 5;
 const MESSAGE_CONTINUATION_WINDOW: Duration = Duration::from_secs(5);
@@ -82,6 +84,7 @@ impl Default for Settings {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Role {
+    System(RealtimeBackend),
     User,
     Assistant,
 }
@@ -106,6 +109,7 @@ struct ChatImage {
     full_load_attempted: bool,
     upload_id: Option<u64>,
     upload_state: ImageUploadState,
+    upload_deadline: Option<Instant>,
 }
 
 struct PreparedChatImage {
@@ -134,9 +138,14 @@ impl PreparedChatImage {
                     .transpose()?
                     .unwrap_or_default();
                 anyhow::ensure!(!sent_image.is_empty(), "sent image data is unavailable");
+                let thumbnail = decode_color_image(thumbnail)
+                    // The transport image is also a valid local preview. Falling back
+                    // to it keeps a successfully captured screenshot visible even if
+                    // its separately encoded thumbnail cannot be decoded.
+                    .or_else(|_| decode_color_image(&sent_image))?;
                 Ok(Some(Self {
                     name: name.clone(),
-                    thumbnail: decode_color_image(thumbnail)?,
+                    thumbnail,
                     sent_image,
                     width: *width,
                     height: *height,
@@ -161,6 +170,7 @@ impl PreparedChatImage {
             full_load_attempted: false,
             upload_id: None,
             upload_state: ImageUploadState::Uploaded,
+            upload_deadline: None,
         }
     }
 }
@@ -187,17 +197,38 @@ impl ChatImage {
         Ok(())
     }
 
-    fn begin_upload(&mut self, upload_id: u64) {
+    fn begin_upload(&mut self, upload_id: u64, deadline: Instant) {
         self.upload_id = Some(upload_id);
         self.upload_state = ImageUploadState::Uploading;
+        self.upload_deadline = Some(deadline);
     }
 
-    fn finish_upload(&mut self) {
-        self.upload_state = ImageUploadState::Uploaded;
+    fn finish_upload(&mut self) -> bool {
+        match self.upload_state {
+            ImageUploadState::Uploading => {
+                self.upload_state = ImageUploadState::Uploaded;
+                self.upload_deadline = None;
+                true
+            }
+            ImageUploadState::Uploaded => true,
+            // A response received after the ten-second deadline must not revive
+            // an upload the app has already given up on.
+            ImageUploadState::Failed => false,
+        }
     }
 
-    fn fail_upload(&mut self) {
+    fn fail_upload(&mut self) -> bool {
+        if self.upload_state != ImageUploadState::Uploading {
+            return false;
+        }
         self.upload_state = ImageUploadState::Failed;
+        self.upload_deadline = None;
+        true
+    }
+
+    fn upload_timed_out(&self, now: Instant) -> bool {
+        self.upload_state == ImageUploadState::Uploading
+            && self.upload_deadline.is_some_and(|deadline| now >= deadline)
     }
 
     fn preview_tint(&self) -> Color32 {
@@ -279,6 +310,22 @@ struct ToolInvocation {
 }
 
 impl ChatMessage {
+    fn system(text: String, backend: RealtimeBackend) -> Self {
+        Self {
+            role: Role::System(backend),
+            text,
+            audio: Vec::new(),
+            tool_calls: Vec::new(),
+            attachment_names: Vec::new(),
+            images: Vec::new(),
+            included_screen: false,
+            voice_turn: false,
+            server_item_id: None,
+            voice_transcript_segments: Vec::new(),
+            voice_last_activity_at: None,
+        }
+    }
+
     fn user_text(text: String, attachments: &[Attachment]) -> Self {
         let audio = attachments
             .iter()
@@ -497,7 +544,7 @@ impl SpeechScreenshotGate {
         if self.sent || !self.speech_active || !speech_is_active {
             return false;
         }
-        loud_speech_samples > SPEECH_SCREENSHOT_SAMPLE_TARGET
+        loud_speech_samples >= SPEECH_SCREENSHOT_SAMPLE_TARGET
     }
 
     fn mark_sent(&mut self) {
@@ -516,8 +563,6 @@ pub struct LiveAssistantApp {
     speaker: Option<Speaker>,
     settings: Settings,
     api_key: String,
-    active_system_prompt: Option<String>,
-    active_system_prompt_backend: Option<RealtimeBackend>,
     show_settings: bool,
     state: ConnectionState,
     status: String,
@@ -535,6 +580,7 @@ pub struct LiveAssistantApp {
     screenshot_capture_in_flight: Option<u64>,
     screenshot_message_index: Option<usize>,
     next_context_upload_id: u64,
+    confirmed_context_uploads: HashSet<u64>,
     captured_transcript_items: HashSet<String>,
     deferred_voice_response: bool,
     screenshot_result_tx: Sender<SpeechScreenshotResult>,
@@ -661,8 +707,6 @@ impl LiveAssistantApp {
             speaker,
             settings,
             api_key,
-            active_system_prompt: None,
-            active_system_prompt_backend: None,
             show_settings: false,
             state: ConnectionState::Offline,
             status: "Ready".to_owned(),
@@ -680,6 +724,7 @@ impl LiveAssistantApp {
             screenshot_capture_in_flight: None,
             screenshot_message_index: None,
             next_context_upload_id: 0,
+            confirmed_context_uploads: HashSet::new(),
             captured_transcript_items: HashSet::new(),
             deferred_voice_response: false,
             screenshot_result_tx,
@@ -759,8 +804,45 @@ impl LiveAssistantApp {
         }
     }
 
+    fn fail_start(&mut self, message: String, show_settings: bool) {
+        let _ = self.realtime.commands.send(Command::Disconnect);
+        self.microphone = None;
+        if let Some(speaker) = &mut self.speaker {
+            let _ = speaker.clear();
+        }
+        self.state = ConnectionState::Offline;
+        self.status = "Ready".to_owned();
+        self.show_settings |= show_settings;
+        self.error = Some(message);
+    }
+
     fn start(&mut self) {
         self.error = None;
+        if self.speaker.is_none() {
+            match Speaker::new() {
+                Ok(speaker) => self.speaker = Some(speaker),
+                Err(error) => {
+                    self.fail_start(format!("Could not open audio output: {error:#}"), false);
+                    return;
+                }
+            }
+        }
+
+        // Open capture as the first connection action. Audio chunks produced while
+        // credentials, screen metadata, and the transport are being prepared stay
+        // ordered in the realtime supervisor's bounded pre-connect buffer.
+        match Microphone::start(self.realtime.commands.clone()) {
+            Ok(microphone) => {
+                self.microphone = Some(microphone);
+                self.state = ConnectionState::Connecting;
+                self.status = "Mic on · Recording while connecting…".to_owned();
+            }
+            Err(error) => {
+                self.fail_start(format!("{error:#}"), false);
+                return;
+            }
+        }
+
         let screen_info = match media::primary_screen_info() {
             Ok(screen) => {
                 self.settings.screenshot_width = screen.logical_width;
@@ -768,9 +850,10 @@ impl LiveAssistantApp {
                 screen
             }
             Err(error) => {
-                self.error = Some(format!(
-                    "Could not read the primary display resolution: {error:#}"
-                ));
+                self.fail_start(
+                    format!("Could not read the primary display resolution: {error:#}"),
+                    false,
+                );
                 return;
             }
         };
@@ -791,15 +874,24 @@ impl LiveAssistantApp {
                     self.settings.backend,
                     system_prompt.len()
                 );
-                self.active_system_prompt = Some(system_prompt);
-                self.active_system_prompt_backend = Some(self.settings.backend);
-                let _ = self.realtime.commands.send(Command::Connect(options));
-                self.state = ConnectionState::Connecting;
-                self.status = "Connecting…".to_owned();
+                if self
+                    .realtime
+                    .commands
+                    .send(Command::Connect(options))
+                    .is_err()
+                {
+                    self.fail_start(
+                        "Could not start Realtime connection: audio service stopped".to_owned(),
+                        false,
+                    );
+                    return;
+                }
+                self.messages
+                    .push(ChatMessage::system(system_prompt, self.settings.backend));
+                self.should_scroll = true;
             }
             Err(error) => {
-                self.show_settings = true;
-                self.error = Some(error.to_string());
+                self.fail_start(error.to_string(), true);
             }
         }
     }
@@ -811,8 +903,6 @@ impl LiveAssistantApp {
             let _ = speaker.clear();
         }
         self.state = ConnectionState::Offline;
-        self.active_system_prompt = None;
-        self.active_system_prompt_backend = None;
         self.active_response_id = None;
         self.last_assistant_item_id = None;
         self.active_assistant_message = None;
@@ -820,6 +910,8 @@ impl LiveAssistantApp {
         self.assistant_text_needs_separator = false;
         self.speech_screenshot_gate.end();
         self.captured_transcript_items.clear();
+        self.confirmed_context_uploads.clear();
+        self.fail_pending_context_uploads();
         self.cancel_speech_screenshot();
         self.active_voice_message = None;
         self.tool_calls_running = 0;
@@ -874,11 +966,19 @@ impl LiveAssistantApp {
             match event {
                 Event::Connecting => {
                     self.state = ConnectionState::Connecting;
-                    self.status = "Connecting…".to_owned();
+                    self.status = if self.microphone.is_some() {
+                        "Mic on · Recording while connecting…".to_owned()
+                    } else {
+                        "Connecting…".to_owned()
+                    };
                 }
                 Event::Reconnecting { attempt, reason } => {
                     self.state = ConnectionState::Connecting;
-                    self.status = format!("Reconnecting GPT-Live… attempt {attempt}");
+                    self.status = if self.microphone.is_some() {
+                        format!("Mic on · Recording during reconnect… attempt {attempt}")
+                    } else {
+                        format!("Reconnecting GPT-Live… attempt {attempt}")
+                    };
                     if self.fail_pending_context_uploads() > 0 {
                         self.error = Some(format!(
                             "Screenshot upload interrupted by reconnect: {reason}"
@@ -919,13 +1019,12 @@ impl LiveAssistantApp {
                         let _ = speaker.clear();
                     }
                     self.state = ConnectionState::Offline;
-                    self.active_system_prompt = None;
-                    self.active_system_prompt_backend = None;
                     self.active_response_id = None;
                     self.last_assistant_item_id = None;
                     self.active_assistant_message = None;
                     self.speech_screenshot_gate.end();
                     self.captured_transcript_items.clear();
+                    self.confirmed_context_uploads.clear();
                     self.cancel_speech_screenshot();
                     self.active_voice_message = None;
                     self.tool_calls_running = 0;
@@ -1111,17 +1210,17 @@ impl LiveAssistantApp {
                     self.should_scroll = true;
                 }
                 Event::ContextImageAccepted { upload_id } => {
-                    if let Some(image) = self.context_image_mut(upload_id) {
-                        image.finish_upload();
-                        self.status = "Mic on · Hearing you… · Screen queued".to_owned();
-                        self.should_scroll = true;
-                        ctx.request_repaint();
-                        eprintln!("[live-assistant image] backend accepted upload_id={upload_id}");
-                    }
+                    // Accepted means the backend has queued the JPEG. Keep the
+                    // overlay visible until its server acknowledgment confirms
+                    // that the image reached conversation context.
+                    self.status = "Mic on · Hearing you… · Screen queued".to_owned();
+                    self.should_scroll = true;
+                    ctx.request_repaint();
+                    eprintln!("[live-assistant image] backend queued upload_id={upload_id}");
                 }
                 Event::ContextImageUploaded { upload_id } => {
-                    if let Some(image) = self.context_image_mut(upload_id) {
-                        image.finish_upload();
+                    let completed = self.mark_context_image_uploaded(upload_id);
+                    if completed {
                         self.status = if self
                             .microphone
                             .as_ref()
@@ -1134,19 +1233,24 @@ impl LiveAssistantApp {
                         };
                         self.should_scroll = true;
                         ctx.request_repaint();
-                        eprintln!("[live-assistant image] upload confirmed upload_id={upload_id}");
                     }
+                    eprintln!(
+                        "[live-assistant image] upload confirmed upload_id={upload_id} applied={completed}"
+                    );
                 }
                 Event::ContextImageUploadFailed { upload_id, detail } => {
-                    if let Some(image) = self.context_image_mut(upload_id) {
-                        image.fail_upload();
+                    self.confirmed_context_uploads.remove(&upload_id);
+                    let failed = self
+                        .context_image_mut(upload_id)
+                        .is_some_and(ChatImage::fail_upload);
+                    if failed {
+                        self.error = Some(format!("Screenshot upload failed: {detail}"));
+                        self.status = "Screenshot upload failed".to_owned();
+                        self.should_scroll = true;
+                        ctx.request_repaint();
                     }
-                    self.error = Some(format!("Screenshot upload failed: {detail}"));
-                    self.status = "Screenshot upload failed".to_owned();
-                    self.should_scroll = true;
-                    ctx.request_repaint();
                     eprintln!(
-                        "[live-assistant image] upload failed upload_id={upload_id}: {detail}"
+                        "[live-assistant image] upload failed upload_id={upload_id} applied={failed}: {detail}"
                     );
                 }
                 Event::AssistantResponseStarted { response_id } => {
@@ -1164,7 +1268,9 @@ impl LiveAssistantApp {
                                 .is_some_and(|message| !message.text.trim().is_empty())
                         });
                     if let Some(speaker) = &mut self.speaker {
-                        speaker.begin_assistant_response();
+                        speaker.begin_assistant_response(
+                            self.settings.backend == RealtimeBackend::CodexGptLive,
+                        );
                     }
                     self.active_response_id = Some(response_id);
                     self.last_assistant_item_id = None;
@@ -1324,14 +1430,24 @@ impl LiveAssistantApp {
                     self.error = Some(message);
                     if self.state != ConnectionState::Live {
                         self.state = ConnectionState::Offline;
-                        self.active_system_prompt = None;
-                        self.active_system_prompt_backend = None;
                     }
                 }
             }
         }
 
-        self.finalize_expired_assistant_group(Instant::now());
+        let now = Instant::now();
+        self.finalize_expired_assistant_group(now);
+        let expired_uploads = self.expire_context_image_uploads(now);
+        if expired_uploads > 0 {
+            self.error = Some(if expired_uploads == 1 {
+                "Screenshot upload gave up after 10 seconds".to_owned()
+            } else {
+                format!("{expired_uploads} screenshot uploads gave up after 10 seconds")
+            });
+            self.status = "Screenshot upload timed out".to_owned();
+            self.should_scroll = true;
+            ctx.request_repaint();
+        }
 
         if self.state == ConnectionState::Live
             && self.active_response_id.is_none()
@@ -1340,10 +1456,9 @@ impl LiveAssistantApp {
                 .as_ref()
                 .map(Speaker::assistant_is_playing)
                 .unwrap_or(false)
+            && self.status.contains("Speaking")
         {
-            if self.status.contains("Speaking") {
-                self.status = "Mic on · Listening".to_owned();
-            }
+            self.status = "Mic on · Listening".to_owned();
         }
     }
 
@@ -1493,6 +1608,41 @@ impl LiveAssistantApp {
             .find(|image| image.upload_id == Some(upload_id))
     }
 
+    /// Apply an acknowledgment even if it arrives before the preview has been
+    /// installed. The latter case is retained and consumed during insertion so
+    /// an uploaded image can never be left behind with an "Uploading…" overlay.
+    fn mark_context_image_uploaded(&mut self, upload_id: u64) -> bool {
+        if let Some(image) = self.context_image_mut(upload_id) {
+            return image.finish_upload();
+        }
+        self.confirmed_context_uploads.insert(upload_id);
+        false
+    }
+
+    fn expire_context_image_uploads(&mut self, now: Instant) -> usize {
+        let mut expired_ids = Vec::new();
+        for image in self
+            .messages
+            .iter_mut()
+            .flat_map(|message| message.images.iter_mut())
+        {
+            if image.upload_timed_out(now)
+                && image.fail_upload()
+                && let Some(upload_id) = image.upload_id
+            {
+                expired_ids.push(upload_id);
+                eprintln!(
+                    "[live-assistant image] upload timeout upload_id={upload_id} seconds={}",
+                    CONTEXT_IMAGE_UPLOAD_TIMEOUT.as_secs()
+                );
+            }
+        }
+        for upload_id in &expired_ids {
+            self.confirmed_context_uploads.remove(upload_id);
+        }
+        expired_ids.len()
+    }
+
     fn fail_pending_context_uploads(&mut self) -> usize {
         let mut failed = 0usize;
         for image in self
@@ -1525,29 +1675,22 @@ impl LiveAssistantApp {
 
             match capture.result {
                 Ok(image) => {
-                    if self.state != ConnectionState::Live {
+                    if self.state == ConnectionState::Offline {
                         continue;
                     }
                     let message_index = screenshot_message_index.unwrap_or_else(|| {
                         self.append_user_message(ChatMessage::user_voice(Vec::new(), None))
                     });
                     let upload_id = self.allocate_context_upload_id();
+                    let upload_deadline = Instant::now() + CONTEXT_IMAGE_UPLOAD_TIMEOUT;
                     let image_index = self.messages[message_index].images.len();
 
-                    // Start transport upload before decoding and installing the preview texture.
-                    // This keeps the image upload on the latency-critical path while the local UI
-                    // work happens immediately afterwards.
-                    let send_result = self.realtime.commands.send(Command::SendContextImage {
-                        upload_id,
-                        image: image.clone(),
-                    });
-
-                    match PreparedChatImage::from_attachment(&image) {
+                    let prepared = match PreparedChatImage::from_attachment(&image) {
                         Ok(Some(prepared_image)) => {
                             let mut chat_image = prepared_image.into_chat_image();
-                            chat_image.begin_upload(upload_id);
-                            if send_result.is_err() {
-                                chat_image.fail_upload();
+                            chat_image.begin_upload(upload_id, upload_deadline);
+                            if self.confirmed_context_uploads.remove(&upload_id) {
+                                let _ = chat_image.finish_upload();
                             }
                             if let Err(error) = chat_image.ensure_thumbnail_texture(
                                 ctx,
@@ -1557,49 +1700,69 @@ impl LiveAssistantApp {
                                     "Screenshot was captured but could not be displayed: {error:#}"
                                 ));
                             }
-                            let message = &mut self.messages[message_index];
-                            message.images.push(chat_image);
-                            message.included_screen = true;
-                            eprintln!(
-                                "[live-assistant image] upload started upload_id={} turn={} message={} image={} total_images={}",
-                                upload_id,
-                                capture.turn_id,
-                                message_index,
-                                image_index,
-                                message.images.len()
-                            );
+                            Some(chat_image)
                         }
                         Ok(None) => {
                             self.error = Some(
                                 "Screenshot capture did not produce an image attachment".to_owned(),
                             );
+                            None
                         }
                         Err(error) => {
                             self.error = Some(format!(
                                 "Screenshot was captured but could not be prepared: {error:#}"
                             ));
+                            None
+                        }
+                    };
+
+                    if let Some(chat_image) = prepared {
+                        // Install the local preview first. Any backend acknowledgment now
+                        // has a matching image, and the next repaint shows the dimmed image
+                        // plus its uploading overlay immediately.
+                        let message = &mut self.messages[message_index];
+                        message.images.push(chat_image);
+                        message.included_screen = true;
+                        eprintln!(
+                            "[live-assistant image] preview ready upload_id={} turn={} message={} image={} total_images={}",
+                            upload_id,
+                            capture.turn_id,
+                            message_index,
+                            image_index,
+                            message.images.len()
+                        );
+                        self.should_scroll = true;
+                        ctx.request_repaint();
+
+                        let send_result = self.realtime.commands.send(Command::SendContextImage {
+                            upload_id,
+                            image,
+                            deadline: upload_deadline,
+                        });
+                        if send_result.is_err() {
+                            if let Some(chat_image) = self.context_image_mut(upload_id) {
+                                chat_image.fail_upload();
+                            }
+                            self.error = Some(
+                                "Screenshot captured but upload could not start: Realtime connection closed"
+                                    .to_owned(),
+                            );
+                            self.status = "Screenshot upload failed".to_owned();
+                        } else if self.state == ConnectionState::Connecting {
+                            self.status = "Mic on · Connecting · Uploading screen…".to_owned();
+                        } else {
+                            self.status = "Mic on · Hearing you… · Uploading screen…".to_owned();
+                        }
+                        if capture.turn_id == self.speech_turn_id
+                            && self
+                                .microphone
+                                .as_ref()
+                                .map(Microphone::in_speech)
+                                .unwrap_or(false)
+                        {
+                            self.active_voice_message = Some(message_index);
                         }
                     }
-
-                    if send_result.is_err() {
-                        self.error = Some(
-                            "Screenshot captured but upload could not start: Realtime connection closed"
-                                .to_owned(),
-                        );
-                        self.status = "Screenshot upload failed".to_owned();
-                    } else {
-                        self.status = "Mic on · Hearing you… · Uploading screen…".to_owned();
-                    }
-                    if capture.turn_id == self.speech_turn_id
-                        && self
-                            .microphone
-                            .as_ref()
-                            .map(Microphone::in_speech)
-                            .unwrap_or(false)
-                    {
-                        self.active_voice_message = Some(message_index);
-                    }
-                    self.should_scroll = true;
                 }
                 Err(error) => {
                     self.error = Some(format!("Screenshot not sent: {error}"));
@@ -1622,7 +1785,7 @@ impl LiveAssistantApp {
         message_index: usize,
         trigger: &'static str,
     ) -> bool {
-        if self.state != ConnectionState::Live
+        if self.state == ConnectionState::Offline
             || !self.settings.send_screenshot
             || self.screenshot_capture_in_flight.is_some()
             || self.speech_screenshot_gate.sent
@@ -1638,7 +1801,11 @@ impl LiveAssistantApp {
         let turn_id = self.speech_turn_id;
         self.screenshot_capture_in_flight = Some(turn_id);
         self.screenshot_message_index = Some(message_index);
-        self.status = "Mic on · Hearing you… · Capturing screen".to_owned();
+        self.status = if self.state == ConnectionState::Connecting {
+            "Mic on · Connecting · Capturing screen".to_owned()
+        } else {
+            "Mic on · Hearing you… · Capturing screen".to_owned()
+        };
         self.should_scroll = true;
         eprintln!(
             "[live-assistant image] capture triggered trigger={} turn={} message={}",
@@ -1666,7 +1833,7 @@ impl LiveAssistantApp {
     }
 
     fn maybe_send_speech_screenshot(&mut self, ctx: &egui::Context) {
-        if self.state != ConnectionState::Live
+        if self.state == ConnectionState::Offline
             || !self.settings.send_screenshot
             || self.screenshot_capture_in_flight.is_some()
         {
@@ -1681,7 +1848,7 @@ impl LiveAssistantApp {
         // Transcript deltas are the primary trigger. This audio path is only a fallback
         // for speech that has not produced its first transcription token yet.
         if !self.speech_screenshot_gate.speech_active
-            && loud_speech_samples > SPEECH_SCREENSHOT_SAMPLE_TARGET
+            && loud_speech_samples >= SPEECH_SCREENSHOT_SAMPLE_TARGET
         {
             self.ensure_active_voice_message();
         }
@@ -1828,7 +1995,7 @@ impl LiveAssistantApp {
             ui.add_space(10.0);
             ui.label(
                 RichText::new(
-                    "Start voice, then speak naturally. After one second of clear speech, \
+                    "Start voice, then speak naturally. After half a second of clear speech, \
                      the current screen is sent while you are still talking.",
                 )
                 .weak(),
@@ -1842,55 +2009,6 @@ impl LiveAssistantApp {
                 ui.label("＋ Images & audio");
             });
         });
-    }
-
-    fn draw_active_system_prompt(&self, ui: &mut egui::Ui) {
-        let Some(prompt) = self.active_system_prompt.as_deref() else {
-            return;
-        };
-        egui::Frame::new()
-            .fill(Color32::from_rgb(239, 245, 252))
-            .stroke(Stroke::new(1.0, Color32::from_rgb(196, 211, 230)))
-            .corner_radius(9.0)
-            .inner_margin(egui::Margin::same(10))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("SYSTEM PROMPT · CURRENT CONNECTION")
-                            .small()
-                            .strong()
-                            .color(Color32::from_rgb(52, 83, 124)),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(match self.active_system_prompt_backend {
-                                Some(RealtimeBackend::OpenAiRealtime) => "OpenAI Realtime",
-                                Some(RealtimeBackend::CodexGptLive) => "GPT-Live",
-                                None => "Current connection",
-                            })
-                            .small()
-                            .weak(),
-                        );
-                    });
-                });
-                ui.add_space(5.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("active-system-prompt")
-                    .max_height(160.0)
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(prompt)
-                                    .monospace()
-                                    .small()
-                                    .color(Color32::from_rgb(48, 57, 70)),
-                            )
-                            .selectable(true),
-                        );
-                    });
-            });
     }
 
     fn draw_messages(&mut self, ui: &mut egui::Ui) {
@@ -1909,7 +2027,15 @@ impl LiveAssistantApp {
                 self.error = image_error;
             }
 
-            let is_user = self.messages[index].role == Role::User;
+            let role = self.messages[index].role;
+            let is_user = role == Role::User;
+            let is_assistant = role == Role::Assistant;
+            let role_label = match role {
+                Role::System(RealtimeBackend::OpenAiRealtime) => "SYSTEM · OPENAI REALTIME",
+                Role::System(RealtimeBackend::CodexGptLive) => "SYSTEM · GPT-LIVE",
+                Role::User => "YOU",
+                Role::Assistant => "ASSISTANT",
+            };
             let width = available * 0.76;
             let layout = if is_user {
                 egui::Layout::right_to_left(egui::Align::Min)
@@ -1932,15 +2058,11 @@ impl LiveAssistantApp {
                         ui.vertical(|ui| {
                             ui.set_max_width(width);
                             let message = &self.messages[index];
-                            ui.label(
-                                RichText::new(if is_user { "YOU" } else { "ASSISTANT" })
-                                    .small()
-                                    .color(if is_user {
-                                        Color32::from_rgb(37, 92, 158)
-                                    } else {
-                                        Color32::from_rgb(92, 102, 116)
-                                    }),
-                            );
+                            ui.label(RichText::new(role_label).small().color(if is_user {
+                                Color32::from_rgb(37, 92, 158)
+                            } else {
+                                Color32::from_rgb(92, 102, 116)
+                            }));
                             for tool in &message.tool_calls {
                                 ui.add_space(7.0);
                                 egui::Frame::new()
@@ -2014,7 +2136,7 @@ impl LiveAssistantApp {
                                 };
                                 ui.label(RichText::new(caption).small().weak());
                             }
-                            if !is_user {
+                            if is_assistant {
                                 ui.add_space(5.0);
                                 ui.label(
                                     RichText::new("Transcript")
@@ -2028,7 +2150,7 @@ impl LiveAssistantApp {
                                 ui.label(&message.text);
                             } else if message.voice_turn {
                                 ui.label(RichText::new("Transcribing…").italics().weak());
-                            } else if !is_user {
+                            } else if is_assistant {
                                 ui.label(
                                     RichText::new("Receiving assistant transcript…")
                                         .italics()
@@ -2208,7 +2330,7 @@ impl LiveAssistantApp {
                         .as_ref()
                         .map(Microphone::level)
                         .unwrap_or(0.0);
-                    if self.state == ConnectionState::Live {
+                    if self.microphone.is_some() {
                         ui.add(
                             egui::ProgressBar::new((level * 5.0).clamp(0.0, 1.0))
                                 .desired_width(70.0),
@@ -2423,9 +2545,9 @@ impl LiveAssistantApp {
                                 );
                                 ui.label(
                                     RichText::new(
-                                        "GPT-Live uses Codex handoffs for screenshots/images and the \
-                                         app's local click/bash/insert tools. Audio and transcripts \
-                                         remain on the low-latency WebRTC path.",
+                                        "GPT-Live adds screenshots as Codex multimodal thread context, \
+                                         using delegation when visual inspection is needed. Audio, \
+                                         transcripts, and local tools remain on low-latency paths.",
                                     )
                                     .small()
                                     .weak(),
@@ -2440,7 +2562,7 @@ impl LiveAssistantApp {
                         ui.add_space(8.0);
                         ui.checkbox(
                             &mut self.settings.send_screenshot,
-                            "Send the primary display after 1 second of clear speech",
+                            "Send the primary display after 0.5 seconds of clear speech",
                         );
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
@@ -2892,10 +3014,6 @@ impl eframe::App for LiveAssistantApp {
                     .inner_margin(egui::Margin::symmetric(22, 18)),
             )
             .show(ctx, |ui| {
-                if self.active_system_prompt.is_some() {
-                    self.draw_active_system_prompt(ui);
-                    ui.add_space(12.0);
-                }
                 if self.messages.is_empty() {
                     self.draw_empty(ui);
                 } else {
@@ -3322,7 +3440,7 @@ mod tests {
         let mut assistant = ChatMessage::assistant();
         assistant.text = "first AI part".to_owned();
         assistant.audio.extend_from_slice(&[1, 2]);
-        let messages = vec![ChatMessage::user_voice(vec![9], None), assistant];
+        let messages = [ChatMessage::user_voice(vec![9], None), assistant];
         let deadline = now + MESSAGE_CONTINUATION_WINDOW;
 
         assert!(now + Duration::from_secs(4) <= deadline);
@@ -3408,14 +3526,14 @@ mod tests {
     }
 
     #[test]
-    fn speech_screenshot_audio_fallback_waits_for_one_second_and_fires_once() {
+    fn speech_screenshot_audio_fallback_waits_for_half_second_and_fires_once() {
         let mut gate = SpeechScreenshotGate::default();
 
-        assert_eq!(SPEECH_SCREENSHOT_SAMPLE_TARGET, 24_000);
+        assert_eq!(SPEECH_SCREENSHOT_SAMPLE_TARGET, 12_000);
         assert!(!gate.should_capture(SPEECH_SCREENSHOT_SAMPLE_TARGET, true));
         gate.begin();
         assert!(!gate.should_capture(SPEECH_SCREENSHOT_SAMPLE_TARGET - 1, true));
-        assert!(!gate.should_capture(SPEECH_SCREENSHOT_SAMPLE_TARGET, true));
+        assert!(gate.should_capture(SPEECH_SCREENSHOT_SAMPLE_TARGET, true));
         assert!(!gate.should_capture(SPEECH_SCREENSHOT_SAMPLE_TARGET + 1, false));
         assert!(gate.should_capture(SPEECH_SCREENSHOT_SAMPLE_TARGET + 1, true));
         gate.mark_sent();
@@ -3441,15 +3559,68 @@ mod tests {
             full_load_attempted: false,
             upload_id: None,
             upload_state: ImageUploadState::Uploaded,
+            upload_deadline: None,
         };
-        image.begin_upload(7);
+        image.begin_upload(7, Instant::now() + CONTEXT_IMAGE_UPLOAD_TIMEOUT);
         assert_eq!(image.upload_overlay_text(), Some("Uploading…"));
         assert_eq!(image.preview_tint().a(), 77);
         assert!(!image.upload_is_complete());
 
-        image.finish_upload();
+        assert!(image.finish_upload());
         assert_eq!(image.upload_overlay_text(), None);
         assert_eq!(image.preview_tint(), Color32::WHITE);
         assert!(image.upload_is_complete());
+    }
+
+    #[test]
+    fn context_image_preview_falls_back_to_uploaded_image_bytes() {
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(2, 1)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let sent_image = encoded.into_inner();
+        let attachment = Attachment::Image {
+            name: "Current screen".to_owned(),
+            data_url: format!("data:image/png;base64,{}", STANDARD.encode(&sent_image)),
+            thumbnail: b"not a decodable thumbnail".to_vec(),
+            width: 2,
+            height: 1,
+            byte_size: sent_image.len(),
+        };
+
+        let prepared = PreparedChatImage::from_attachment(&attachment)
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.thumbnail.size, [2, 1]);
+        assert_eq!(prepared.sent_image, sent_image);
+    }
+
+    #[test]
+    fn timed_out_context_image_ignores_late_success() {
+        let mut image = ChatImage {
+            name: "Current screen".to_owned(),
+            thumbnail: None,
+            sent_image: vec![1],
+            width: 100,
+            height: 100,
+            byte_size: 1,
+            thumbnail_texture: None,
+            full_texture: None,
+            thumbnail_load_attempted: false,
+            full_load_attempted: false,
+            upload_id: None,
+            upload_state: ImageUploadState::Uploaded,
+            upload_deadline: None,
+        };
+        let now = Instant::now();
+        image.begin_upload(8, now + CONTEXT_IMAGE_UPLOAD_TIMEOUT);
+
+        assert!(
+            !image.upload_timed_out(now + CONTEXT_IMAGE_UPLOAD_TIMEOUT - Duration::from_millis(1))
+        );
+        assert!(image.upload_timed_out(now + CONTEXT_IMAGE_UPLOAD_TIMEOUT));
+        assert!(image.fail_upload());
+        assert!(!image.finish_upload());
+        assert_eq!(image.upload_overlay_text(), Some("Upload failed"));
     }
 }

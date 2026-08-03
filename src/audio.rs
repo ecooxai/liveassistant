@@ -23,10 +23,29 @@ const PLAYBACK_RATE: u32 = 24_000;
 /// Roughly -48 dBFS after VoiceProcessingIO. This is intentionally sensitive
 /// enough for normal conversational speech while AEC removes speaker/system echo.
 const LOUD_SPEECH_RMS: f32 = 0.004;
-/// Do not reset the one-second speech timer for tiny natural gaps between syllables.
+/// Do not reset the sustained-speech timer for tiny natural gaps between syllables.
 const LOUD_SPEECH_QUIET_TOLERANCE_SAMPLES: usize = 24_000 / 5; // 200 ms at 24 kHz
-const PLAYBACK_BUFFER_LOW_MS: u32 = 500;
-const PLAYBACK_RECHECK_MS: u64 = 1_000;
+/// OpenAI Realtime keeps the existing low-latency playback policy.
+const REALTIME_PLAYBACK_BUFFER_LOW_MS: u32 = 40;
+const REALTIME_PLAYBACK_RECHECK_MS: u64 = 5;
+/// GPT-Live's WebRTC audio benefits from a larger jitter buffer. Only speaker
+/// playback is delayed; transcript and tool events use a separate event path.
+const GPT_LIVE_PLAYBACK_BUFFER_LOW_MS: u32 = 500;
+const GPT_LIVE_PLAYBACK_RECHECK_MS: u64 = 1_000;
+
+fn assistant_playback_policy(buffered_gpt_live: bool) -> (u32, u64) {
+    if buffered_gpt_live {
+        (
+            GPT_LIVE_PLAYBACK_BUFFER_LOW_MS,
+            GPT_LIVE_PLAYBACK_RECHECK_MS,
+        )
+    } else {
+        (
+            REALTIME_PLAYBACK_BUFFER_LOW_MS,
+            REALTIME_PLAYBACK_RECHECK_MS,
+        )
+    }
+}
 
 #[derive(Default)]
 struct TurnBuffer {
@@ -273,10 +292,10 @@ impl Speaker {
             streaming_assistant: false,
             response_complete: true,
             low_watermark_samples: (config.sample_rate.0 as usize
-                * PLAYBACK_BUFFER_LOW_MS as usize)
+                * REALTIME_PLAYBACK_BUFFER_LOW_MS as usize)
                 / 1_000,
             resume_check_at: None,
-            resume_check_interval: Duration::from_millis(PLAYBACK_RECHECK_MS),
+            resume_check_interval: Duration::from_millis(REALTIME_PLAYBACK_RECHECK_MS),
             native_sample_rate: config.sample_rate.0,
             played_assistant_samples_native: 0,
         }));
@@ -289,8 +308,8 @@ impl Speaker {
             config.sample_rate.0,
             config.channels,
             sample_format,
-            PLAYBACK_BUFFER_LOW_MS,
-            PLAYBACK_RECHECK_MS
+            REALTIME_PLAYBACK_BUFFER_LOW_MS,
+            REALTIME_PLAYBACK_RECHECK_MS
         );
 
         Ok(Self {
@@ -303,7 +322,7 @@ impl Speaker {
         })
     }
 
-    pub fn begin_assistant_response(&mut self) {
+    pub fn begin_assistant_response(&mut self, buffered_gpt_live: bool) {
         // Reset conversion/filter history without blocking transcript or tool events.
         // Only the native speaker queue is gated by the jitter-buffer state below.
         self.assistant_started_at = None;
@@ -311,6 +330,10 @@ impl Speaker {
         self.assistant_logged_seconds = 0;
         self.output_resampler.reset();
         if let Ok(mut playback) = self.playback.lock() {
+            let (buffer_low_ms, recheck_ms) = assistant_playback_policy(buffered_gpt_live);
+            playback.low_watermark_samples =
+                playback.native_sample_rate as usize * buffer_low_ms as usize / 1_000;
+            playback.resume_check_interval = Duration::from_millis(recheck_ms);
             playback.streaming_assistant = true;
             playback.response_complete = false;
             playback.playing = false;
@@ -323,7 +346,7 @@ impl Speaker {
         if let Ok(mut playback) = self.playback.lock() {
             playback.response_complete = true;
             playback.resume_check_at = None;
-            // Flush the final tail even when it is shorter than the 0.5-second
+            // Flush the final tail even when it is shorter than the selected
             // streaming watermark. No more network audio is expected for this reply.
             playback.playing = !playback.samples_native.is_empty();
         }
@@ -430,7 +453,7 @@ impl Speaker {
             playback.samples_native.clear();
             playback.samples_native.extend(samples.iter().copied());
             // Manual WAV playback is already complete, so it must not wait for the
-            // streaming jitter-buffer watermark or one-second retry timer.
+            // streaming jitter-buffer watermark or retry timer.
             playback.streaming_assistant = false;
             playback.response_complete = true;
             playback.playing = !samples.is_empty();
@@ -646,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn speaker_rebuffers_below_half_second_and_rechecks_once_per_second() {
+    fn gpt_live_speaker_rebuffers_below_low_watermark_for_one_second() {
         let now = Instant::now();
         let mut playback = test_playback([0.25, -0.5]);
         playback.playing = true;
@@ -666,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn speaker_does_not_resume_at_exactly_half_second() {
+    fn gpt_live_speaker_resumes_only_above_low_watermark() {
         let now = Instant::now();
         let mut playback = test_playback([0.25, -0.5, 0.75]);
         playback.resume_check_at = Some(now);
@@ -702,9 +725,9 @@ mod tests {
     }
 
     #[test]
-    fn speaker_buffer_policy_uses_half_second_and_one_second_checks() {
-        assert_eq!(PLAYBACK_BUFFER_LOW_MS, 500);
-        assert_eq!(PLAYBACK_RECHECK_MS, 1_000);
+    fn speaker_buffer_policy_is_backend_specific() {
+        assert_eq!(assistant_playback_policy(false), (40, 5));
+        assert_eq!(assistant_playback_policy(true), (500, 1_000));
     }
 
     #[test]

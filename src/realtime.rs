@@ -94,6 +94,7 @@ pub enum RealtimeBackend {
     #[default]
     OpenAiRealtime,
     CodexGptLive,
+    CodexText,
 }
 
 #[derive(Clone)]
@@ -249,12 +250,17 @@ async fn supervisor(
                             )
                             .await
                         }
+                        RealtimeBackend::CodexText => {
+                            run_codex_text_connection(options.clone(), &mut commands, &events).await
+                        }
                     };
                     match result {
                         Ok(()) => break,
                         Err(error)
-                            if options.backend == RealtimeBackend::CodexGptLive
-                                && is_transient_codex_live_error(&error) =>
+                            if matches!(
+                                options.backend,
+                                RealtimeBackend::CodexGptLive | RealtimeBackend::CodexText
+                            ) && is_transient_codex_live_error(&error) =>
                         {
                             reconnect_attempt = reconnect_attempt.saturating_add(1);
                             let reason = format!("{error:#}");
@@ -589,7 +595,8 @@ struct CodexAppServer {
 
 impl CodexAppServer {
     fn start(platform_api_key: Option<&str>) -> Result<Self> {
-        let mut command = ProcessCommand::new("codex");
+        let executable = std::env::var_os("CODEX_BIN").unwrap_or_else(|| "codex".into());
+        let mut command = ProcessCommand::new(executable);
         command
             .args(["app-server", "--stdio"])
             .stdin(Stdio::piped())
@@ -1329,6 +1336,413 @@ async fn run_codex_live_connection(
     }
 }
 
+#[derive(Default)]
+struct CodexTextState {
+    response_number: u64,
+    active_response_id: Option<String>,
+    assistant_text: String,
+}
+
+impl CodexTextState {
+    fn ensure_response(
+        &mut self,
+        hint: Option<&str>,
+        events: &std::sync::mpsc::Sender<Event>,
+    ) -> String {
+        if let Some(response_id) = &self.active_response_id
+            && hint.is_none_or(|hint| hint.is_empty() || hint == response_id)
+        {
+            return response_id.clone();
+        }
+        self.response_number = self.response_number.saturating_add(1);
+        let response_id = hint
+            .filter(|hint| !hint.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("codex-text-{}", self.response_number));
+        self.active_response_id = Some(response_id.clone());
+        self.assistant_text.clear();
+        let _ = events.send(Event::AssistantResponseStarted {
+            response_id: response_id.clone(),
+        });
+        response_id
+    }
+
+    fn emit_text(
+        &mut self,
+        response_id: String,
+        text: &str,
+        events: &std::sync::mpsc::Sender<Event>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let delta = if text.starts_with(&self.assistant_text) {
+            text[self.assistant_text.len()..].to_owned()
+        } else {
+            text.to_owned()
+        };
+        if delta.is_empty() {
+            return;
+        }
+        if text.starts_with(&self.assistant_text) {
+            self.assistant_text = text.to_owned();
+        } else {
+            self.assistant_text.push_str(&delta);
+        }
+        let _ = events.send(Event::AssistantTranscriptDelta { response_id, delta });
+    }
+
+    fn finish(&mut self, events: &std::sync::mpsc::Sender<Event>) {
+        if let Some(response_id) = self.active_response_id.take() {
+            let _ = events.send(Event::AssistantDone { response_id });
+        }
+        self.assistant_text.clear();
+    }
+}
+
+/// Run a normal Codex model through app-server. Text tabs use the same dynamic
+/// computer tools as the live backends; only the transport and response events
+/// differ from GPT-Live's WebRTC session.
+async fn run_codex_text_connection(
+    options: ConnectOptions,
+    commands: &mut UnboundedReceiver<Command>,
+    events: &std::sync::mpsc::Sender<Event>,
+) -> Result<()> {
+    let platform_api_key = options
+        .chatgpt_account_id
+        .is_none()
+        .then_some(options.api_key.as_str());
+    let mut server = CodexAppServer::start(platform_api_key)?;
+    server
+        .call(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "live-assistant",
+                    "title": "Live Assistant",
+                    "version": env!("CARGO_PKG_VERSION")
+                },
+                "capabilities": {"experimentalApi": true}
+            }),
+        )
+        .await?;
+    server.notify("initialized", json!({}))?;
+
+    let thread = server
+        .call(
+            "thread/start",
+            codex_text_thread_start_params(
+                &options,
+                options.system_prompt.clone(),
+                std::env::current_dir()
+                    .context("Could not read the current working directory")?
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        )
+        .await?;
+    let thread_id = thread
+        .pointer("/thread/id")
+        .and_then(Value::as_str)
+        .context("Codex app-server did not return a thread id")?
+        .to_owned();
+
+    let _ = events.send(Event::Connected);
+    let mut state = CodexTextState::default();
+    let mut pending_dynamic_tools: HashMap<String, Value> = HashMap::new();
+    let mut in_flight_context_images = HashMap::<u64, InFlightContextImage>::new();
+    let mut context_image_tick = tokio::time::interval(Duration::from_millis(50));
+    context_image_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            command = commands.recv() => {
+                match command {
+                    Some(Command::SendTurn { text, attachments }) => {
+                        if text.trim().is_empty() && attachments.is_empty() {
+                            continue;
+                        }
+                        server
+                            .call(
+                                "turn/start",
+                                json!({
+                                    "threadId": thread_id,
+                                    "input": codex_turn_input(&text, &attachments),
+                                }),
+                            )
+                            .await?;
+                    }
+                    Some(Command::SendContextImage { upload_id, image, deadline }) => {
+                        if Instant::now() >= deadline {
+                            let _ = events.send(Event::ContextImageUploadFailed {
+                                upload_id,
+                                detail: context_image_timeout_detail(),
+                            });
+                            continue;
+                        }
+                        let params = match codex_context_image_inject_params(&thread_id, upload_id, &image) {
+                            Ok(params) => params,
+                            Err(error) => {
+                                let _ = events.send(Event::ContextImageUploadFailed {
+                                    upload_id,
+                                    detail: format!("{error:#}"),
+                                });
+                                continue;
+                            }
+                        };
+                        let request_id = server.send_request("thread/inject_items", params)?;
+                        let (name, width, height, byte_size) = image_metadata(&image)?;
+                        in_flight_context_images.insert(
+                            request_id,
+                            InFlightContextImage {
+                                upload_id,
+                                name,
+                                width,
+                                height,
+                                byte_size,
+                                turn_id: "text thread".to_owned(),
+                                deadline,
+                            },
+                        );
+                        let _ = events.send(Event::ContextImageAccepted { upload_id });
+                    }
+                    Some(Command::ToolOutputs(outputs)) => {
+                        let mut submitted = 0usize;
+                        for output in outputs {
+                            let Some(request_id) = pending_dynamic_tools.remove(&output.call_id) else {
+                                continue;
+                            };
+                            let success = serde_json::from_str::<Value>(&output.output)
+                                .ok()
+                                .and_then(|value| value.get("ok").and_then(Value::as_bool))
+                                .unwrap_or(false);
+                            server.respond(
+                                request_id,
+                                json!({
+                                    "contentItems": [{
+                                        "type": "inputText",
+                                        "text": output.output
+                                    }],
+                                    "success": success
+                                }),
+                            )?;
+                            submitted = submitted.saturating_add(1);
+                        }
+                        let _ = events.send(Event::ToolOutputsSubmitted { count: submitted });
+                    }
+                    Some(Command::AudioChunk(_))
+                    | Some(Command::CreateResponse)
+                    | Some(Command::TruncateAssistant { .. }) => {}
+                    Some(Command::Disconnect) | Some(Command::Shutdown) | None => return Ok(()),
+                    Some(Command::Connect(_)) => {}
+                }
+            }
+            message = server.next_message() => {
+                let Some(message) = message else {
+                    bail!("Codex app-server closed during text session");
+                };
+                eprintln!("[live-assistant codex-text] {}", codex_message_summary(&message));
+                match handle_codex_context_image_response(
+                    &message,
+                    &mut in_flight_context_images,
+                    events,
+                ) {
+                    CodexContextImageResponse::NotHandled => {}
+                    CodexContextImageResponse::Uploaded(_)
+                    | CodexContextImageResponse::Failed(_) => continue,
+                }
+                if let Some((request_id, call)) = dynamic_tool_request(&message) {
+                    eprintln!(
+                        "[live-assistant tool] text call_id={} name={} arguments={}",
+                        call.call_id, call.name, call.arguments
+                    );
+                    pending_dynamic_tools.insert(call.call_id.clone(), request_id);
+                    let _ = events.send(Event::ToolCalls(vec![call]));
+                    continue;
+                }
+                handle_codex_text_message(&message, events, &mut state)?;
+            }
+            _ = context_image_tick.tick() => {
+                expire_codex_context_images(&mut in_flight_context_images, Instant::now(), events);
+            }
+        }
+    }
+}
+
+fn codex_text_thread_start_params(
+    options: &ConnectOptions,
+    system_prompt: String,
+    cwd: String,
+) -> Value {
+    json!({
+        "cwd": cwd,
+        "ephemeral": true,
+        "approvalPolicy": "never",
+        "sandbox": "read-only",
+        "model": options.model,
+        "baseInstructions": system_prompt,
+        "dynamicTools": codex_dynamic_tools(options.screen_info),
+        "config": {
+            "suppress_unstable_features_warning": true,
+        }
+    })
+}
+
+fn handle_codex_text_message(
+    message: &Value,
+    events: &std::sync::mpsc::Sender<Event>,
+    state: &mut CodexTextState,
+) -> Result<()> {
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match method {
+        "turn/started" | "turn/created" => {
+            let response_id = codex_text_response_hint(message);
+            state.ensure_response(response_id.as_deref(), events);
+        }
+        "item/started" => {
+            if codex_text_message_is_assistant(message) {
+                let response_id =
+                    state.ensure_response(codex_text_response_hint(message).as_deref(), events);
+                if let Some(item_id) = codex_text_item_id(message) {
+                    let _ = events.send(Event::AssistantItem {
+                        response_id,
+                        item_id,
+                    });
+                }
+            }
+        }
+        "item/agentMessage/delta"
+        | "item/assistantMessage/delta"
+        | "item/message/delta"
+        | "item/delta" => {
+            if codex_text_message_is_assistant(message)
+                && let Some(text) = codex_text_message_text(message)
+            {
+                let response_id =
+                    state.ensure_response(codex_text_response_hint(message).as_deref(), events);
+                state.emit_text(response_id, text, events);
+            }
+        }
+        "item/completed" | "item/agentMessage/completed" | "item/assistantMessage/completed" => {
+            if codex_text_message_is_assistant(message)
+                && let Some(text) = codex_text_message_text(message)
+            {
+                let response_id =
+                    state.ensure_response(codex_text_response_hint(message).as_deref(), events);
+                state.emit_text(response_id, text, events);
+            }
+        }
+        "turn/completed" | "turn/finished" | "turn/stopped" => {
+            let status = message
+                .pointer("/params/turn/status")
+                .or_else(|| message.pointer("/params/status"))
+                .and_then(Value::as_str)
+                .unwrap_or("completed");
+            if !matches!(status, "completed" | "stopped" | "interrupted") {
+                let detail = codex_text_error_detail(message);
+                let _ = events.send(Event::Error(detail));
+            }
+            state.finish(events);
+        }
+        "error" | "turn/failed" | "item/failed" => {
+            let detail = codex_text_error_detail(message);
+            let _ = events.send(Event::Error(detail));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn codex_text_response_hint(message: &Value) -> Option<String> {
+    [
+        "/params/turnId",
+        "/params/responseId",
+        "/params/turn/id",
+        "/params/turn/turnId",
+        "/params/item/turnId",
+    ]
+    .into_iter()
+    .find_map(|pointer| {
+        message
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn codex_text_item_id(message: &Value) -> Option<String> {
+    ["/params/itemId", "/params/item/id", "/params/id"]
+        .into_iter()
+        .find_map(|pointer| {
+            message
+                .pointer(pointer)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        })
+}
+
+fn codex_text_message_is_assistant(message: &Value) -> bool {
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if matches!(
+        method,
+        "item/agentMessage/delta"
+            | "item/assistantMessage/delta"
+            | "item/message/delta"
+            | "item/delta"
+    ) {
+        return true;
+    }
+    let role = message
+        .pointer("/params/role")
+        .or_else(|| message.pointer("/params/item/role"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if role.eq_ignore_ascii_case("assistant") {
+        return true;
+    }
+    let item_type = message
+        .pointer("/params/item/type")
+        .or_else(|| message.pointer("/params/type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    item_type.contains("agentmessage")
+        || item_type.contains("assistantmessage")
+        || item_type == "output_text"
+}
+
+fn codex_text_message_text(message: &Value) -> Option<&str> {
+    [
+        "/params/delta",
+        "/params/text",
+        "/params/item/text",
+        "/params/item/message/text",
+        "/params/item/content/0/text",
+        "/params/item/content/0/value",
+    ]
+    .into_iter()
+    .find_map(|pointer| message.pointer(pointer).and_then(Value::as_str))
+}
+
+fn codex_text_error_detail(message: &Value) -> String {
+    message
+        .pointer("/params/message")
+        .or_else(|| message.pointer("/params/turn/error/message"))
+        .or_else(|| message.pointer("/params/error/message"))
+        .or_else(|| message.pointer("/error/message"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("Codex text session reported {message}"))
+}
+
 fn codex_live_thread_start_params(
     options: &ConnectOptions,
     system_prompt: String,
@@ -1405,6 +1819,9 @@ fn probe_context_image_upload_backend(
         voice: match backend {
             RealtimeBackend::OpenAiRealtime => "marin",
             RealtimeBackend::CodexGptLive => "ember",
+            RealtimeBackend::CodexText => {
+                bail!("The JPEG upload probe only supports voice backends")
+            }
         }
         .to_owned(),
         system_prompt: shared_system_prompt(
@@ -1534,6 +1951,9 @@ fn probe_ask_latest_image_question(
             }
             Ok(())
         }
+        RealtimeBackend::CodexText => {
+            bail!("The latest-image probe only supports voice backends")
+        }
     }
 }
 
@@ -1561,6 +1981,9 @@ fn probe_wait_for_animal_reply(
         let receive_window = match backend {
             RealtimeBackend::CodexGptLive => remaining.min(Duration::from_millis(20)),
             RealtimeBackend::OpenAiRealtime => remaining,
+            RealtimeBackend::CodexText => {
+                bail!("The animal-reply probe only supports voice backends")
+            }
         };
         match client.events.recv_timeout(receive_window) {
             Ok(Event::AssistantResponseStarted { response_id }) => {
@@ -3434,19 +3857,20 @@ mod tests {
 
     use super::{
         CONNECT_AUDIO_BUFFER_MAX_SAMPLES, CONTEXT_IMAGE_UPLOAD_TIMEOUT, CodexContextImageResponse,
-        CodexHandoffAction, CodexHandoffState, CodexLiveState, ConnectOptions, Event,
-        InFlightContextImage, OPENAI_VAD_SILENCE_MS, PendingAudioBuffer,
+        CodexHandoffAction, CodexHandoffState, CodexLiveState, CodexTextState, ConnectOptions,
+        Event, InFlightContextImage, OPENAI_VAD_SILENCE_MS, PendingAudioBuffer,
         PendingOpenAiContextUpload, RealtimeBackend, ServerSignal, ToolCall,
         codex_context_image_inject_params, codex_live_start_error, codex_live_thread_start_params,
-        codex_message_is_assistant_transcript, codex_message_starts_reply, codex_turn_input,
-        context_image_item_event, context_image_item_id, context_image_upload_id,
-        decode_audio_to_24k_mono, dynamic_tool_request, encode_pcm, expire_codex_context_images,
+        codex_message_is_assistant_transcript, codex_message_starts_reply,
+        codex_text_thread_start_params, codex_turn_input, context_image_item_event,
+        context_image_item_id, context_image_upload_id, decode_audio_to_24k_mono,
+        dynamic_tool_request, encode_pcm, expire_codex_context_images,
         expire_openai_context_uploads, extract_function_call_event, extract_function_calls,
         gpt_live_context_image_failed_params, gpt_live_context_image_pending_params,
         gpt_live_context_image_ready_params, handle_codex_context_image_response,
-        handle_codex_handoff_message, handle_codex_live_message, handle_context_image_server_value,
-        handle_server_event, input_image_content, openai_context_response_blockers,
-        openai_deferred_response_is_ready, shared_system_prompt,
+        handle_codex_handoff_message, handle_codex_live_message, handle_codex_text_message,
+        handle_context_image_server_value, handle_server_event, input_image_content,
+        openai_context_response_blockers, openai_deferred_response_is_ready, shared_system_prompt,
         take_latest_ready_codex_context_image,
     };
     use crate::media::{Attachment, ScreenInfo, jpeg_upload_probe_attachment};
@@ -4354,6 +4778,114 @@ Call me Ecoo."
             "method": "thread/realtime/transcript/delta",
             "params": {"role": "user", "delta": "hello"}
         })));
+    }
+
+    #[test]
+    fn codex_text_stream_emits_standard_app_server_assistant_events() {
+        let (events, received) = std::sync::mpsc::channel();
+        let mut state = CodexTextState::default();
+
+        handle_codex_text_message(
+            &json!({
+                "method": "turn/started",
+                "params": {"turn": {"id": "turn-1"}}
+            }),
+            &events,
+            &mut state,
+        )
+        .unwrap();
+        assert!(matches!(
+            received.recv().unwrap(),
+            Event::AssistantResponseStarted { response_id } if response_id == "turn-1"
+        ));
+
+        handle_codex_text_message(
+            &json!({
+                "method": "item/agentMessage/delta",
+                "params": {"delta": "hello"}
+            }),
+            &events,
+            &mut state,
+        )
+        .unwrap();
+        assert!(matches!(
+            received.recv().unwrap(),
+            Event::AssistantTranscriptDelta { response_id, delta }
+                if response_id == "turn-1" && delta == "hello"
+        ));
+
+        handle_codex_text_message(
+            &json!({
+                "method": "item/agentMessage/delta",
+                "params": {"delta": " world"}
+            }),
+            &events,
+            &mut state,
+        )
+        .unwrap();
+        assert!(matches!(
+            received.recv().unwrap(),
+            Event::AssistantTranscriptDelta { response_id, delta }
+                if response_id == "turn-1" && delta == " world"
+        ));
+
+        handle_codex_text_message(
+            &json!({
+                "method": "item/completed",
+                "params": {
+                    "item": {"type": "agentMessage", "text": "hello world"}
+                }
+            }),
+            &events,
+            &mut state,
+        )
+        .unwrap();
+        assert!(received.try_recv().is_err());
+
+        handle_codex_text_message(
+            &json!({
+                "method": "turn/completed",
+                "params": {"turn": {"id": "turn-1", "status": "completed"}}
+            }),
+            &events,
+            &mut state,
+        )
+        .unwrap();
+        assert!(matches!(
+            received.recv().unwrap(),
+            Event::AssistantDone { response_id } if response_id == "turn-1"
+        ));
+        assert!(state.active_response_id.is_none());
+    }
+
+    #[test]
+    fn codex_text_thread_uses_selected_model_and_local_tools() {
+        let options = ConnectOptions {
+            backend: RealtimeBackend::CodexText,
+            api_key: "oauth-secret".to_owned(),
+            chatgpt_account_id: Some("account-123".to_owned()),
+            model: "gpt-5.6-sol".to_owned(),
+            voice: "unused".to_owned(),
+            system_prompt: "shared prompt".to_owned(),
+            screen_info: ScreenInfo {
+                origin_x: 0,
+                origin_y: 0,
+                logical_width: 1408,
+                logical_height: 881,
+                backing_width: 2816,
+                backing_height: 1762,
+                scale_factor: 2.0,
+            },
+        };
+        let params =
+            codex_text_thread_start_params(&options, "instructions".to_owned(), "/tmp".to_owned());
+
+        assert_eq!(params["model"], "gpt-5.6-sol");
+        assert_eq!(params["baseInstructions"], "instructions");
+        let tools = params["dynamicTools"].as_array().unwrap();
+        assert_eq!(tools.len(), 4);
+        assert!(tools.iter().any(|tool| tool["name"] == "click_screen"));
+        assert!(tools.iter().any(|tool| tool["name"] == "run_bash"));
     }
 
     #[test]

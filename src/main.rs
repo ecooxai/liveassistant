@@ -105,7 +105,7 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Live Assistant")
+            .with_title("")
             .with_inner_size([1080.0, 760.0])
             .with_min_inner_size([760.0, 560.0])
             // glow shares one GL config across every viewport, and its alpha
@@ -116,7 +116,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "Live Assistant",
+        "",
         options,
         Box::new(|cc| Ok(Box::new(LiveAssistantApp::new(cc)))),
     )

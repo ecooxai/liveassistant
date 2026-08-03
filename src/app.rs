@@ -16,6 +16,7 @@ use eframe::egui::{self, Color32, RichText, Stroke};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
+    mem,
     path::Path,
     sync::{
         Arc,
@@ -43,6 +44,11 @@ const FALLBACK_REALTIME_VOICES: &[&str] = &[
 ];
 const GPT_LIVE_VOICES: &[&str] = &[
     "juniper", "maple", "spruce", "ember", "vale", "breeze", "arbor", "sol", "cove",
+];
+const FALLBACK_TEXT_MODELS: &[(&str, &str)] = &[
+    ("gpt-5.6-sol", "GPT-5.6 Sol"),
+    ("gpt-5.6-luna", "GPT-5.6 Luna"),
+    ("gpt-5.6", "GPT-5.6"),
 ];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -523,6 +529,12 @@ enum ConnectionState {
     Live,
 }
 
+impl Default for ConnectionState {
+    fn default() -> Self {
+        Self::Offline
+    }
+}
+
 #[derive(Default)]
 struct SpeechScreenshotGate {
     speech_active: bool,
@@ -555,6 +567,78 @@ impl SpeechScreenshotGate {
 struct SpeechScreenshotResult {
     turn_id: u64,
     result: Result<Attachment, String>,
+}
+
+struct TabSession {
+    settings: Settings,
+    state: ConnectionState,
+    status: String,
+    error: Option<String>,
+    composer: String,
+    pending: Vec<Attachment>,
+    messages: Vec<ChatMessage>,
+    active_assistant_message: Option<usize>,
+    assistant_group_deadline: Option<Instant>,
+    assistant_text_needs_separator: bool,
+    active_response_id: Option<String>,
+    last_assistant_item_id: Option<String>,
+    speech_screenshot_gate: SpeechScreenshotGate,
+    speech_turn_id: u64,
+    screenshot_capture_in_flight: Option<u64>,
+    screenshot_message_index: Option<usize>,
+    next_context_upload_id: u64,
+    confirmed_context_uploads: HashSet<u64>,
+    captured_transcript_items: HashSet<String>,
+    deferred_voice_response: bool,
+    active_voice_message: Option<usize>,
+    image_viewer: Option<(usize, usize)>,
+    should_scroll: bool,
+    tool_calls_running: usize,
+    pending_tool_reply: bool,
+}
+
+impl TabSession {
+    fn new(settings: Settings) -> Self {
+        Self {
+            settings,
+            state: ConnectionState::Offline,
+            status: "Ready".to_owned(),
+            error: None,
+            composer: String::new(),
+            pending: Vec::new(),
+            messages: Vec::new(),
+            active_assistant_message: None,
+            assistant_group_deadline: None,
+            assistant_text_needs_separator: false,
+            active_response_id: None,
+            last_assistant_item_id: None,
+            speech_screenshot_gate: SpeechScreenshotGate::default(),
+            speech_turn_id: 0,
+            screenshot_capture_in_flight: None,
+            screenshot_message_index: None,
+            next_context_upload_id: 0,
+            confirmed_context_uploads: HashSet::new(),
+            captured_transcript_items: HashSet::new(),
+            deferred_voice_response: false,
+            active_voice_message: None,
+            image_viewer: None,
+            should_scroll: false,
+            tool_calls_running: 0,
+            pending_tool_reply: false,
+        }
+    }
+}
+
+struct AssistantTab {
+    session: TabSession,
+}
+
+impl AssistantTab {
+    fn new(settings: Settings) -> Self {
+        Self {
+            session: TabSession::new(settings),
+        }
+    }
 }
 
 pub struct LiveAssistantApp {
@@ -604,6 +688,9 @@ pub struct LiveAssistantApp {
     codex_usage_tx: Sender<Result<CodexUsageInfo, String>>,
     codex_usage_rx: Receiver<Result<CodexUsageInfo, String>>,
     pointer_overlay: live_pointer::OverlayState,
+    tabs: Vec<AssistantTab>,
+    active_tab: usize,
+    show_model_picker: bool,
 }
 
 fn ensure_assistant_message_index(
@@ -701,6 +788,7 @@ impl LiveAssistantApp {
         let (codex_info_tx, codex_info_rx) = mpsc::channel();
         let (codex_usage_tx, codex_usage_rx) = mpsc::channel();
         let (screenshot_result_tx, screenshot_result_rx) = mpsc::channel();
+        let initial_tab_settings = settings.clone();
         Self {
             realtime: RealtimeClient::spawn(),
             microphone: None,
@@ -748,6 +836,168 @@ impl LiveAssistantApp {
             codex_usage_tx,
             codex_usage_rx,
             pointer_overlay: live_pointer::OverlayState::new(),
+            tabs: vec![AssistantTab::new(initial_tab_settings)],
+            active_tab: 0,
+            show_model_picker: false,
+        }
+    }
+
+    fn take_active_session(&mut self) -> TabSession {
+        TabSession {
+            settings: mem::take(&mut self.settings),
+            state: mem::take(&mut self.state),
+            status: mem::take(&mut self.status),
+            error: self.error.take(),
+            composer: mem::take(&mut self.composer),
+            pending: mem::take(&mut self.pending),
+            messages: mem::take(&mut self.messages),
+            active_assistant_message: self.active_assistant_message.take(),
+            assistant_group_deadline: self.assistant_group_deadline.take(),
+            assistant_text_needs_separator: mem::take(&mut self.assistant_text_needs_separator),
+            active_response_id: self.active_response_id.take(),
+            last_assistant_item_id: self.last_assistant_item_id.take(),
+            speech_screenshot_gate: mem::take(&mut self.speech_screenshot_gate),
+            speech_turn_id: mem::replace(&mut self.speech_turn_id, 0),
+            screenshot_capture_in_flight: self.screenshot_capture_in_flight.take(),
+            screenshot_message_index: self.screenshot_message_index.take(),
+            next_context_upload_id: mem::replace(&mut self.next_context_upload_id, 0),
+            confirmed_context_uploads: mem::take(&mut self.confirmed_context_uploads),
+            captured_transcript_items: mem::take(&mut self.captured_transcript_items),
+            deferred_voice_response: mem::take(&mut self.deferred_voice_response),
+            active_voice_message: self.active_voice_message.take(),
+            image_viewer: self.image_viewer.take(),
+            should_scroll: mem::take(&mut self.should_scroll),
+            tool_calls_running: mem::replace(&mut self.tool_calls_running, 0),
+            pending_tool_reply: mem::take(&mut self.pending_tool_reply),
+        }
+    }
+
+    fn install_active_session(&mut self, session: TabSession) {
+        self.settings = session.settings;
+        self.state = session.state;
+        self.status = session.status;
+        self.error = session.error;
+        self.composer = session.composer;
+        self.pending = session.pending;
+        self.messages = session.messages;
+        self.active_assistant_message = session.active_assistant_message;
+        self.assistant_group_deadline = session.assistant_group_deadline;
+        self.assistant_text_needs_separator = session.assistant_text_needs_separator;
+        self.active_response_id = session.active_response_id;
+        self.last_assistant_item_id = session.last_assistant_item_id;
+        self.speech_screenshot_gate = session.speech_screenshot_gate;
+        self.speech_turn_id = session.speech_turn_id;
+        self.screenshot_capture_in_flight = session.screenshot_capture_in_flight;
+        self.screenshot_message_index = session.screenshot_message_index;
+        self.next_context_upload_id = session.next_context_upload_id;
+        self.confirmed_context_uploads = session.confirmed_context_uploads;
+        self.captured_transcript_items = session.captured_transcript_items;
+        self.deferred_voice_response = session.deferred_voice_response;
+        self.active_voice_message = session.active_voice_message;
+        self.image_viewer = session.image_viewer;
+        self.should_scroll = session.should_scroll;
+        self.tool_calls_running = session.tool_calls_running;
+        self.pending_tool_reply = session.pending_tool_reply;
+    }
+
+    fn reset_session_channels(&mut self) {
+        let (screenshot_result_tx, screenshot_result_rx) =
+            mpsc::channel::<SpeechScreenshotResult>();
+        self.screenshot_result_tx = screenshot_result_tx;
+        self.screenshot_result_rx = screenshot_result_rx;
+        let (tool_result_tx, tool_result_rx) = mpsc::channel::<(String, String)>();
+        self.tool_result_tx = tool_result_tx;
+        self.tool_result_rx = tool_result_rx;
+    }
+
+    fn switch_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() || index == self.active_tab {
+            return;
+        }
+        if self.state != ConnectionState::Offline {
+            self.stop();
+        }
+        let previous_index = self.active_tab;
+        let previous = self.take_active_session();
+        self.tabs[previous_index].session = previous;
+        self.active_tab = index;
+        let next = mem::replace(
+            &mut self.tabs[index].session,
+            TabSession::new(Settings::default()),
+        );
+        self.install_active_session(next);
+        // Each tab owns its transcript and settings. Only the selected tab owns
+        // a live transport, so switching cannot leak events into another chat.
+        self.realtime = RealtimeClient::spawn();
+        self.reset_session_channels();
+        self.show_settings = false;
+    }
+
+    fn add_model_tab(&mut self, backend: RealtimeBackend, model: String, voice: &str) {
+        let mut settings = self.settings.clone();
+        settings.backend = backend;
+        settings.model = model;
+        settings.voice = voice.to_owned();
+        self.tabs.push(AssistantTab::new(settings));
+        let index = self.tabs.len() - 1;
+        self.switch_tab(index);
+        self.show_model_picker = false;
+    }
+
+    fn tab_title(&self, index: usize) -> String {
+        let settings = if index == self.active_tab {
+            &self.settings
+        } else {
+            &self.tabs[index].session.settings
+        };
+        match settings.backend {
+            RealtimeBackend::OpenAiRealtime => "Realtime".to_owned(),
+            RealtimeBackend::CodexGptLive => "GPT-Live".to_owned(),
+            RealtimeBackend::CodexText => self
+                .text_model_choices()
+                .into_iter()
+                .find(|(model, _)| model == &settings.model)
+                .map(|(_, label)| label)
+                .unwrap_or_else(|| settings.model.clone()),
+        }
+    }
+
+    fn text_model_choices(&self) -> Vec<(String, String)> {
+        let mut choices = Vec::new();
+        let mut seen = HashSet::new();
+        if let Some(info) = &self.codex_info {
+            for model in &info.models {
+                if !model.hidden && seen.insert(model.name.clone()) {
+                    choices.push((model.name.clone(), model.display_name.clone()));
+                }
+            }
+        }
+        for (name, display_name) in FALLBACK_TEXT_MODELS {
+            if seen.insert((*name).to_owned()) {
+                choices.push(((*name).to_owned(), (*display_name).to_owned()));
+            }
+        }
+        choices
+    }
+
+    fn ensure_text_model_selection(&mut self) {
+        if self.settings.backend != RealtimeBackend::CodexText {
+            return;
+        }
+        let choices = self.text_model_choices();
+        if !choices
+            .iter()
+            .any(|(model, _)| model == &self.settings.model)
+            && let Some((model, _)) = choices.first()
+        {
+            self.settings.model = model.clone();
+        }
+    }
+
+    fn open_model_picker(&mut self) {
+        self.show_model_picker = true;
+        if self.codex_info.is_none() && !self.codex_info_loading {
+            self.refresh_codex_info();
         }
     }
 
@@ -777,7 +1027,11 @@ impl LiveAssistantApp {
     }
 
     fn maybe_refresh_codex_usage(&mut self) {
-        if self.settings.backend != RealtimeBackend::CodexGptLive || self.codex_usage_loading {
+        if !matches!(
+            self.settings.backend,
+            RealtimeBackend::CodexGptLive | RealtimeBackend::CodexText
+        ) || self.codex_usage_loading
+        {
             return;
         }
         let due = self
@@ -793,6 +1047,12 @@ impl LiveAssistantApp {
             AuthMode::ApiKey => {
                 let key = self.api_key.trim();
                 if key.is_empty() {
+                    if self.settings.backend == RealtimeBackend::CodexText {
+                        let creds = auth::codex_credentials().context(
+                            "No API key is set and no Codex login was found for this text model",
+                        )?;
+                        return Ok((creds.bearer_token, creds.chatgpt_account_id));
+                    }
                     anyhow::bail!("Enter an OpenAI Platform API key in Settings.")
                 }
                 Ok((key.to_owned(), None))
@@ -816,8 +1076,65 @@ impl LiveAssistantApp {
         self.error = Some(message);
     }
 
+    fn start_text(&mut self) {
+        let screen_info = match media::primary_screen_info() {
+            Ok(screen) => {
+                self.settings.screenshot_width = screen.logical_width;
+                self.settings.screenshot_height = screen.logical_height;
+                screen
+            }
+            Err(error) => {
+                self.fail_start(
+                    format!("Could not read the primary display resolution: {error:#}"),
+                    false,
+                );
+                return;
+            }
+        };
+        let (api_key, chatgpt_account_id) = match self.resolve_credentials() {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                self.fail_start(error.to_string(), true);
+                return;
+            }
+        };
+        let system_prompt = shared_system_prompt(&self.settings.instructions, screen_info);
+        let options = ConnectOptions {
+            backend: RealtimeBackend::CodexText,
+            api_key,
+            chatgpt_account_id,
+            model: self.settings.model.clone(),
+            voice: self.settings.voice.clone(),
+            system_prompt: system_prompt.clone(),
+            screen_info,
+        };
+        self.state = ConnectionState::Connecting;
+        self.status = "Connecting…".to_owned();
+        if self
+            .realtime
+            .commands
+            .send(Command::Connect(options))
+            .is_err()
+        {
+            self.fail_start(
+                "Could not start text connection: app-server transport stopped".to_owned(),
+                false,
+            );
+            return;
+        }
+        self.messages.push(ChatMessage::system(
+            system_prompt,
+            RealtimeBackend::CodexText,
+        ));
+        self.should_scroll = true;
+    }
+
     fn start(&mut self) {
         self.error = None;
+        if self.settings.backend == RealtimeBackend::CodexText {
+            self.start_text();
+            return;
+        }
         if self.speaker.is_none() {
             match Speaker::new() {
                 Ok(speaker) => self.speaker = Some(speaker),
@@ -835,7 +1152,7 @@ impl LiveAssistantApp {
             Ok(microphone) => {
                 self.microphone = Some(microphone);
                 self.state = ConnectionState::Connecting;
-                self.status = "Mic on · Recording while connecting…".to_owned();
+                self.status = "Recording while connecting…".to_owned();
             }
             Err(error) => {
                 self.fail_start(format!("{error:#}"), false);
@@ -967,15 +1284,17 @@ impl LiveAssistantApp {
                 Event::Connecting => {
                     self.state = ConnectionState::Connecting;
                     self.status = if self.microphone.is_some() {
-                        "Mic on · Recording while connecting…".to_owned()
+                        "Recording while connecting…".to_owned()
                     } else {
                         "Connecting…".to_owned()
                     };
                 }
                 Event::Reconnecting { attempt, reason } => {
                     self.state = ConnectionState::Connecting;
-                    self.status = if self.microphone.is_some() {
-                        format!("Mic on · Recording during reconnect… attempt {attempt}")
+                    self.status = if self.settings.backend == RealtimeBackend::CodexText {
+                        format!("Reconnecting… attempt {attempt}")
+                    } else if self.microphone.is_some() {
+                        format!("Recording during reconnect… attempt {attempt}")
                     } else {
                         format!("Reconnecting GPT-Live… attempt {attempt}")
                     };
@@ -991,16 +1310,21 @@ impl LiveAssistantApp {
                         attempt, reason
                     );
                 }
+                Event::Connected if self.settings.backend == RealtimeBackend::CodexText => {
+                    self.state = ConnectionState::Live;
+                    self.status = "Ready".to_owned();
+                    self.error = None;
+                }
                 Event::Connected if self.microphone.is_some() && self.speaker.is_some() => {
                     self.state = ConnectionState::Live;
-                    self.status = "Mic on · Listening".to_owned();
+                    self.status = "Listening".to_owned();
                     self.error = None;
                 }
                 Event::Connected => match Microphone::start(self.realtime.commands.clone()) {
                     Ok(mic) if self.speaker.is_some() => {
                         self.microphone = Some(mic);
                         self.state = ConnectionState::Live;
-                        self.status = "Mic on · AEC listening".to_owned();
+                        self.status = "AEC listening".to_owned();
                         self.error = None;
                     }
                     Ok(_) => {
@@ -1043,16 +1367,16 @@ impl LiveAssistantApp {
                                 .map(Speaker::assistant_is_playing)
                                 .unwrap_or(false)
                         {
-                            "Mic on · Speaking + hearing you…".to_owned()
+                            "Speaking + hearing you…".to_owned()
                         } else {
-                            "Mic on · Hearing you…".to_owned()
+                            "Hearing you…".to_owned()
                         };
                         self.ensure_active_voice_message();
                         self.should_scroll = true;
                         continue;
                     }
                     // OpenAI Realtime uses interruption/truncation for barge-in.
-                    self.status = "Mic on · Hearing you…".to_owned();
+                    self.status = "Hearing you…".to_owned();
                     let played_ms = if let Some(speaker) = &mut self.speaker {
                         match speaker.interrupt_assistant() {
                             Ok(played_ms) => played_ms,
@@ -1119,7 +1443,7 @@ impl LiveAssistantApp {
                         if !has_visible_content {
                             self.discard_active_voice_message_if_empty();
                             if self.state == ConnectionState::Live {
-                                self.status = "Mic on · Listening".to_owned();
+                                self.status = "Listening".to_owned();
                             }
                             continue;
                         }
@@ -1206,14 +1530,14 @@ impl LiveAssistantApp {
                             MESSAGE_CONTINUATION_WINDOW.as_secs()
                         );
                     }
-                    self.status = "Mic on · Hearing you…".to_owned();
+                    self.status = "Hearing you…".to_owned();
                     self.should_scroll = true;
                 }
                 Event::ContextImageAccepted { upload_id } => {
                     // Accepted means the backend has queued the JPEG. Keep the
                     // overlay visible until its server acknowledgment confirms
                     // that the image reached conversation context.
-                    self.status = "Mic on · Hearing you… · Screen queued".to_owned();
+                    self.status = "Hearing you… · Screen queued".to_owned();
                     self.should_scroll = true;
                     ctx.request_repaint();
                     eprintln!("[live-assistant image] backend queued upload_id={upload_id}");
@@ -1227,7 +1551,7 @@ impl LiveAssistantApp {
                             .map(Microphone::in_speech)
                             .unwrap_or(false)
                         {
-                            "Mic on · Hearing you… · Screen uploaded".to_owned()
+                            "Hearing you… · Screen uploaded".to_owned()
                         } else {
                             "Screen uploaded".to_owned()
                         };
@@ -1267,7 +1591,9 @@ impl LiveAssistantApp {
                                 .get(index)
                                 .is_some_and(|message| !message.text.trim().is_empty())
                         });
-                    if let Some(speaker) = &mut self.speaker {
+                    if self.settings.backend != RealtimeBackend::CodexText
+                        && let Some(speaker) = &mut self.speaker
+                    {
                         speaker.begin_assistant_response(
                             self.settings.backend == RealtimeBackend::CodexGptLive,
                         );
@@ -1320,12 +1646,14 @@ impl LiveAssistantApp {
                     if !self.response_is_active(&response_id) {
                         continue;
                     }
-                    if let Some(speaker) = &mut self.speaker {
+                    if self.settings.backend != RealtimeBackend::CodexText
+                        && let Some(speaker) = &mut self.speaker
+                    {
                         speaker.append_assistant(samples.clone());
                     }
                     self.current_assistant().audio.extend_from_slice(&samples);
                     self.touch_assistant_group(Instant::now());
-                    self.status = "Mic on · Speaking…".to_owned();
+                    self.status = "Speaking…".to_owned();
                     self.should_scroll = true;
                 }
                 Event::AssistantSegmentDone { response_id } => {
@@ -1348,7 +1676,9 @@ impl LiveAssistantApp {
                 }
                 Event::AssistantDone { response_id } => {
                     if self.response_is_active(&response_id) {
-                        if let Some(speaker) = &mut self.speaker {
+                        if self.settings.backend != RealtimeBackend::CodexText
+                            && let Some(speaker) = &mut self.speaker
+                        {
                             speaker.finish_assistant_response();
                         }
                         self.active_response_id = None;
@@ -1370,7 +1700,11 @@ impl LiveAssistantApp {
                                 .map(Speaker::assistant_is_playing)
                                 .unwrap_or(false)
                         {
-                            self.status = "Mic on · Listening".to_owned();
+                            self.status = if self.settings.backend == RealtimeBackend::CodexText {
+                                "Ready".to_owned()
+                            } else {
+                                "Listening".to_owned()
+                            };
                         }
                     }
                 }
@@ -1450,6 +1784,7 @@ impl LiveAssistantApp {
         }
 
         if self.state == ConnectionState::Live
+            && self.settings.backend != RealtimeBackend::CodexText
             && self.active_response_id.is_none()
             && !self
                 .speaker
@@ -1458,7 +1793,7 @@ impl LiveAssistantApp {
                 .unwrap_or(false)
             && self.status.contains("Speaking")
         {
-            self.status = "Mic on · Listening".to_owned();
+            self.status = "Listening".to_owned();
         }
     }
 
@@ -1749,9 +2084,9 @@ impl LiveAssistantApp {
                             );
                             self.status = "Screenshot upload failed".to_owned();
                         } else if self.state == ConnectionState::Connecting {
-                            self.status = "Mic on · Connecting · Uploading screen…".to_owned();
+                            self.status = "Connecting · Uploading screen…".to_owned();
                         } else {
-                            self.status = "Mic on · Hearing you… · Uploading screen…".to_owned();
+                            self.status = "Hearing you… · Uploading screen…".to_owned();
                         }
                         if capture.turn_id == self.speech_turn_id
                             && self
@@ -1802,9 +2137,9 @@ impl LiveAssistantApp {
         self.screenshot_capture_in_flight = Some(turn_id);
         self.screenshot_message_index = Some(message_index);
         self.status = if self.state == ConnectionState::Connecting {
-            "Mic on · Connecting · Capturing screen".to_owned()
+            "Connecting · Capturing screen".to_owned()
         } else {
-            "Mic on · Hearing you… · Capturing screen".to_owned()
+            "Hearing you… · Capturing screen".to_owned()
         };
         self.should_scroll = true;
         eprintln!(
@@ -1911,7 +2246,11 @@ impl LiveAssistantApp {
 
     fn send_composer(&mut self) {
         if self.state != ConnectionState::Live {
-            self.error = Some("Start the voice session before sending a message.".to_owned());
+            self.error = Some(if self.settings.backend == RealtimeBackend::CodexText {
+                "Start the text session before sending a message.".to_owned()
+            } else {
+                "Start the voice session before sending a message.".to_owned()
+            });
             return;
         }
         if self.composer.trim().is_empty() && self.pending.is_empty() {
@@ -1946,9 +2285,30 @@ impl LiveAssistantApp {
     }
 
     fn draw_header(&mut self, ui: &mut egui::Ui) {
+        let mut requested_switch = None;
         ui.horizontal(|ui| {
-            ui.heading(RichText::new("Live Assistant").size(22.0));
-            ui.add_space(8.0);
+            for index in 0..self.tabs.len() {
+                let title = self.tab_title(index);
+                if ui
+                    .selectable_label(index == self.active_tab, title)
+                    .clicked()
+                {
+                    requested_switch = Some(index);
+                }
+            }
+            if ui
+                .button("＋")
+                .on_hover_text("Open a new model tab")
+                .clicked()
+            {
+                self.open_model_picker();
+            }
+        });
+        if let Some(index) = requested_switch {
+            self.switch_tab(index);
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
             let (dot, label) = match self.state {
                 ConnectionState::Offline => (Color32::from_rgb(112, 120, 132), "Offline"),
                 ConnectionState::Connecting => (Color32::from_rgb(190, 123, 20), "Connecting"),
@@ -1963,7 +2323,12 @@ impl LiveAssistantApp {
                     self.show_settings = true;
                 }
                 let button = if self.state == ConnectionState::Offline {
-                    egui::Button::new(RichText::new("● Start voice").color(Color32::WHITE))
+                    let label = if self.settings.backend == RealtimeBackend::CodexText {
+                        "● Start"
+                    } else {
+                        "● Start voice"
+                    };
+                    egui::Button::new(RichText::new(label).color(Color32::WHITE))
                         .fill(Color32::from_rgb(31, 138, 84))
                 } else {
                     egui::Button::new(RichText::new("■ Stop").color(Color32::WHITE))
@@ -1988,22 +2353,106 @@ impl LiveAssistantApp {
         });
     }
 
+    fn draw_model_picker(&mut self, ctx: &egui::Context) {
+        if !self.show_model_picker {
+            return;
+        }
+        let text_models = self.text_model_choices();
+        let mut open = true;
+        let mut selection: Option<(RealtimeBackend, String, String)> = None;
+        egui::Window::new("New model tab")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                ui.label("Choose a model for a new conversation tab.");
+                ui.add_space(8.0);
+                ui.label(RichText::new("Voice").strong());
+                if ui.button("Realtime · gpt-realtime-2.1").clicked() {
+                    selection = Some((
+                        RealtimeBackend::OpenAiRealtime,
+                        "gpt-realtime-2.1".to_owned(),
+                        "marin".to_owned(),
+                    ));
+                }
+                if ui.button("Live · Codex GPT-Live").clicked() {
+                    selection = Some((
+                        RealtimeBackend::CodexGptLive,
+                        "gpt-realtime-2.1".to_owned(),
+                        "ember".to_owned(),
+                    ));
+                }
+                ui.add_space(8.0);
+                ui.label(RichText::new("Text").strong());
+                for (model, display_name) in &text_models {
+                    if ui
+                        .button(display_name)
+                        .on_hover_text(model)
+                        .clicked()
+                    {
+                        selection = Some((
+                            RealtimeBackend::CodexText,
+                            model.clone(),
+                            "marin".to_owned(),
+                        ));
+                    }
+                }
+                if self.codex_info_loading {
+                    ui.add_space(6.0);
+                    ui.label("Loading additional Codex models…");
+                } else if let Some(error) = &self.codex_info_error {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(error).small().weak());
+                }
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "Text tabs use the Codex app-server and include the same computer tools as voice tabs.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            });
+        self.show_model_picker = open;
+        if let Some((backend, model, voice)) = selection {
+            self.add_model_tab(backend, model, &voice);
+        }
+    }
+
     fn draw_empty(&self, ui: &mut egui::Ui) {
+        let text_model = self.settings.backend == RealtimeBackend::CodexText;
         ui.vertical_centered(|ui| {
             ui.add_space(100.0);
-            ui.label(RichText::new("Talk, type, or share what you see").size(28.0));
+            ui.label(
+                RichText::new(if text_model {
+                    "Chat with this model"
+                } else {
+                    "Talk, type, or share what you see"
+                })
+                .size(28.0),
+            );
             ui.add_space(10.0);
             ui.label(
-                RichText::new(
+                RichText::new(if text_model {
+                    "Send a message, attach an image, or ask the model to use the computer tools."
+                } else {
                     "Start voice, then speak naturally. After half a second of clear speech, \
-                     the current screen is sent while you are still talking.",
-                )
+                     the current screen is sent while you are still talking."
+                })
                 .weak(),
             );
             ui.add_space(24.0);
             ui.horizontal_wrapped(|ui| {
-                ui.label("🎙 Semantic turn detection");
-                ui.separator();
+                if !text_model {
+                    ui.label("🎙 Semantic turn detection");
+                    ui.separator();
+                } else {
+                    ui.label("Text model");
+                    ui.separator();
+                    ui.label("Computer tools");
+                    ui.separator();
+                }
                 ui.label("▣ Logical-resolution screen context");
                 ui.separator();
                 ui.label("＋ Images & audio");
@@ -2033,6 +2482,7 @@ impl LiveAssistantApp {
             let role_label = match role {
                 Role::System(RealtimeBackend::OpenAiRealtime) => "SYSTEM · OPENAI REALTIME",
                 Role::System(RealtimeBackend::CodexGptLive) => "SYSTEM · GPT-LIVE",
+                Role::System(RealtimeBackend::CodexText) => "SYSTEM · CODEX TEXT",
                 Role::User => "YOU",
                 Role::Assistant => "ASSISTANT",
             };
@@ -2134,7 +2584,19 @@ impl LiveAssistantApp {
                                 } else {
                                     &image.name
                                 };
-                                ui.label(RichText::new(caption).small().weak());
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new(caption).small().weak());
+                                    if ui.small_button("Save image").clicked()
+                                        && let Some(path) = rfd::FileDialog::new()
+                                            .set_file_name(image.name.clone())
+                                            .add_filter("JPEG image", &["jpg", "jpeg"])
+                                            .save_file()
+                                        && let Err(error) =
+                                            media::save_image(&path, &image.sent_image)
+                                    {
+                                        self.error = Some(format!("{error:#}"));
+                                    }
+                                });
                             }
                             if is_assistant {
                                 ui.add_space(5.0);
@@ -2369,6 +2831,7 @@ impl LiveAssistantApp {
         {
             self.refresh_codex_info();
         }
+        self.ensure_text_model_selection();
         let mut open = self.show_settings;
         egui::Window::new("Settings")
             .open(&mut open)
@@ -2389,22 +2852,19 @@ impl LiveAssistantApp {
                     .id_salt("settings_scroll")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.heading("Realtime session");
+                        ui.heading("Session and model");
                         ui.add_space(8.0);
                         egui::Grid::new("settings_grid")
                             .num_columns(2)
                             .spacing([16.0, 10.0])
                             .show(ui, |ui| {
-                                ui.label("Voice engine");
+                                ui.label("Session type");
                                 let previous_backend = self.settings.backend;
                                 egui::ComboBox::from_id_salt("voice_engine")
                                     .selected_text(match self.settings.backend {
-                                        RealtimeBackend::OpenAiRealtime => {
-                                            "OpenAI Realtime API"
-                                        }
-                                        RealtimeBackend::CodexGptLive => {
-                                            "Codex GPT-Live (experimental)"
-                                        }
+                                        RealtimeBackend::OpenAiRealtime => "Realtime · OpenAI",
+                                        RealtimeBackend::CodexGptLive => "Live · Codex GPT-Live",
+                                        RealtimeBackend::CodexText => "Text · Codex model",
                                     })
                                     .show_ui(ui, |ui| {
                                         ui.selectable_value(
@@ -2417,19 +2877,45 @@ impl LiveAssistantApp {
                                             RealtimeBackend::CodexGptLive,
                                             "Codex GPT-Live via app-server",
                                         );
+                                        ui.selectable_value(
+                                            &mut self.settings.backend,
+                                            RealtimeBackend::CodexText,
+                                            "Text model via Codex app-server",
+                                        );
                                     });
                                 if previous_backend != self.settings.backend {
                                     self.settings.voice = match self.settings.backend {
                                         RealtimeBackend::OpenAiRealtime => "marin",
                                         RealtimeBackend::CodexGptLive => "ember",
+                                        RealtimeBackend::CodexText => "marin",
                                     }
                                     .to_owned();
+                                    if self.settings.backend == RealtimeBackend::CodexText {
+                                        self.ensure_text_model_selection();
+                                    }
                                 }
                                 ui.end_row();
 
-                                ui.label("Realtime model");
+                                ui.label(if self.settings.backend == RealtimeBackend::CodexText {
+                                    "Text model"
+                                } else {
+                                    "Realtime model"
+                                });
                                 if self.settings.backend == RealtimeBackend::CodexGptLive {
                                     ui.label("gpt-live-1-boulder-alpha · managed by Codex");
+                                } else if self.settings.backend == RealtimeBackend::CodexText {
+                                    let text_models = self.text_model_choices();
+                                    egui::ComboBox::from_id_salt("text_model")
+                                        .selected_text(&self.settings.model)
+                                        .show_ui(ui, |ui| {
+                                            for (model, display_name) in text_models {
+                                                ui.selectable_value(
+                                                    &mut self.settings.model,
+                                                    model,
+                                                    display_name,
+                                                );
+                                            }
+                                        });
                                 } else {
                                     egui::ComboBox::from_id_salt("model")
                                         .selected_text(&self.settings.model)
@@ -2448,7 +2934,11 @@ impl LiveAssistantApp {
                                 }
                                 ui.end_row();
 
-                                ui.label("Voice");
+                                ui.label(if self.settings.backend == RealtimeBackend::CodexText {
+                                    "Output"
+                                } else {
+                                    "Voice"
+                                });
                                 let voices: Vec<String> = match self.settings.backend {
                                     RealtimeBackend::OpenAiRealtime => self
                                         .codex_info
@@ -2472,27 +2962,32 @@ impl LiveAssistantApp {
                                                 .map(|voice| (*voice).to_owned())
                                                 .collect()
                                         }),
+                                    RealtimeBackend::CodexText => Vec::new(),
                                 };
-                                egui::ComboBox::from_id_salt("voice")
-                                    .selected_text(&self.settings.voice)
-                                    .show_ui(ui, |ui| {
-                                        if !voices.contains(&self.settings.voice) {
-                                            let current = self.settings.voice.clone();
-                                            ui.selectable_value(
-                                                &mut self.settings.voice,
-                                                current.clone(),
-                                                format!("{current} (saved)"),
-                                            );
-                                        }
-                                        for voice in voices {
-                                            let label = voice.clone();
-                                            ui.selectable_value(
-                                                &mut self.settings.voice,
-                                                voice,
-                                                label,
-                                            );
-                                        }
-                                    });
+                                if self.settings.backend == RealtimeBackend::CodexText {
+                                    ui.label("Text response");
+                                } else {
+                                    egui::ComboBox::from_id_salt("voice")
+                                        .selected_text(&self.settings.voice)
+                                        .show_ui(ui, |ui| {
+                                            if !voices.contains(&self.settings.voice) {
+                                                let current = self.settings.voice.clone();
+                                                ui.selectable_value(
+                                                    &mut self.settings.voice,
+                                                    current.clone(),
+                                                    format!("{current} (saved)"),
+                                                );
+                                            }
+                                            for voice in voices {
+                                                let label = voice.clone();
+                                                ui.selectable_value(
+                                                    &mut self.settings.voice,
+                                                    voice,
+                                                    label,
+                                                );
+                                            }
+                                        });
+                                }
                                 ui.end_row();
 
                                 ui.label("Authentication");
@@ -2535,7 +3030,7 @@ impl LiveAssistantApp {
                             .corner_radius(7.0)
                             .inner_margin(egui::Margin::same(9))
                             .show(ui, |ui| {
-                                ui.label(RichText::new("Voice engines").strong());
+                                ui.label(RichText::new("Available session types").strong());
                                 ui.label(
                                     "gpt-realtime-2.1 · current selectable Realtime API model",
                                 );
@@ -2552,6 +3047,9 @@ impl LiveAssistantApp {
                                     .small()
                                     .weak(),
                                 );
+                                ui.label(
+                                    "Text models · Codex app-server threads with the same computer tools and image attachments",
+                                );
                             });
 
                         if self.settings.auth_mode == AuthMode::CodexApiKey {
@@ -2560,10 +3058,19 @@ impl LiveAssistantApp {
                         }
 
                         ui.add_space(8.0);
-                        ui.checkbox(
-                            &mut self.settings.send_screenshot,
-                            "Send the primary display after 0.5 seconds of clear speech",
-                        );
+                        if self.settings.backend == RealtimeBackend::CodexText {
+                            ui.label(
+                                RichText::new(
+                                    "Text models can inspect the screen through computer tools or an attached image.",
+                                )
+                                .weak(),
+                            );
+                        } else {
+                            ui.checkbox(
+                                &mut self.settings.send_screenshot,
+                                "Send the primary display after 0.5 seconds of clear speech",
+                            );
+                        }
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.label("macOS logical resolution");
@@ -2979,6 +3486,10 @@ impl eframe::App for LiveAssistantApp {
                     .inner_margin(egui::Margin::symmetric(18, 12)),
             )
             .show(ctx, |ui| self.draw_header(ui));
+
+        if self.show_model_picker {
+            self.draw_model_picker(ctx);
+        }
 
         egui::TopBottomPanel::bottom("composer")
             .resizable(false)

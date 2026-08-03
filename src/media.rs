@@ -406,6 +406,13 @@ pub fn save_wav(path: &Path, samples: &[i16]) -> Result<()> {
     Ok(())
 }
 
+pub fn save_image(path: &Path, encoded_image: &[u8]) -> Result<()> {
+    anyhow::ensure!(!encoded_image.is_empty(), "Image data is empty");
+    std::fs::write(path, encoded_image)
+        .with_context(|| format!("Could not create image {}", path.display()))?;
+    Ok(())
+}
+
 pub fn wav_file_size(sample_count: usize) -> usize {
     const PCM_WAV_HEADER_BYTES: usize = 44;
     PCM_WAV_HEADER_BYTES.saturating_add(sample_count.saturating_mul(size_of::<i16>()))
@@ -416,7 +423,7 @@ mod tests {
     use super::{
         Attachment, DynamicImage, MAX_JPEG_UPLOAD_BYTES, encode_image_attachment,
         jpeg_animal_probe_attachments, jpeg_attachment_name, jpeg_latest_image_probe_attachments,
-        jpeg_upload_probe_attachment, resample_to_24k, wav_file_size,
+        jpeg_upload_probe_attachment, resample_to_24k, save_image, wav_file_size,
     };
     use base64::{Engine, engine::general_purpose::STANDARD};
     use image::{ImageFormat, Rgba, RgbaImage};
@@ -469,6 +476,19 @@ mod tests {
         assert_eq!(&bytes[..2], &[0xff, 0xd8]);
         assert_eq!(&bytes[bytes.len() - 2..], &[0xff, 0xd9]);
         assert_eq!(image::guess_format(&thumbnail).unwrap(), ImageFormat::Png);
+    }
+
+    #[test]
+    fn save_image_preserves_the_encoded_payload() {
+        let path = std::env::temp_dir().join(format!(
+            "live-assistant-save-image-{}.jpg",
+            std::process::id()
+        ));
+        let encoded_image = b"encoded image payload";
+
+        save_image(&path, encoded_image).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), encoded_image);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -824,6 +824,24 @@ impl CodexLiveState {
     }
 }
 
+fn emit_codex_live_remote_audio(
+    state: &mut CodexLiveState,
+    events: &std::sync::mpsc::Sender<Event>,
+    samples: Vec<i16>,
+) -> bool {
+    if samples.is_empty() {
+        return false;
+    }
+    let response_id = state.ensure_response(events);
+    state.note_assistant_audio_activity();
+    events
+        .send(Event::AssistantAudio {
+            response_id,
+            samples,
+        })
+        .is_ok()
+}
+
 #[derive(Default)]
 struct CodexHandoffState {
     active_turn_id: Option<String>,
@@ -981,11 +999,9 @@ async fn run_codex_live_connection(
     let mut latest_ready_context_image_upload_id: Option<u64> = None;
     let mut pending_dynamic_tools: HashMap<String, Value> = HashMap::new();
     let mut response_watchdog: Option<Instant> = None;
-    // GPT-Live's RTP track is continuous. Keep a small packet pre-roll while
-    // there is no backend-declared assistant response, then flush it when the
-    // assistant transcript starts. The backend—not an RMS threshold—owns the
-    // response start/stop decision.
-    let mut remote_audio_pre_roll: VecDeque<Vec<i16>> = VecDeque::new();
+    // The WebRTC receive task filters continuous comfort noise and emits only
+    // reordered speech packets. Start UI/playback from the first real audio
+    // packet instead of waiting for the slower sideband transcript notification.
     let mut finish_tick = tokio::time::interval(Duration::from_millis(50));
     finish_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1178,15 +1194,7 @@ async fn run_codex_live_connection(
                 match audio {
                     Some(Ok(samples)) if !samples.is_empty() => {
                         response_watchdog = None;
-                        if let Some(response_id) = state.active_response_id.clone() {
-                            state.note_assistant_audio_activity();
-                            let _ = events.send(Event::AssistantAudio { response_id, samples });
-                        } else {
-                            remote_audio_pre_roll.push_back(samples);
-                            while remote_audio_pre_roll.len() > 10 {
-                                remote_audio_pre_roll.pop_front();
-                            }
-                        }
+                        emit_codex_live_remote_audio(&mut state, events, samples);
                     }
                     Some(Ok(_)) => {}
                     Some(Err(detail)) => {
@@ -1258,13 +1266,7 @@ async fn run_codex_live_connection(
                     response_watchdog = None;
                 }
                 if codex_message_is_assistant_transcript(&message) {
-                    let response_id = state.ensure_response(events);
-                    while let Some(samples) = remote_audio_pre_roll.pop_front() {
-                        let _ = events.send(Event::AssistantAudio {
-                            response_id: response_id.clone(),
-                            samples,
-                        });
-                    }
+                    state.ensure_response(events);
                 }
                 if let Some((request_id, call)) = dynamic_tool_request(&message) {
                     eprintln!(
@@ -1333,7 +1335,6 @@ async fn run_codex_live_connection(
                     );
                 }
                 if state.finish_response_if_due(now, events) {
-                    remote_audio_pre_roll.clear();
                     eprintln!("[live-assistant reply] finalized GPT-Live response after quiet speech tail");
                 }
                 if response_watchdog.is_some_and(|deadline| now >= deadline) {
@@ -4110,15 +4111,16 @@ mod tests {
         codex_live_thread_start_params, codex_message_is_assistant_transcript,
         codex_message_starts_reply, codex_text_thread_start_params, codex_text_turn_start_params,
         codex_turn_input, context_image_item_event, context_image_item_id, context_image_upload_id,
-        decode_audio_to_24k_mono, dynamic_tool_content_items, dynamic_tool_request, encode_pcm,
-        expire_codex_context_images, expire_openai_context_uploads, extract_function_call_event,
-        extract_function_calls, gpt_live_context_image_failed_params,
-        gpt_live_context_image_pending_params, gpt_live_context_image_ready_params,
-        handle_codex_context_image_response, handle_codex_handoff_message,
-        handle_codex_live_message, handle_codex_text_message, handle_context_image_server_value,
-        handle_server_event, input_image_content, openai_context_response_blockers,
-        openai_deferred_response_is_ready, openai_function_output, response_total_tokens,
-        shared_system_prompt, take_latest_ready_codex_context_image, voice_tools,
+        decode_audio_to_24k_mono, dynamic_tool_content_items, dynamic_tool_request,
+        emit_codex_live_remote_audio, encode_pcm, expire_codex_context_images,
+        expire_openai_context_uploads, extract_function_call_event, extract_function_calls,
+        gpt_live_context_image_failed_params, gpt_live_context_image_pending_params,
+        gpt_live_context_image_ready_params, handle_codex_context_image_response,
+        handle_codex_handoff_message, handle_codex_live_message, handle_codex_text_message,
+        handle_context_image_server_value, handle_server_event, input_image_content,
+        openai_context_response_blockers, openai_deferred_response_is_ready,
+        openai_function_output, response_total_tokens, shared_system_prompt,
+        take_latest_ready_codex_context_image, voice_tools,
     };
     use crate::media::{Attachment, ScreenInfo, jpeg_upload_probe_attachment};
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -5117,7 +5119,34 @@ Call me Ecoo."
     }
 
     #[test]
-    fn codex_live_backend_transcript_controls_audio_start() {
+    fn codex_live_audio_starts_reply_before_sideband_transcript() {
+        let (events, received) = std::sync::mpsc::channel();
+        let mut state = CodexLiveState::default();
+
+        assert!(emit_codex_live_remote_audio(
+            &mut state,
+            &events,
+            vec![1; 480]
+        ));
+        let response_id = match received.recv().unwrap() {
+            Event::AssistantResponseStarted { response_id } => response_id,
+            other => panic!("unexpected event: {other:?}"),
+        };
+        assert!(matches!(
+            received.recv().unwrap(),
+            Event::AssistantAudio {
+                response_id: id,
+                samples
+            } if id == response_id && samples.len() == 480
+        ));
+        assert_eq!(
+            state.active_response_id.as_deref(),
+            Some(response_id.as_str())
+        );
+    }
+
+    #[test]
+    fn codex_live_sideband_identifies_assistant_transcript() {
         assert!(codex_message_is_assistant_transcript(&json!({
             "method": "thread/realtime/transcript/delta",
             "params": {"role": "assistant", "delta": "hello"}

@@ -18,7 +18,9 @@ WebSocket API. It supports:
 - compact per-message start/end timing and elapsed cost, plus token totals and completed assistant token rate
 - GPT-Live and Realtime tabs open by default with GPT-Live first and auto-connecting, plus a manual down-arrow control instead of automatic transcript scrolling
 - OpenAI Realtime has an optional tool-first prompt appendix, delegates screenshot-backed clicks to a text model for accuracy, and GPT-Live clicks directly
-- both voice backends pause streaming playback below one second of queued audio and retry every two seconds
+- OpenAI Realtime retains its conservative one-second playback gate; GPT-Live uses an adaptive 80 ms low watermark and 320 ms resume cushion to avoid repeated stalls
+- GPT-Live reorders RTP packets, applies Opus packet-loss concealment from media timestamps, and starts playback from audio before delayed transcript events
+- GPT-Live microphone Opus encoding runs independently from receive/control processing with in-band FEC and packet-loss tuning
 - Realtime function tools for screenshot-relative clicks, Bash commands, and text insertion
 - light interface theme
 - a persistent conversation until the voice session is stopped
@@ -111,6 +113,11 @@ then flushed when the session is ready before live audio continues. A screen
 capture is taken after roughly half a second of clear speech or the first live
 transcript token, not continuously. Disable per-turn screenshots in Settings.
 Press **Stop** to close the transport and microphone.
+
+GPT-Live uses the raw WebRTC RTP track rather than a browser audio element. The
+receiver therefore provides its own short packet-reordering window, Opus loss
+concealment, comfort-noise filtering, and playback hysteresis. Audio receive and
+microphone packetization are separated so full-duplex input cannot block output.
 
 Computer tools run with the current user's permissions. The session prompt
 treats screenshot/application text as untrusted content. Bash commands time out

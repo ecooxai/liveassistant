@@ -25,19 +25,38 @@ const PLAYBACK_RATE: u32 = 24_000;
 const LOUD_SPEECH_RMS: f32 = 0.004;
 /// Do not reset the sustained-speech timer for tiny natural gaps between syllables.
 const LOUD_SPEECH_QUIET_TOLERANCE_SAMPLES: usize = 24_000 / 5; // 200 ms at 24 kHz
-/// Both voice transports use the same conservative streaming jitter buffer.
-/// When queued audio drops below one second, playback pauses without consuming
-/// samples. The output callback checks again every two seconds and resumes only
-/// after more than one second has accumulated. Transcript and tool events stay
-/// on their independent low-latency paths.
-const ASSISTANT_PLAYBACK_BUFFER_LOW_MS: u32 = 1_000;
-const ASSISTANT_PLAYBACK_RECHECK_MS: u64 = 2_000;
+/// OpenAI Realtime retains the explicit conservative buffer requested for its
+/// WebSocket audio stream. GPT-Live already arrives over RTP and needs a normal
+/// jitter-buffer hysteresis instead: start/resume with a healthy cushion, but do
+/// not stop during ordinary packet jitter until the queue is nearly empty.
+const REALTIME_PLAYBACK_LOW_MS: u32 = 1_000;
+const REALTIME_PLAYBACK_RESUME_MS: u32 = 1_000;
+const REALTIME_PLAYBACK_RECHECK_MS: u64 = 2_000;
+const GPT_LIVE_PLAYBACK_LOW_MS: u32 = 80;
+const GPT_LIVE_PLAYBACK_RESUME_MS: u32 = 320;
+const GPT_LIVE_PLAYBACK_RECHECK_MS: u64 = 20;
 
-fn assistant_playback_policy(_buffered_gpt_live: bool) -> (u32, u64) {
-    (
-        ASSISTANT_PLAYBACK_BUFFER_LOW_MS,
-        ASSISTANT_PLAYBACK_RECHECK_MS,
-    )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AssistantPlaybackPolicy {
+    low_ms: u32,
+    resume_ms: u32,
+    recheck_ms: u64,
+}
+
+fn assistant_playback_policy(buffered_gpt_live: bool) -> AssistantPlaybackPolicy {
+    if buffered_gpt_live {
+        AssistantPlaybackPolicy {
+            low_ms: GPT_LIVE_PLAYBACK_LOW_MS,
+            resume_ms: GPT_LIVE_PLAYBACK_RESUME_MS,
+            recheck_ms: GPT_LIVE_PLAYBACK_RECHECK_MS,
+        }
+    } else {
+        AssistantPlaybackPolicy {
+            low_ms: REALTIME_PLAYBACK_LOW_MS,
+            resume_ms: REALTIME_PLAYBACK_RESUME_MS,
+            recheck_ms: REALTIME_PLAYBACK_RECHECK_MS,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -262,6 +281,7 @@ struct PlaybackBuffer {
     streaming_assistant: bool,
     response_complete: bool,
     low_watermark_samples: usize,
+    resume_watermark_samples: usize,
     resume_check_at: Option<Instant>,
     resume_check_interval: Duration,
     native_sample_rate: u32,
@@ -285,10 +305,13 @@ impl Speaker {
             streaming_assistant: false,
             response_complete: true,
             low_watermark_samples: (config.sample_rate.0 as usize
-                * ASSISTANT_PLAYBACK_BUFFER_LOW_MS as usize)
+                * REALTIME_PLAYBACK_LOW_MS as usize)
+                / 1_000,
+            resume_watermark_samples: (config.sample_rate.0 as usize
+                * REALTIME_PLAYBACK_RESUME_MS as usize)
                 / 1_000,
             resume_check_at: None,
-            resume_check_interval: Duration::from_millis(ASSISTANT_PLAYBACK_RECHECK_MS),
+            resume_check_interval: Duration::from_millis(REALTIME_PLAYBACK_RECHECK_MS),
             native_sample_rate: config.sample_rate.0,
             played_assistant_samples_native: 0,
         }));
@@ -301,8 +324,8 @@ impl Speaker {
             config.sample_rate.0,
             config.channels,
             sample_format,
-            ASSISTANT_PLAYBACK_BUFFER_LOW_MS,
-            ASSISTANT_PLAYBACK_RECHECK_MS
+            REALTIME_PLAYBACK_LOW_MS,
+            REALTIME_PLAYBACK_RECHECK_MS
         );
 
         Ok(Self {
@@ -323,10 +346,12 @@ impl Speaker {
         self.assistant_logged_seconds = 0;
         self.output_resampler.reset();
         if let Ok(mut playback) = self.playback.lock() {
-            let (buffer_low_ms, recheck_ms) = assistant_playback_policy(buffered_gpt_live);
+            let policy = assistant_playback_policy(buffered_gpt_live);
             playback.low_watermark_samples =
-                playback.native_sample_rate as usize * buffer_low_ms as usize / 1_000;
-            playback.resume_check_interval = Duration::from_millis(recheck_ms);
+                playback.native_sample_rate as usize * policy.low_ms as usize / 1_000;
+            playback.resume_watermark_samples =
+                playback.native_sample_rate as usize * policy.resume_ms as usize / 1_000;
+            playback.resume_check_interval = Duration::from_millis(policy.recheck_ms);
             playback.streaming_assistant = true;
             playback.response_complete = false;
             playback.playing = false;
@@ -501,7 +526,10 @@ fn build_output_stream(
 }
 
 fn write_output_f32(output: &mut [f32], channels: usize, playback: &Mutex<PlaybackBuffer>) {
-    let Ok(mut playback) = playback.try_lock() else {
+    // The producer holds this lock only while extending a small PCM batch.
+    // Waiting for that brief critical section is less audible than emitting a
+    // full callback of silence whenever `try_lock` happens to collide with it.
+    let Ok(mut playback) = playback.lock() else {
         output.fill(0.0);
         return;
     };
@@ -517,7 +545,7 @@ fn write_output_f32(output: &mut [f32], channels: usize, playback: &Mutex<Playba
 }
 
 fn write_output_i16(output: &mut [i16], channels: usize, playback: &Mutex<PlaybackBuffer>) {
-    let Ok(mut playback) = playback.try_lock() else {
+    let Ok(mut playback) = playback.lock() else {
         output.fill(0);
         return;
     };
@@ -534,7 +562,7 @@ fn write_output_i16(output: &mut [i16], channels: usize, playback: &Mutex<Playba
 }
 
 fn write_output_u16(output: &mut [u16], channels: usize, playback: &Mutex<PlaybackBuffer>) {
-    let Ok(mut playback) = playback.try_lock() else {
+    let Ok(mut playback) = playback.lock() else {
         output.fill(u16::MAX / 2);
         return;
     };
@@ -582,7 +610,7 @@ fn playback_ready_for_callback(playback: &mut PlaybackBuffer, now: Instant) -> b
     if now < check_at {
         return false;
     }
-    if playback.samples_native.len() > playback.low_watermark_samples {
+    if playback.samples_native.len() > playback.resume_watermark_samples {
         playback.playing = true;
         playback.resume_check_at = None;
         return true;
@@ -654,6 +682,7 @@ mod tests {
             streaming_assistant: true,
             response_complete: false,
             low_watermark_samples: 3,
+            resume_watermark_samples: 3,
             resume_check_at: None,
             resume_check_interval: Duration::from_secs(2),
             native_sample_rate: 48_000,
@@ -662,7 +691,7 @@ mod tests {
     }
 
     #[test]
-    fn voice_speaker_rebuffers_below_one_second_for_two_seconds() {
+    fn streaming_speaker_rebuffers_below_low_watermark() {
         let now = Instant::now();
         let mut playback = test_playback([0.25, -0.5]);
         playback.playing = true;
@@ -682,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn voice_speaker_resumes_only_above_one_second_watermark() {
+    fn streaming_speaker_resumes_only_above_resume_watermark() {
         let now = Instant::now();
         let mut playback = test_playback([0.25, -0.5, 0.75]);
         playback.resume_check_at = Some(now);
@@ -718,9 +747,23 @@ mod tests {
     }
 
     #[test]
-    fn speaker_buffer_policy_is_shared_by_both_voice_backends() {
-        assert_eq!(assistant_playback_policy(false), (1_000, 2_000));
-        assert_eq!(assistant_playback_policy(true), (1_000, 2_000));
+    fn speaker_buffer_policy_uses_gpt_live_hysteresis() {
+        assert_eq!(
+            assistant_playback_policy(false),
+            AssistantPlaybackPolicy {
+                low_ms: 1_000,
+                resume_ms: 1_000,
+                recheck_ms: 2_000,
+            }
+        );
+        assert_eq!(
+            assistant_playback_policy(true),
+            AssistantPlaybackPolicy {
+                low_ms: 80,
+                resume_ms: 320,
+                recheck_ms: 20,
+            }
+        );
     }
 
     #[test]

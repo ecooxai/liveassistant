@@ -1185,7 +1185,9 @@ impl LiveAssistantApp {
         }
         settings.instructions.clear();
         let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-        let speaker = Speaker::new().ok();
+        // Audio devices are opened lazily. GPT-Live on macOS delegates both
+        // capture and playout to native libWebRTC's platform audio device module.
+        let speaker = None;
         let (tool_result_tx, tool_result_rx) = mpsc::channel();
         let (codex_info_tx, codex_info_rx) = mpsc::channel();
         let (codex_usage_tx, codex_usage_rx) = mpsc::channel();
@@ -1619,28 +1621,44 @@ impl LiveAssistantApp {
             self.start_text();
             return;
         }
-        if self.speaker.is_none() {
-            match Speaker::new() {
-                Ok(speaker) => self.speaker = Some(speaker),
-                Err(error) => {
-                    self.fail_start(format!("Could not open audio output: {error:#}"), false);
-                    return;
+        if self.settings.backend == RealtimeBackend::CodexGptLive
+            && crate::gpt_live_webrtc::uses_platform_audio()
+        {
+            // Match Codex's native WebRTC architecture: one platform ADM owns
+            // microphone capture, AEC, jitter buffering, and speaker playout.
+            // Opening parallel CPAL/VoiceProcessingIO streams here can compete
+            // with libWebRTC and cause stalls or broken acoustic timing.
+            self.microphone = None;
+            if let Some(speaker) = &mut self.speaker {
+                let _ = speaker.clear();
+            }
+            self.speaker = None;
+            self.state = ConnectionState::Connecting;
+            self.status = "Connecting native WebRTC audio…".to_owned();
+        } else {
+            if self.speaker.is_none() {
+                match Speaker::new() {
+                    Ok(speaker) => self.speaker = Some(speaker),
+                    Err(error) => {
+                        self.fail_start(format!("Could not open audio output: {error:#}"), false);
+                        return;
+                    }
                 }
             }
-        }
 
-        // Open capture as the first connection action. Audio chunks produced while
-        // credentials, screen metadata, and the transport are being prepared stay
-        // ordered in the realtime supervisor's bounded pre-connect buffer.
-        match Microphone::start(self.realtime.commands.clone()) {
-            Ok(microphone) => {
-                self.microphone = Some(microphone);
-                self.state = ConnectionState::Connecting;
-                self.status = "Recording while connecting…".to_owned();
-            }
-            Err(error) => {
-                self.fail_start(format!("{error:#}"), false);
-                return;
+            // Open capture as the first connection action. Audio chunks produced while
+            // credentials, screen metadata, and the transport are being prepared stay
+            // ordered in the realtime supervisor's bounded pre-connect buffer.
+            match Microphone::start(self.realtime.commands.clone()) {
+                Ok(microphone) => {
+                    self.microphone = Some(microphone);
+                    self.state = ConnectionState::Connecting;
+                    self.status = "Recording while connecting…".to_owned();
+                }
+                Err(error) => {
+                    self.fail_start(format!("{error:#}"), false);
+                    return;
+                }
             }
         }
 
@@ -1766,6 +1784,10 @@ impl LiveAssistantApp {
                     self.state = ConnectionState::Connecting;
                     self.status = if self.microphone.is_some() {
                         "Recording while connecting…".to_owned()
+                    } else if self.settings.backend == RealtimeBackend::CodexGptLive
+                        && crate::gpt_live_webrtc::uses_platform_audio()
+                    {
+                        "Connecting native WebRTC audio…".to_owned()
                     } else {
                         "Connecting…".to_owned()
                     };
@@ -1794,6 +1816,15 @@ impl LiveAssistantApp {
                 Event::Connected if self.settings.backend == RealtimeBackend::CodexText => {
                     self.state = ConnectionState::Live;
                     self.status = "Ready".to_owned();
+                    self.error = None;
+                    self.flush_pending_turn();
+                }
+                Event::Connected
+                    if self.settings.backend == RealtimeBackend::CodexGptLive
+                        && crate::gpt_live_webrtc::uses_platform_audio() =>
+                {
+                    self.state = ConnectionState::Live;
+                    self.status = "Listening · Native WebRTC".to_owned();
                     self.error = None;
                     self.flush_pending_turn();
                 }
@@ -1842,16 +1873,9 @@ impl LiveAssistantApp {
                 }
                 Event::SpeechStarted => {
                     if self.settings.backend == RealtimeBackend::CodexGptLive {
-                        // GPT-Live is backend-controlled full duplex. Never clear,
-                        // truncate, pause, or close assistant playback in the frontend,
-                        // including during a temporary quiet gap in the response.
-                        self.status = if self.active_response_id.is_some()
-                            || self
-                                .speaker
-                                .as_ref()
-                                .map(Speaker::assistant_is_playing)
-                                .unwrap_or(false)
-                        {
+                        // Native libWebRTC owns barge-in and full-duplex audio. Keep
+                        // only the UI transcript turn here; do not touch audio devices.
+                        self.status = if self.active_response_id.is_some() {
                             "Speaking + hearing you…".to_owned()
                         } else {
                             "Hearing you…".to_owned()
@@ -1896,8 +1920,17 @@ impl LiveAssistantApp {
                     self.ensure_active_voice_message();
                 }
                 Event::SpeechStopped => {
-                    // Server VAD has ended the utterance; only reply on real speech.
+                    // Server VAD has ended the utterance. Native GPT-Live has no
+                    // parallel local PCM capture; finalize the transcript-only turn.
                     self.speech_screenshot_gate.end();
+                    if self.settings.backend == RealtimeBackend::CodexGptLive
+                        && crate::gpt_live_webrtc::uses_platform_audio()
+                    {
+                        self.status = "Thinking…".to_owned();
+                        self.finish_voice_message(Vec::new());
+                        continue;
+                    }
+                    // OpenAI Realtime only replies on locally confirmed speech.
                     if !self
                         .microphone
                         .as_ref()
@@ -2121,6 +2154,11 @@ impl LiveAssistantApp {
                     self.current_assistant().refresh_token_estimate();
                     self.assistant_text_needs_separator = false;
                     self.touch_assistant_group(Instant::now());
+                    if self.settings.backend == RealtimeBackend::CodexGptLive
+                        && crate::gpt_live_webrtc::uses_platform_audio()
+                    {
+                        self.status = "Speaking… · Native WebRTC".to_owned();
+                    }
                 }
                 Event::AssistantAudio {
                     response_id,

@@ -69,6 +69,18 @@ fn main() -> eframe::Result<()> {
     if std::env::args().any(|argument| argument == "--test-click") {
         return click_test::run();
     }
+    if std::env::args().any(|argument| argument == "--test-gpt-live-native") {
+        match realtime::probe_codex_gpt_live_native() {
+            Ok(()) => {
+                println!("GPT-Live native platform-ADM probe succeeded.");
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("GPT-Live native platform-ADM probe failed: {error:#}");
+                std::process::exit(1);
+            }
+        }
+    }
     if std::env::args().any(|argument| argument == "--test-gpt-live") {
         match realtime::probe_codex_gpt_live() {
             Ok(()) => {

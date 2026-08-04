@@ -1,5 +1,5 @@
 use crate::{
-    gpt_live_webrtc::GptLivePeer,
+    gpt_live_webrtc::{GptLivePeer, GptLiveProbePeer},
     media::{Attachment, ScreenInfo},
 };
 use anyhow::{Context, Result, bail};
@@ -734,6 +734,15 @@ impl Drop for CodexAppServer {
 
 const CODEX_RESPONSE_QUIET_TAIL: Duration = Duration::from_millis(1_200);
 
+fn codex_live_initialize_capabilities() -> Value {
+    json!({
+        "experimentalApi": true,
+        // WebRTC owns remote audio playout. Suppress duplicate PCM notifications
+        // from app-server so they cannot be decoded and played a second time.
+        "optOutNotificationMethods": ["thread/realtime/outputAudio/delta"]
+    })
+}
+
 #[derive(Default)]
 struct CodexLiveState {
     response_number: u64,
@@ -884,7 +893,7 @@ async fn run_codex_live_connection(
                     "title": "Live Assistant",
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "capabilities": {"experimentalApi": true}
+                "capabilities": codex_live_initialize_capabilities()
             }),
         )
         .await?;
@@ -922,6 +931,7 @@ async fn run_codex_live_connection(
                 // This avoids the automatic V3 thinking-channel race where a
                 // correct delegated image answer can remain silent.
                 "clientManagedHandoffs": true,
+                "delegationAckFiller": false,
                 "codexResponsesAsItems": false,
                 "includeStartupContext": false,
                 "prompt": realtime_prompt,
@@ -2220,7 +2230,7 @@ pub fn probe_codex_gpt_live() -> Result<()> {
                         "title": "Live Assistant GPT-Live Probe",
                         "version": env!("CARGO_PKG_VERSION")
                     },
-                    "capabilities": {"experimentalApi": true}
+                    "capabilities": codex_live_initialize_capabilities()
                 }),
             )
             .await?;
@@ -2250,7 +2260,7 @@ pub fn probe_codex_gpt_live() -> Result<()> {
             .and_then(Value::as_str)
             .context("Codex app-server did not return a probe thread id")?
             .to_owned();
-        let (peer, offer_sdp) = GptLivePeer::create().await?;
+        let (peer, offer_sdp) = GptLiveProbePeer::create().await?;
         server
             .call(
                 "thread/realtime/start",
@@ -2815,6 +2825,173 @@ fn handle_codex_handoff_message(
     }
 }
 
+/// Native GPT-Live smoke test that follows the same platform-ADM WebRTC path
+/// used by the production macOS app. It starts a session, sends a text turn,
+/// waits for the assistant transcript while libWebRTC plays audio directly,
+/// then closes the transport.
+pub fn probe_codex_gpt_live_native() -> Result<()> {
+    let credentials = crate::auth::codex_credentials()?;
+    let runtime =
+        tokio::runtime::Runtime::new().context("Could not create native probe runtime")?;
+    runtime.block_on(async move {
+        let platform_api_key = credentials
+            .chatgpt_account_id
+            .is_none()
+            .then_some(credentials.bearer_token.as_str());
+        let mut server = CodexAppServer::start(platform_api_key)?;
+        server
+            .call(
+                "initialize",
+                json!({
+                    "clientInfo": {
+                        "name": "live-assistant-native-probe",
+                        "title": "Live Assistant Native GPT-Live Probe",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "capabilities": codex_live_initialize_capabilities()
+                }),
+            )
+            .await?;
+        server.notify("initialized", json!({}))?;
+        let cwd = std::env::current_dir()
+            .context("Could not read the current working directory")?
+            .to_string_lossy()
+            .into_owned();
+        let thread = server
+            .call(
+                "thread/start",
+                json!({
+                    "cwd": cwd,
+                    "ephemeral": true,
+                    "approvalPolicy": "never",
+                    "sandbox": "read-only",
+                    "baseInstructions": "This is a native WebRTC audio smoke test.",
+                    "config": {
+                        "features.realtime_conversation": true,
+                        "suppress_unstable_features_warning": true
+                    }
+                }),
+            )
+            .await?;
+        let thread_id = thread
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .context("Codex app-server did not return a native probe thread id")?
+            .to_owned();
+
+        let (peer, offer_sdp) = GptLivePeer::create().await?;
+        server
+            .call(
+                "thread/realtime/start",
+                json!({
+                    "threadId": thread_id,
+                    "outputModality": "audio",
+                    "version": "v3",
+                    "model": "gpt-live-1-boulder-alpha",
+                    "voice": "ember",
+                    "transport": {"type": "webrtc", "sdp": offer_sdp},
+                    "clientManagedHandoffs": false,
+                    "delegationAckFiller": false,
+                    "codexResponsesAsItems": false,
+                    "includeStartupContext": false,
+                    "prompt": "Reply conversationally and briefly."
+                }),
+            )
+            .await?;
+
+        let mut answer_applied = false;
+        let mut started = false;
+        while !answer_applied || !started {
+            let message = tokio::time::timeout(Duration::from_secs(45), server.next_message())
+                .await
+                .context("Timed out starting native GPT-Live WebRTC")?
+                .context("Codex app-server closed during native GPT-Live startup")?;
+            match message.get("method").and_then(Value::as_str) {
+                Some("thread/realtime/sdp") => {
+                    let answer = message
+                        .pointer("/params/sdp")
+                        .and_then(Value::as_str)
+                        .context("Native GPT-Live probe did not receive an SDP answer")?;
+                    peer.accept_answer(answer.to_owned()).await?;
+                    answer_applied = true;
+                }
+                Some("thread/realtime/started") => started = true,
+                Some("thread/realtime/error") => {
+                    bail!("Native GPT-Live startup failed: {}", realtime_error_detail(&message));
+                }
+                Some("thread/realtime/closed") => {
+                    bail!("Native GPT-Live closed during startup");
+                }
+                _ => {}
+            }
+        }
+
+        server
+            .call(
+                "thread/realtime/appendText",
+                json!({
+                    "threadId": thread_id,
+                    "role": "user",
+                    "text": "Say exactly: Native audio ready."
+                }),
+            )
+            .await?;
+
+        let deadline = Instant::now() + Duration::from_secs(45);
+        let mut assistant_text = String::new();
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let message = tokio::time::timeout(remaining, server.next_message())
+                .await
+                .context("Timed out waiting for native GPT-Live response")?
+                .context("Codex app-server closed during native GPT-Live response")?;
+            match message.get("method").and_then(Value::as_str) {
+                Some("thread/realtime/transcript/delta")
+                    if message.pointer("/params/role").and_then(Value::as_str)
+                        == Some("assistant") =>
+                {
+                    if let Some(delta) = message.pointer("/params/delta").and_then(Value::as_str) {
+                        assistant_text.push_str(delta);
+                    }
+                }
+                Some("thread/realtime/transcript/done")
+                    if message.pointer("/params/role").and_then(Value::as_str)
+                        == Some("assistant") =>
+                {
+                    if assistant_text.is_empty()
+                        && let Some(text) = message.pointer("/params/text").and_then(Value::as_str)
+                    {
+                        assistant_text.push_str(text);
+                    }
+                    break;
+                }
+                Some("thread/realtime/error") => {
+                    bail!("Native GPT-Live response failed: {}", realtime_error_detail(&message));
+                }
+                Some("thread/realtime/closed") => {
+                    bail!("Native GPT-Live closed before responding");
+                }
+                _ => {}
+            }
+        }
+
+        let _ = server.send_request(
+            "thread/realtime/stop",
+            json!({"threadId": thread_id}),
+        );
+        peer.close().await;
+        anyhow::ensure!(
+            !assistant_text.trim().is_empty(),
+            "Native GPT-Live returned no assistant transcript"
+        );
+        eprintln!(
+            "[gpt-live native probe] transcript={:?} platform_adm=true duplicate_audio_notifications=false",
+            assistant_text.trim()
+        );
+        Ok(())
+    })
+}
+
 fn realtime_error_detail(message: &Value) -> String {
     let direct = message
         .pointer("/params/message")
@@ -2850,7 +3027,6 @@ fn codex_message_starts_reply(message: &Value) -> bool {
         Some("thread/realtime/transcript/delta") | Some("thread/realtime/transcript/done") => {
             message.pointer("/params/role").and_then(Value::as_str) == Some("assistant")
         }
-        Some("thread/realtime/outputAudio/delta") => true,
         _ => false,
     }
 }
@@ -3230,27 +3406,9 @@ fn handle_codex_live_message(
             }
         }
         "thread/realtime/outputAudio/delta" => {
-            let data = message
-                .pointer("/params/audio/data")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let sample_rate = message
-                .pointer("/params/audio/sampleRate")
-                .and_then(Value::as_u64)
-                .unwrap_or(24_000) as u32;
-            let channels = message
-                .pointer("/params/audio/numChannels")
-                .and_then(Value::as_u64)
-                .unwrap_or(1) as usize;
-            let samples = decode_audio_to_24k_mono(data, sample_rate, channels)?;
-            if !samples.is_empty() {
-                let response_id = state.ensure_response(events);
-                state.note_assistant_audio_activity();
-                let _ = events.send(Event::AssistantAudio {
-                    response_id,
-                    samples,
-                });
-            }
+            // Native/browser WebRTC already renders the remote media track.
+            // This method is opted out during initialize, but ignore it
+            // defensively if an older app-server still emits it.
         }
         "thread/realtime/error" => {
             let detail = realtime_error_detail(message);
@@ -3275,6 +3433,7 @@ fn handle_codex_live_message(
     Ok(())
 }
 
+#[cfg(test)]
 fn decode_audio_to_24k_mono(data: &str, sample_rate: u32, channels: usize) -> Result<Vec<i16>> {
     let bytes = STANDARD
         .decode(data)
@@ -4107,10 +4266,11 @@ mod tests {
         CodexHandoffAction, CodexHandoffState, CodexLiveState, CodexTextState, ConnectOptions,
         Event, InFlightContextImage, OPENAI_VAD_SILENCE_MS, PendingAudioBuffer,
         PendingOpenAiContextUpload, RealtimeBackend, ServerSignal, ToolCall,
-        codex_context_image_inject_params, codex_dynamic_tools, codex_live_start_error,
-        codex_live_thread_start_params, codex_message_is_assistant_transcript,
-        codex_message_starts_reply, codex_text_thread_start_params, codex_text_turn_start_params,
-        codex_turn_input, context_image_item_event, context_image_item_id, context_image_upload_id,
+        codex_context_image_inject_params, codex_dynamic_tools, codex_live_initialize_capabilities,
+        codex_live_start_error, codex_live_thread_start_params,
+        codex_message_is_assistant_transcript, codex_message_starts_reply,
+        codex_text_thread_start_params, codex_text_turn_start_params, codex_turn_input,
+        context_image_item_event, context_image_item_id, context_image_upload_id,
         decode_audio_to_24k_mono, dynamic_tool_content_items, dynamic_tool_request,
         emit_codex_live_remote_audio, encode_pcm, expire_codex_context_images,
         expire_openai_context_uploads, extract_function_call_event, extract_function_calls,
@@ -5320,6 +5480,42 @@ Call me Ecoo."
         );
         assert!(state.active_turn_id.is_none());
         assert!(state.response_text.is_empty());
+    }
+
+    #[test]
+    fn codex_live_webrtc_opts_out_of_duplicate_sideband_audio() {
+        let capabilities = codex_live_initialize_capabilities();
+        assert_eq!(capabilities["experimentalApi"], true);
+        assert_eq!(
+            capabilities["optOutNotificationMethods"],
+            json!(["thread/realtime/outputAudio/delta"])
+        );
+    }
+
+    #[test]
+    fn codex_live_sideband_audio_is_ignored_for_webrtc() {
+        let (events, received) = std::sync::mpsc::channel();
+        let mut state = CodexLiveState::default();
+        handle_codex_live_message(
+            &json!({
+                "method": "thread/realtime/outputAudio/delta",
+                "params": {
+                    "audio": {
+                        "data": encode_pcm(&[1_000, -1_000]),
+                        "sampleRate": 24_000,
+                        "numChannels": 1
+                    }
+                }
+            }),
+            &events,
+            &mut state,
+        )
+        .unwrap();
+        assert!(received.try_recv().is_err());
+        assert!(state.active_response_id.is_none());
+        assert!(!codex_message_starts_reply(&json!({
+            "method": "thread/realtime/outputAudio/delta"
+        })));
     }
 
     #[test]

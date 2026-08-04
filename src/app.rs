@@ -2,11 +2,12 @@ use crate::{
     audio::{Microphone, Speaker},
     auth,
     codex_account::{self, CodexAccountInfo, CodexUsageInfo, RateLimitWindow},
-    live_pointer,
+    image_generation, live_pointer,
     media::{self, Attachment, ScreenInfo},
     realtime::{
         CONTEXT_IMAGE_UPLOAD_TIMEOUT, Command, ConnectOptions, Event, RealtimeBackend,
-        RealtimeClient, ToolOutput, available_tool_descriptions, shared_system_prompt,
+        RealtimeClient, ToolOutput, available_tool_descriptions, default_system_prompt,
+        shared_system_prompt,
     },
     tools,
 };
@@ -23,7 +24,7 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const SETTINGS_KEY: &str = "live_assistant.settings";
@@ -134,9 +135,14 @@ struct Settings {
     backend: RealtimeBackend,
     model: String,
     default_text_model: String,
+    default_image_model: String,
+    default_image_resolution: ImageResolution,
     default_thinking_level: ThinkingLevel,
     thinking_level: ThinkingLevel,
     voice: String,
+    system_prompt: String,
+    append_realtime_tool_prompt: bool,
+    /// Kept only to migrate settings saved by older builds.
     instructions: String,
     auth_mode: AuthMode,
     send_screenshot: bool,
@@ -151,9 +157,13 @@ impl Default for Settings {
             backend: RealtimeBackend::OpenAiRealtime,
             model: "gpt-realtime-2.1".to_owned(),
             default_text_model: "gpt-5.6-luna".to_owned(),
+            default_image_model: "gpt-image-2".to_owned(),
+            default_image_resolution: ImageResolution::Square1024,
             default_thinking_level: ThinkingLevel::Light,
             thinking_level: ThinkingLevel::Light,
             voice: "marin".to_owned(),
+            system_prompt: String::new(),
+            append_realtime_tool_prompt: true,
             instructions: String::new(),
             auth_mode: AuthMode::ApiKey,
             send_screenshot: true,
@@ -162,6 +172,92 @@ impl Default for Settings {
             show_live_pointer: true,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum ImageResolution {
+    #[default]
+    Square1024,
+    Portrait1024,
+    Landscape1536,
+    Landscape2560,
+    Landscape3840,
+}
+
+impl ImageResolution {
+    const ALL: [Self; 5] = [
+        Self::Square1024,
+        Self::Portrait1024,
+        Self::Landscape1536,
+        Self::Landscape2560,
+        Self::Landscape3840,
+    ];
+
+    fn wire_value(self) -> &'static str {
+        match self {
+            Self::Square1024 => "1024x1024",
+            Self::Portrait1024 => "1024x1536",
+            Self::Landscape1536 => "1536x1024",
+            Self::Landscape2560 => "2560x1440",
+            Self::Landscape3840 => "3840x2160",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Square1024 => "1024 × 1024",
+            Self::Portrait1024 => "1024 × 1536",
+            Self::Landscape1536 => "1536 × 1024 · HD Landscape",
+            Self::Landscape2560 => "2560 × 1440 · HD Landscape",
+            Self::Landscape3840 => "3840 × 2160 · Ultra HD Landscape",
+        }
+    }
+}
+
+const OPENAI_REALTIME_TOOL_GUIDANCE: &str = "- OpenAI Realtime fast tool behavior:
+  - When a user request requires a tool, call the required tool as the first response output, before speaking or emitting assistant text. Do not acknowledge, explain, or promise before the tool call.
+  - After the tool result arrives, reply to the user briefly and accurately with the real result. This tool-first order is required for faster actions.
+  - For screen click requests, call ask_text_model first with include_screenshot=true and instruct it to inspect the fresh screenshot and perform the click with click_screen. Do not estimate coordinates or call click_screen directly in the OpenAI Realtime layer.";
+
+fn configured_system_prompt(settings: &Settings, screen: ScreenInfo) -> String {
+    if !settings.system_prompt.trim().is_empty() {
+        settings.system_prompt.clone()
+    } else if !settings.instructions.trim().is_empty() {
+        // Compatibility for settings created before the full prompt became
+        // editable. New saves clear this legacy field after migration.
+        shared_system_prompt(&settings.instructions, screen)
+    } else {
+        default_system_prompt(screen)
+    }
+}
+
+fn connection_system_prompt(settings: &Settings, screen: ScreenInfo) -> String {
+    let mut prompt = configured_system_prompt(settings, screen);
+    if settings.backend == RealtimeBackend::OpenAiRealtime && settings.append_realtime_tool_prompt {
+        prompt.push_str("\n\n");
+        prompt.push_str(OPENAI_REALTIME_TOOL_GUIDANCE);
+    }
+    prompt
+}
+
+fn voice_tab_settings(base: &Settings, backend: RealtimeBackend) -> Settings {
+    let mut settings = base.clone();
+    settings.backend = backend;
+    settings.model = "gpt-realtime-2.1".to_owned();
+    let voice = match backend {
+        RealtimeBackend::OpenAiRealtime => "marin".to_owned(),
+        RealtimeBackend::CodexGptLive => "ember".to_owned(),
+        RealtimeBackend::CodexText => settings.voice.clone(),
+    };
+    settings.voice = voice;
+    settings
+}
+
+fn default_voice_tab_settings(base: &Settings) -> [Settings; 2] {
+    [
+        voice_tab_settings(base, RealtimeBackend::CodexGptLive),
+        voice_tab_settings(base, RealtimeBackend::OpenAiRealtime),
+    ]
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -382,6 +478,16 @@ struct ChatMessage {
     server_item_id: Option<String>,
     voice_transcript_segments: Vec<VoiceTranscriptSegment>,
     voice_last_activity_at: Option<Instant>,
+    response_id: Option<String>,
+    started_at: SystemTime,
+    finished_at: Option<SystemTime>,
+    started_instant: Instant,
+    finished_instant: Option<Instant>,
+    token_count: Option<u64>,
+    token_count_is_estimate: bool,
+    actual_token_total: u64,
+    last_usage_response_id: Option<String>,
+    tokens_per_second: Option<f64>,
 }
 
 struct ToolInvocation {
@@ -391,8 +497,28 @@ struct ToolInvocation {
     output: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VoiceToolRoute {
+    AskTextModel,
+    CreateImage,
+    Local,
+}
+
+fn voice_tool_route(name: &str) -> VoiceToolRoute {
+    match name {
+        "ask_text_model" => VoiceToolRoute::AskTextModel,
+        "create_image" => VoiceToolRoute::CreateImage,
+        _ => VoiceToolRoute::Local,
+    }
+}
+
 impl ChatMessage {
+    fn timing_start() -> (SystemTime, Instant) {
+        (SystemTime::now(), Instant::now())
+    }
+
     fn system(text: String, backend: RealtimeBackend) -> Self {
+        let (started_at, started_instant) = Self::timing_start();
         Self {
             role: Role::System(backend),
             text,
@@ -405,10 +531,21 @@ impl ChatMessage {
             server_item_id: None,
             voice_transcript_segments: Vec::new(),
             voice_last_activity_at: None,
+            response_id: None,
+            started_at,
+            finished_at: None,
+            started_instant,
+            finished_instant: None,
+            token_count: None,
+            token_count_is_estimate: false,
+            actual_token_total: 0,
+            last_usage_response_id: None,
+            tokens_per_second: None,
         }
     }
 
     fn user_text(text: String, attachments: &[Attachment]) -> Self {
+        let (started_at, started_instant) = Self::timing_start();
         let audio = attachments
             .iter()
             .find_map(|attachment| match attachment {
@@ -416,7 +553,7 @@ impl ChatMessage {
                 Attachment::Image { .. } => None,
             })
             .unwrap_or_default();
-        Self {
+        let mut message = Self {
             role: Role::User,
             text,
             audio,
@@ -431,10 +568,23 @@ impl ChatMessage {
             server_item_id: None,
             voice_transcript_segments: Vec::new(),
             voice_last_activity_at: None,
-        }
+            response_id: None,
+            started_at,
+            finished_at: None,
+            started_instant,
+            finished_instant: None,
+            token_count: None,
+            token_count_is_estimate: false,
+            actual_token_total: 0,
+            last_usage_response_id: None,
+            tokens_per_second: None,
+        };
+        message.finish();
+        message
     }
 
     fn user_voice(audio: Vec<i16>, screen: Option<ChatImage>) -> Self {
+        let (started_at, started_instant) = Self::timing_start();
         let included_screen = screen.is_some();
         Self {
             role: Role::User,
@@ -448,10 +598,21 @@ impl ChatMessage {
             server_item_id: None,
             voice_transcript_segments: Vec::new(),
             voice_last_activity_at: None,
+            response_id: None,
+            started_at,
+            finished_at: None,
+            started_instant,
+            finished_instant: None,
+            token_count: None,
+            token_count_is_estimate: false,
+            actual_token_total: 0,
+            last_usage_response_id: None,
+            tokens_per_second: None,
         }
     }
 
     fn assistant() -> Self {
+        let (started_at, started_instant) = Self::timing_start();
         Self {
             role: Role::Assistant,
             text: String::new(),
@@ -464,8 +625,135 @@ impl ChatMessage {
             server_item_id: None,
             voice_transcript_segments: Vec::new(),
             voice_last_activity_at: None,
+            response_id: None,
+            started_at,
+            finished_at: None,
+            started_instant,
+            finished_instant: None,
+            token_count: None,
+            token_count_is_estimate: false,
+            actual_token_total: 0,
+            last_usage_response_id: None,
+            tokens_per_second: None,
         }
     }
+
+    fn refresh_token_estimate(&mut self) {
+        if self.last_usage_response_id.is_some() {
+            return;
+        }
+        self.token_count = Some(estimated_message_tokens(self));
+        self.token_count_is_estimate = true;
+        self.recompute_tokens_per_second();
+    }
+
+    fn finish(&mut self) {
+        if self.finished_instant.is_none() {
+            self.finished_instant = Some(Instant::now());
+            self.finished_at = Some(SystemTime::now());
+        }
+        if self.last_usage_response_id.is_none() {
+            self.refresh_token_estimate();
+        }
+        self.recompute_tokens_per_second();
+    }
+
+    fn begin_response(&mut self, response_id: String) {
+        self.response_id = Some(response_id);
+        self.finished_at = None;
+        self.finished_instant = None;
+        self.tokens_per_second = None;
+    }
+
+    fn reopen_for_voice_continuation(&mut self) {
+        self.finished_at = None;
+        self.finished_instant = None;
+        self.tokens_per_second = None;
+    }
+
+    fn set_actual_usage(&mut self, response_id: &str, total_tokens: u64) {
+        if self.last_usage_response_id.as_deref() != Some(response_id) {
+            self.actual_token_total = self.actual_token_total.saturating_add(total_tokens);
+            self.last_usage_response_id = Some(response_id.to_owned());
+        }
+        self.token_count = Some(self.actual_token_total);
+        self.token_count_is_estimate = false;
+        self.recompute_tokens_per_second();
+    }
+
+    fn recompute_tokens_per_second(&mut self) {
+        self.tokens_per_second = self
+            .finished_instant
+            .and_then(|finished| finished.checked_duration_since(self.started_instant))
+            .and_then(|elapsed| {
+                let seconds = elapsed.as_secs_f64();
+                (seconds > 0.0).then(|| self.token_count.unwrap_or_default() as f64 / seconds)
+            });
+    }
+}
+
+fn estimated_text_tokens(text: &str) -> u64 {
+    let chars = text.chars().count() as u64;
+    let words = text.split_whitespace().count() as u64;
+    if chars == 0 {
+        0
+    } else {
+        chars.div_ceil(4).max(words)
+    }
+}
+
+fn estimated_message_tokens(message: &ChatMessage) -> u64 {
+    let mut total = estimated_text_tokens(&message.text);
+    total = total.saturating_add(
+        message
+            .attachment_names
+            .iter()
+            .map(|name| estimated_text_tokens(name))
+            .sum::<u64>(),
+    );
+    for tool in &message.tool_calls {
+        total = total
+            .saturating_add(estimated_text_tokens(&tool.name))
+            .saturating_add(estimated_text_tokens(&tool.arguments));
+        if let Some(output) = &tool.output {
+            total = total.saturating_add(estimated_text_tokens(output));
+        }
+    }
+    if !message.images.is_empty() {
+        // Image tokenization varies by model. Keep the estimate deliberately
+        // conservative and visibly marked as approximate in the UI.
+        total = total.saturating_add(256 * message.images.len() as u64);
+    }
+    if !message.audio.is_empty() {
+        // Audio is not represented by the text tokenizer, so use a small
+        // duration-based placeholder until the backend reports usage.
+        total = total.saturating_add((message.audio.len() as u64 / 2_400).max(1));
+    }
+    total.max(u64::from(
+        !message.text.is_empty()
+            || !message.audio.is_empty()
+            || !message.images.is_empty()
+            || !message.attachment_names.is_empty()
+            || !message.tool_calls.is_empty(),
+    ))
+}
+
+fn apply_assistant_usage(
+    messages: &mut [ChatMessage],
+    response_id: &str,
+    total_tokens: u64,
+) -> bool {
+    messages
+        .iter_mut()
+        .rev()
+        .find(|message| {
+            message.role == Role::Assistant && message.response_id.as_deref() == Some(response_id)
+        })
+        .map(|message| {
+            message.set_actual_usage(response_id, total_tokens);
+            true
+        })
+        .unwrap_or(false)
 }
 
 fn recent_voice_continuation_index(messages: &[ChatMessage], now: Instant) -> Option<usize> {
@@ -500,6 +788,7 @@ fn prepare_voice_continuation(message: &mut ChatMessage, now: Instant) {
     seed_existing_voice_transcript(message);
     message.server_item_id = None;
     message.voice_last_activity_at = Some(now);
+    message.reopen_for_voice_continuation();
 }
 
 fn merge_voice_transcript(prefix: &str, current: &str) -> String {
@@ -589,6 +878,7 @@ fn update_voice_transcript(message: &mut ChatMessage, item_id: String, text: Str
             merge_voice_transcript(&combined, &segment.text)
         });
     message.voice_last_activity_at = Some(now);
+    message.refresh_token_estimate();
 }
 
 fn append_voice_audio_fragment(message: &mut ChatMessage, audio: &[i16], now: Instant) {
@@ -596,6 +886,7 @@ fn append_voice_audio_fragment(message: &mut ChatMessage, audio: &[i16], now: In
         message.audio.extend_from_slice(audio);
     }
     message.voice_last_activity_at = Some(now);
+    message.refresh_token_estimate();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -780,7 +1071,10 @@ pub struct LiveAssistantApp {
     tabs: Vec<AssistantTab>,
     active_tab: usize,
     show_model_picker: bool,
-    background_text_clients: HashMap<usize, RealtimeClient>,
+    /// Every tab owns a transport. Inactive transports are drained by
+    /// process_background_events instead of being disconnected when the tab
+    /// view changes.
+    background_clients: HashMap<usize, RealtimeClient>,
     pending_ask_calls: HashMap<String, (usize, usize)>,
     pending_ask_order: VecDeque<String>,
     pending_voice_tool_outputs: Vec<(usize, ToolOutput)>,
@@ -871,18 +1165,34 @@ impl LiveAssistantApp {
         {
             settings.instructions.clear();
         }
+        if settings.default_image_model.trim().is_empty() {
+            settings.default_image_model = "gpt-image-2".to_owned();
+        }
         if let Ok((width, height)) = media::primary_screen_resolution() {
             settings.screenshot_width = width;
             settings.screenshot_height = height;
         }
+        let screen_info = Self::screen_info_for_settings(&settings);
+        if settings.system_prompt.trim().is_empty()
+            || settings
+                .system_prompt
+                .contains("do not call click_screen directly")
+            || settings
+                .system_prompt
+                .contains("Call ask_text_model as your first output")
+        {
+            settings.system_prompt = default_system_prompt(screen_info);
+        }
+        settings.instructions.clear();
         let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
         let speaker = Speaker::new().ok();
         let (tool_result_tx, tool_result_rx) = mpsc::channel();
         let (codex_info_tx, codex_info_rx) = mpsc::channel();
         let (codex_usage_tx, codex_usage_rx) = mpsc::channel();
         let (screenshot_result_tx, screenshot_result_rx) = mpsc::channel();
-        let initial_tab_settings = settings.clone();
-        Self {
+        let [gpt_live_tab_settings, realtime_tab_settings] = default_voice_tab_settings(&settings);
+        settings = gpt_live_tab_settings.clone();
+        let mut app = Self {
             realtime: RealtimeClient::spawn(),
             microphone: None,
             speaker,
@@ -931,14 +1241,19 @@ impl LiveAssistantApp {
             codex_usage_tx,
             codex_usage_rx,
             pointer_overlay: live_pointer::OverlayState::new(),
-            tabs: vec![AssistantTab::new(initial_tab_settings)],
+            tabs: vec![
+                AssistantTab::new(gpt_live_tab_settings),
+                AssistantTab::new(realtime_tab_settings),
+            ],
             active_tab: 0,
             show_model_picker: false,
-            background_text_clients: HashMap::new(),
+            background_clients: HashMap::new(),
             pending_ask_calls: HashMap::new(),
             pending_ask_order: VecDeque::new(),
             pending_voice_tool_outputs: Vec::new(),
-        }
+        };
+        app.start();
+        app
     }
 
     fn take_active_session(&mut self) -> TabSession {
@@ -1017,10 +1332,13 @@ impl LiveAssistantApp {
         if index >= self.tabs.len() || index == self.active_tab {
             return;
         }
-        if self.state != ConnectionState::Offline {
-            self.stop();
-        }
         let previous_index = self.active_tab;
+        // A tab switch is a view operation. Keep the current transport alive
+        // and put its event receiver in the per-tab background map; the
+        // background pump continues draining it while another tab is shown.
+        let previous_realtime = mem::replace(&mut self.realtime, RealtimeClient::spawn());
+        self.background_clients
+            .insert(previous_index, previous_realtime);
         let previous = self.take_active_session();
         self.tabs[previous_index].session = previous;
         self.active_tab = index;
@@ -1028,7 +1346,7 @@ impl LiveAssistantApp {
             &mut self.tabs[index].session,
             TabSession::new(Settings::default()),
         );
-        let next_realtime = self.background_text_clients.remove(&index);
+        let next_realtime = self.background_clients.remove(&index);
         self.install_active_session(next);
         // A text tab used by ask_text_model may already have a live background
         // transport. Adopt that transport when the user opens the tab instead
@@ -1092,6 +1410,36 @@ impl LiveAssistantApp {
             choices.push((model, display_name));
         }
         for (name, display_name) in FALLBACK_TEXT_MODELS {
+            if seen.insert((*name).to_owned()) {
+                choices.push(((*name).to_owned(), (*display_name).to_owned()));
+            }
+        }
+        choices
+    }
+
+    fn image_model_choices(&self) -> Vec<(String, String)> {
+        let mut choices = Vec::new();
+        let mut seen = HashSet::new();
+        if let Some(info) = &self.codex_info {
+            for model in &info.models {
+                let is_image_model = model.name.to_ascii_lowercase().contains("image");
+                if is_image_model && !model.hidden && seen.insert(model.name.clone()) {
+                    choices.push((model.name.clone(), model.display_name.clone()));
+                }
+            }
+        }
+        if !self.settings.default_image_model.trim().is_empty()
+            && seen.insert(self.settings.default_image_model.clone())
+        {
+            let model = self.settings.default_image_model.clone();
+            let display_name = image_generation::FALLBACK_MODELS
+                .iter()
+                .find(|(name, _)| *name == model)
+                .map(|(_, label)| (*label).to_owned())
+                .unwrap_or_else(|| model.clone());
+            choices.push((model, display_name));
+        }
+        for (name, display_name) in image_generation::FALLBACK_MODELS {
             if seen.insert((*name).to_owned()) {
                 choices.push(((*name).to_owned(), (*display_name).to_owned()));
             }
@@ -1228,7 +1576,7 @@ impl LiveAssistantApp {
                 return;
             }
         };
-        let system_prompt = shared_system_prompt(&self.settings.instructions, screen_info);
+        let system_prompt = configured_system_prompt(&self.settings, screen_info);
         let options = ConnectOptions {
             backend: RealtimeBackend::CodexText,
             api_key,
@@ -1263,7 +1611,6 @@ impl LiveAssistantApp {
                 RealtimeBackend::CodexText,
             ));
         }
-        self.should_scroll = true;
     }
 
     fn start(&mut self) {
@@ -1313,7 +1660,7 @@ impl LiveAssistantApp {
         };
         match self.resolve_credentials() {
             Ok((api_key, chatgpt_account_id)) => {
-                let system_prompt = shared_system_prompt(&self.settings.instructions, screen_info);
+                let system_prompt = connection_system_prompt(&self.settings, screen_info);
                 let options = ConnectOptions {
                     backend: self.settings.backend,
                     api_key,
@@ -1343,7 +1690,6 @@ impl LiveAssistantApp {
                 }
                 self.messages
                     .push(ChatMessage::system(system_prompt, self.settings.backend));
-                self.should_scroll = true;
             }
             Err(error) => {
                 self.fail_start(error.to_string(), true);
@@ -1408,24 +1754,9 @@ impl LiveAssistantApp {
 
         while let Ok((tab_index, call_id, output)) = self.tool_result_rx.try_recv() {
             if tab_index == self.active_tab {
-                if let Some(tool) = self
-                    .messages
-                    .iter_mut()
-                    .flat_map(|message| message.tool_calls.iter_mut())
-                    .find(|tool| tool.call_id == call_id)
-                {
-                    tool.output = Some(pretty_tool_arguments(&output));
-                    self.should_scroll = true;
-                }
-            } else if let Some(tool) = self
-                .tabs
-                .get_mut(tab_index)
-                .into_iter()
-                .flat_map(|tab| tab.session.messages.iter_mut())
-                .flat_map(|message| message.tool_calls.iter_mut())
-                .find(|tool| tool.call_id == call_id)
-            {
-                tool.output = Some(pretty_tool_arguments(&output));
+                apply_tool_result_to_messages(&mut self.messages, &call_id, &output);
+            } else if let Some(tab) = self.tabs.get_mut(tab_index) {
+                apply_tool_result_to_messages(&mut tab.session.messages, &call_id, &output);
             }
         }
 
@@ -1526,7 +1857,6 @@ impl LiveAssistantApp {
                             "Hearing you…".to_owned()
                         };
                         self.ensure_active_voice_message();
-                        self.should_scroll = true;
                         continue;
                     }
                     // OpenAI Realtime uses interruption/truncation for barge-in.
@@ -1564,7 +1894,6 @@ impl LiveAssistantApp {
                     self.active_response_id = None;
                     self.touch_assistant_group(Instant::now());
                     self.ensure_active_voice_message();
-                    self.should_scroll = true;
                 }
                 Event::SpeechStopped => {
                     // Server VAD has ended the utterance; only reply on real speech.
@@ -1604,7 +1933,6 @@ impl LiveAssistantApp {
                     }
                     self.status = "Thinking…".to_owned();
                     self.finish_voice_message(audio);
-                    self.should_scroll = true;
                     if self.screenshot_capture_in_flight.is_some() {
                         self.deferred_voice_response = true;
                         self.status = "Finishing screen capture…".to_owned();
@@ -1685,14 +2013,12 @@ impl LiveAssistantApp {
                         );
                     }
                     self.status = "Hearing you…".to_owned();
-                    self.should_scroll = true;
                 }
                 Event::ContextImageAccepted { upload_id } => {
                     // Accepted means the backend has queued the JPEG. Keep the
                     // overlay visible until its server acknowledgment confirms
                     // that the image reached conversation context.
                     self.status = "Hearing you… · Screen queued".to_owned();
-                    self.should_scroll = true;
                     ctx.request_repaint();
                     eprintln!("[live-assistant image] backend queued upload_id={upload_id}");
                 }
@@ -1709,7 +2035,6 @@ impl LiveAssistantApp {
                         } else {
                             "Screen uploaded".to_owned()
                         };
-                        self.should_scroll = true;
                         ctx.request_repaint();
                     }
                     eprintln!(
@@ -1724,7 +2049,6 @@ impl LiveAssistantApp {
                     if failed {
                         self.error = Some(format!("Screenshot upload failed: {detail}"));
                         self.status = "Screenshot upload failed".to_owned();
-                        self.should_scroll = true;
                         ctx.request_repaint();
                     }
                     eprintln!(
@@ -1752,7 +2076,12 @@ impl LiveAssistantApp {
                             self.settings.backend == RealtimeBackend::CodexGptLive,
                         );
                     }
-                    self.active_response_id = Some(response_id);
+                    self.active_response_id = Some(response_id.clone());
+                    let assistant_index = ensure_assistant_message_index(
+                        &mut self.messages,
+                        &mut self.active_assistant_message,
+                    );
+                    self.messages[assistant_index].begin_response(response_id);
                     self.last_assistant_item_id = None;
                     self.pending_tool_reply = false;
                     self.touch_assistant_group(now);
@@ -1789,9 +2118,9 @@ impl LiveAssistantApp {
                         }
                         message.text.push_str(&delta);
                     }
+                    self.current_assistant().refresh_token_estimate();
                     self.assistant_text_needs_separator = false;
                     self.touch_assistant_group(Instant::now());
-                    self.should_scroll = true;
                 }
                 Event::AssistantAudio {
                     response_id,
@@ -1808,7 +2137,6 @@ impl LiveAssistantApp {
                     self.current_assistant().audio.extend_from_slice(&samples);
                     self.touch_assistant_group(Instant::now());
                     self.status = "Speaking…".to_owned();
-                    self.should_scroll = true;
                 }
                 Event::AssistantSegmentDone { response_id } => {
                     if self.response_is_active(&response_id) {
@@ -1830,6 +2158,15 @@ impl LiveAssistantApp {
                 }
                 Event::AssistantDone { response_id } => {
                     if self.response_is_active(&response_id) {
+                        let reply_is_complete = self.tool_calls_running == 0;
+                        // The backend's final response event is the message end.
+                        // Speaker playback may continue draining after this timestamp.
+                        if reply_is_complete
+                            && let Some(index) = self.active_assistant_message
+                            && let Some(message) = self.messages.get_mut(index)
+                        {
+                            message.finish();
+                        }
                         if self.settings.backend != RealtimeBackend::CodexText
                             && let Some(speaker) = &mut self.speaker
                         {
@@ -1863,6 +2200,12 @@ impl LiveAssistantApp {
                         }
                     }
                 }
+                Event::AssistantUsage {
+                    response_id,
+                    total_tokens,
+                } => {
+                    apply_assistant_usage(&mut self.messages, &response_id, total_tokens);
+                }
                 Event::ToolCalls(calls) => {
                     let count = calls.len();
                     self.tool_calls_running = self.tool_calls_running.saturating_add(count);
@@ -1879,36 +2222,32 @@ impl LiveAssistantApp {
                                 output: None,
                             }));
                     }
-                    self.should_scroll = true;
                     self.status =
                         format!("Running {count} tool{}…", if count == 1 { "" } else { "s" });
                     let delegated_calls = calls
                         .iter()
-                        .filter(|call| call.name == "ask_text_model" || call.name == "click_screen")
+                        .filter(|call| voice_tool_route(&call.name) == VoiceToolRoute::AskTextModel)
                         .cloned()
                         .collect::<Vec<_>>();
                     for call in delegated_calls {
-                        if call.name == "click_screen" {
-                            let delegated = crate::realtime::ToolCall {
-                                call_id: call.call_id,
-                                name: "ask_text_model".to_owned(),
-                                arguments: serde_json::json!({
-                                    "prompt": format!(
-                                        "Use the attached newest screen capture to determine and perform the user's requested click. The voice layer proposed these coordinates, but inspect the image yourself and do not trust them without visual verification: {}",
-                                        call.arguments
-                                    ),
-                                    "include_screenshot": true,
-                                })
-                                .to_string(),
-                            };
-                            self.start_ask_text_model(delegated, self.active_tab);
-                        } else {
-                            self.start_ask_text_model(call, self.active_tab);
-                        }
+                        self.start_ask_text_model(call, self.active_tab);
+                    }
+                    let image_calls = calls
+                        .iter()
+                        .filter(|call| voice_tool_route(&call.name) == VoiceToolRoute::CreateImage)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !image_calls.is_empty() {
+                        self.start_image_generation(
+                            self.active_tab,
+                            self.realtime.commands.clone(),
+                            image_calls,
+                            self.settings.clone(),
+                        );
                     }
                     let local_calls = calls
                         .into_iter()
-                        .filter(|call| call.name != "ask_text_model" && call.name != "click_screen")
+                        .filter(|call| voice_tool_route(&call.name) == VoiceToolRoute::Local)
                         .collect::<Vec<_>>();
                     if local_calls.is_empty() {
                         continue;
@@ -1973,7 +2312,6 @@ impl LiveAssistantApp {
                 format!("{expired_uploads} screenshot uploads gave up after 10 seconds")
             });
             self.status = "Screenshot upload timed out".to_owned();
-            self.should_scroll = true;
             ctx.request_repaint();
         }
 
@@ -2207,11 +2545,9 @@ impl LiveAssistantApp {
                     if self.state == ConnectionState::Offline {
                         continue;
                     }
-                    // Keep the exact captured attachment available for a
-                    // subsequent ask_text_model delegation. Click requests
-                    // force a fresh capture below, while visual questions can
-                    // reuse this newest ready image without touching the
-                    // realtime transport again.
+                    // Keep the exact captured attachment available as the newest
+                    // visual context for the realtime model. Direct click_screen
+                    // calls use coordinates from this capture.
                     self.latest_screen_image = Some(image.clone());
                     let message_index = screenshot_message_index.unwrap_or_else(|| {
                         self.append_user_message(ChatMessage::user_voice(Vec::new(), None))
@@ -2258,6 +2594,7 @@ impl LiveAssistantApp {
                         let message = &mut self.messages[message_index];
                         message.images.push(chat_image);
                         message.included_screen = true;
+                        message.refresh_token_estimate();
                         eprintln!(
                             "[live-assistant image] preview ready upload_id={} turn={} message={} image={} total_images={}",
                             upload_id,
@@ -2266,7 +2603,6 @@ impl LiveAssistantApp {
                             image_index,
                             message.images.len()
                         );
-                        self.should_scroll = true;
                         ctx.request_repaint();
 
                         let send_result = self.realtime.commands.send(Command::SendContextImage {
@@ -2341,7 +2677,6 @@ impl LiveAssistantApp {
         } else {
             "Hearing you… · Capturing screen".to_owned()
         };
-        self.should_scroll = true;
         eprintln!(
             "[live-assistant image] capture triggered trigger={} turn={} message={}",
             trigger, turn_id, message_index
@@ -2423,10 +2758,12 @@ impl LiveAssistantApp {
             && message.voice_turn
         {
             append_voice_audio_fragment(message, &audio, now);
+            message.finish();
             return;
         }
         let index = self.append_user_message(ChatMessage::user_voice(Vec::new(), None));
         append_voice_audio_fragment(&mut self.messages[index], &audio, now);
+        self.messages[index].finish();
         if self.screenshot_capture_in_flight == Some(self.speech_turn_id) {
             self.screenshot_message_index = Some(index);
         }
@@ -2539,7 +2876,7 @@ impl LiveAssistantApp {
         }
         let screen_info = self.background_text_screen(tab_index);
         let settings_snapshot = self.tabs[tab_index].session.settings.clone();
-        let system_prompt = shared_system_prompt(&settings_snapshot.instructions, screen_info);
+        let system_prompt = configured_system_prompt(&settings_snapshot, screen_info);
         {
             let session = &mut self.tabs[tab_index].session;
             session.settings.thinking_level = thinking_level;
@@ -2557,7 +2894,6 @@ impl LiveAssistantApp {
                 attachments,
                 thinking_level: thinking_level.wire_value().to_owned(),
             });
-            session.should_scroll = true;
             if placement.moved_assistant.is_some() {
                 session.assistant_group_deadline = None;
             }
@@ -2582,7 +2918,7 @@ impl LiveAssistantApp {
             return;
         }
 
-        if self.background_text_clients.contains_key(&tab_index) {
+        if self.background_clients.contains_key(&tab_index) {
             if self.tabs[tab_index].session.state == ConnectionState::Live {
                 self.flush_background_turn(tab_index);
             } else {
@@ -2627,7 +2963,7 @@ impl LiveAssistantApp {
             );
             return;
         }
-        self.background_text_clients.insert(tab_index, client);
+        self.background_clients.insert(tab_index, client);
         let session = &mut self.tabs[tab_index].session;
         session.state = ConnectionState::Connecting;
         session.status = "Connecting text model… will send when ready".to_owned();
@@ -2643,7 +2979,7 @@ impl LiveAssistantApp {
             return;
         }
         let Some(commands) = self
-            .background_text_clients
+            .background_clients
             .get(&tab_index)
             .map(|client| client.commands.clone())
         else {
@@ -2880,14 +3216,10 @@ impl LiveAssistantApp {
     }
 
     fn process_background_events(&mut self, ctx: &egui::Context) {
-        let indices = self
-            .background_text_clients
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
+        let indices = self.background_clients.keys().copied().collect::<Vec<_>>();
         for tab_index in indices {
             let mut events = Vec::new();
-            if let Some(client) = self.background_text_clients.get(&tab_index) {
+            if let Some(client) = self.background_clients.get(&tab_index) {
                 while let Ok(event) = client.events.try_recv() {
                     events.push(event);
                 }
@@ -2929,7 +3261,7 @@ impl LiveAssistantApp {
                 ctx.request_repaint();
             }
             Event::Disconnected => {
-                self.background_text_clients.remove(&tab_index);
+                self.background_clients.remove(&tab_index);
                 let session = &mut self.tabs[tab_index].session;
                 session.state = ConnectionState::Offline;
                 session.status = "Offline".to_owned();
@@ -2941,16 +3273,17 @@ impl LiveAssistantApp {
             }
             Event::AssistantResponseStarted { response_id } => {
                 let session = &mut self.tabs[tab_index].session;
-                session.active_response_id = Some(response_id);
+                session.active_response_id = Some(response_id.clone());
                 session.last_assistant_item_id = None;
                 session.active_assistant_message = None;
                 session.assistant_group_deadline = None;
                 session.assistant_text_needs_separator = false;
                 session.pending_tool_reply = false;
-                ensure_assistant_message_index(
+                let index = ensure_assistant_message_index(
                     &mut session.messages,
                     &mut session.active_assistant_message,
                 );
+                session.messages[index].begin_response(response_id);
                 session.status = "Thinking…".to_owned();
             }
             Event::AssistantItem {
@@ -2977,8 +3310,8 @@ impl LiveAssistantApp {
                     &mut session.active_assistant_message,
                 );
                 session.messages[index].text.push_str(&delta);
+                session.messages[index].refresh_token_estimate();
                 session.status = "Thinking…".to_owned();
-                session.should_scroll = true;
                 ctx.request_repaint();
             }
             Event::AssistantDone { response_id } => {
@@ -2987,6 +3320,15 @@ impl LiveAssistantApp {
                     if session.active_response_id.as_deref() != Some(&response_id) {
                         false
                     } else {
+                        let reply_is_complete = session.tool_calls_running == 0;
+                        // Background/text completion also uses the final model event,
+                        // independent of any later UI or audio playback work.
+                        if reply_is_complete
+                            && let Some(index) = session.active_assistant_message
+                            && let Some(message) = session.messages.get_mut(index)
+                        {
+                            message.finish();
+                        }
                         session.active_response_id = None;
                         session.last_assistant_item_id = None;
                         session.status = if session.tool_calls_running > 0 {
@@ -3011,6 +3353,15 @@ impl LiveAssistantApp {
                 }
                 ctx.request_repaint();
             }
+            Event::AssistantUsage {
+                response_id,
+                total_tokens,
+            } => {
+                let session = &mut self.tabs[tab_index].session;
+                if apply_assistant_usage(&mut session.messages, &response_id, total_tokens) {
+                    ctx.request_repaint();
+                }
+            }
             Event::ToolCalls(calls) => {
                 let count = calls.len();
                 {
@@ -3031,7 +3382,6 @@ impl LiveAssistantApp {
                         }));
                     session.status =
                         format!("Running {count} tool{}…", if count == 1 { "" } else { "s" });
-                    session.should_scroll = true;
                 }
                 self.start_background_local_tools(tab_index, calls);
                 ctx.request_repaint();
@@ -3051,7 +3401,7 @@ impl LiveAssistantApp {
                 ctx.request_repaint();
             }
             Event::Error(message) => {
-                let transport_exists = self.background_text_clients.contains_key(&tab_index);
+                let transport_exists = self.background_clients.contains_key(&tab_index);
                 let session = &mut self.tabs[tab_index].session;
                 session.error = Some(message.clone());
                 session.status = "Text request failed".to_owned();
@@ -3082,7 +3432,7 @@ impl LiveAssistantApp {
         calls: Vec<crate::realtime::ToolCall>,
     ) {
         let Some(commands) = self
-            .background_text_clients
+            .background_clients
             .get(&tab_index)
             .map(|client| client.commands.clone())
         else {
@@ -3092,6 +3442,26 @@ impl LiveAssistantApp {
             );
             return;
         };
+        let image_calls = calls
+            .iter()
+            .filter(|call| call.name == "create_image")
+            .cloned()
+            .collect::<Vec<_>>();
+        if !image_calls.is_empty() {
+            let settings = self
+                .tabs
+                .get(tab_index)
+                .map(|tab| tab.session.settings.clone())
+                .unwrap_or_else(|| self.settings.clone());
+            self.start_image_generation(tab_index, commands.clone(), image_calls, settings);
+        }
+        let calls = calls
+            .into_iter()
+            .filter(|call| call.name != "create_image")
+            .collect::<Vec<_>>();
+        if calls.is_empty() {
+            return;
+        }
         let (screenshot_width, screenshot_height) = self
             .tabs
             .get(tab_index)
@@ -3124,6 +3494,82 @@ impl LiveAssistantApp {
                     tool_result_tx.send((tab_index, output.call_id.clone(), output.output.clone()));
             }
             let _ = commands.send(Command::ToolOutputs(outputs));
+        });
+    }
+
+    fn resolve_image_credentials(
+        &self,
+        auth_mode: AuthMode,
+    ) -> anyhow::Result<auth::CodexCredentials> {
+        if auth_mode == AuthMode::CodexApiKey || self.api_key.trim().is_empty() {
+            return auth::codex_credentials();
+        }
+        Ok(auth::CodexCredentials {
+            bearer_token: self.api_key.trim().to_owned(),
+            chatgpt_account_id: None,
+        })
+    }
+
+    fn start_image_generation(
+        &mut self,
+        tab_index: usize,
+        commands: tokio::sync::mpsc::UnboundedSender<Command>,
+        calls: Vec<crate::realtime::ToolCall>,
+        settings: Settings,
+    ) {
+        if calls.is_empty() {
+            return;
+        }
+        let default_model = settings.default_image_model.clone();
+        let default_resolution = settings.default_image_resolution.wire_value().to_owned();
+        let credentials = self
+            .resolve_image_credentials(settings.auth_mode)
+            .map_err(|error| format!("{error:#}"));
+        let tool_result_tx = self.tool_result_tx.clone();
+        thread::spawn(move || {
+            for call in calls {
+                let output = match &credentials {
+                    Ok(credentials) => image_generation::request_from_tool_arguments(
+                        &call.arguments,
+                        &default_model,
+                        &default_resolution,
+                        &call.call_id,
+                    )
+                    .and_then(|request| {
+                        image_generation::generate(request, credentials).map(|result| {
+                            serde_json::json!({
+                                "ok": true,
+                                "model": result.model,
+                                "resolution": result.resolution,
+                                "image_url": result.data_url,
+                            })
+                            .to_string()
+                        })
+                    })
+                    .unwrap_or_else(|error| {
+                        serde_json::json!({
+                            "ok": false,
+                            "error": format!("{error:#}"),
+                        })
+                        .to_string()
+                    }),
+                    Err(error) => serde_json::json!({
+                        "ok": false,
+                        "error": error,
+                    })
+                    .to_string(),
+                };
+                let tool_output = ToolOutput {
+                    call_id: call.call_id,
+                    output,
+                };
+                let _ = tool_result_tx.send((
+                    tab_index,
+                    tool_output.call_id.clone(),
+                    tool_output.output.clone(),
+                ));
+                let _ = commands.send(Command::ToolOutputs(vec![tool_output]));
+            }
         });
     }
 
@@ -3188,7 +3634,6 @@ impl LiveAssistantApp {
         } else {
             self.status = "Connecting… will send when ready".to_owned();
         }
-        self.should_scroll = true;
     }
 
     fn draw_thinking_level_controls(&mut self, ui: &mut egui::Ui) {
@@ -3367,14 +3812,20 @@ impl LiveAssistantApp {
                 ui.label("Choose a model for a new conversation tab.");
                 ui.add_space(8.0);
                 ui.label(RichText::new("Voice").strong());
-                if ui.button("Realtime · gpt-realtime-2.1").clicked() {
+                if ui
+                    .add(egui::Button::new("Realtime · gpt-realtime-2.1").fill(LIGHT_BLUE))
+                    .clicked()
+                {
                     selection = Some((
                         RealtimeBackend::OpenAiRealtime,
                         "gpt-realtime-2.1".to_owned(),
                         "marin".to_owned(),
                     ));
                 }
-                if ui.button("Live · Codex GPT-Live").clicked() {
+                if ui
+                    .add(egui::Button::new("Live · Codex GPT-Live").fill(LIGHT_BLUE))
+                    .clicked()
+                {
                     selection = Some((
                         RealtimeBackend::CodexGptLive,
                         "gpt-realtime-2.1".to_owned(),
@@ -3385,7 +3836,7 @@ impl LiveAssistantApp {
                 ui.label(RichText::new("Text").strong());
                 for (model, display_name) in &text_models {
                     if ui
-                        .button(display_name)
+                        .add(egui::Button::new(display_name).fill(LIGHT_BLUE))
                         .on_hover_text(model)
                         .clicked()
                     {
@@ -3511,6 +3962,13 @@ impl LiveAssistantApp {
                             } else {
                                 Color32::from_rgb(92, 102, 116)
                             }));
+                            if is_user || is_assistant {
+                                let metadata = format_message_metadata(message, is_assistant);
+                                ui.label(RichText::new(metadata).small().weak())
+                                    .on_hover_text(
+                                        "The first value is start-end time and elapsed cost. Backend-reported token totals are exact when available; a ~ prefix means a local estimate.",
+                                    );
+                            }
                             for tool in &message.tool_calls {
                                 ui.add_space(7.0);
                                 egui::Frame::new()
@@ -3834,8 +4292,9 @@ impl LiveAssistantApp {
             self.refresh_codex_info();
         }
         self.ensure_text_model_selection();
-        let available_tools =
-            available_tool_descriptions(Self::screen_info_for_settings(&self.settings));
+        let settings_screen = Self::screen_info_for_settings(&self.settings);
+        let default_prompt = default_system_prompt(settings_screen);
+        let available_tools = available_tool_descriptions(settings_screen);
         let mut open = self.show_settings;
         egui::Window::new("Settings")
             .open(&mut open)
@@ -3954,6 +4413,37 @@ impl LiveAssistantApp {
                                                 &mut self.settings.default_text_model,
                                                 model,
                                                 display_name,
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label("Default image model");
+                                let image_models = self.image_model_choices();
+                                egui::ComboBox::from_id_salt("default_image_model")
+                                    .selected_text(&self.settings.default_image_model)
+                                    .show_ui(ui, |ui| {
+                                        style_light_blue_popup(ui);
+                                        for (model, display_name) in image_models {
+                                            ui.selectable_value(
+                                                &mut self.settings.default_image_model,
+                                                model,
+                                                display_name,
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
+
+                                ui.label("Default image resolution");
+                                egui::ComboBox::from_id_salt("default_image_resolution")
+                                    .selected_text(self.settings.default_image_resolution.label())
+                                    .show_ui(ui, |ui| {
+                                        style_light_blue_popup(ui);
+                                        for resolution in ImageResolution::ALL {
+                                            ui.selectable_value(
+                                                &mut self.settings.default_image_resolution,
+                                                resolution,
+                                                resolution.label(),
                                             );
                                         }
                                     });
@@ -4081,9 +4571,9 @@ impl LiveAssistantApp {
                                 );
                                 ui.label(
                                     RichText::new(
-                                        "GPT-Live adds screenshots as Codex multimodal thread context, \
-                                         using delegation when visual inspection is needed. Audio, \
-                                         transcripts, and local tools remain on low-latency paths.",
+                                        "GPT-Live adds screenshots as Codex multimodal thread context. \
+                                         Its screen clicks and other local tools remain on the direct \
+                                         low-latency realtime path.",
                                     )
                                     .small()
                                     .weak(),
@@ -4103,7 +4593,7 @@ impl LiveAssistantApp {
                                 ui.label(RichText::new("Available tools").strong());
                                 ui.label(
                                     RichText::new(
-                                        "Voice and Live models use ask_text_model for screen clicks; the delegated text tab receives the newest screenshot and uses click_screen. Text tabs omit ask_text_model to prevent recursive text sessions.",
+                                        "OpenAI Realtime delegates screen clicks to ask_text_model with a fresh screenshot for accuracy. GPT-Live calls click_screen directly. Text tabs omit ask_text_model to prevent recursive text sessions.",
                                     )
                                     .small()
                                     .weak(),
@@ -4167,19 +4657,58 @@ impl LiveAssistantApp {
                             .weak(),
                         );
                         ui.add_space(12.0);
-                        ui.label("Custom system prompt");
+                        let append_prompt_changed = ui
+                            .checkbox(
+                                &mut self.settings.append_realtime_tool_prompt,
+                                "Append fast tool-call instructions for OpenAI Realtime",
+                            )
+                            .on_hover_text(
+                                "When enabled, OpenAI Realtime is told to call tools before speaking, then reply after the real result. GPT-Live is unaffected.",
+                            )
+                            .changed();
+                        if append_prompt_changed {
+                            let enabled = self.settings.append_realtime_tool_prompt;
+                            for tab in &mut self.tabs {
+                                tab.session.settings.append_realtime_tool_prompt = enabled;
+                            }
+                        }
                         ui.label(
-                    RichText::new(
-                        "Appended after Live Assistant's built-in system prompt. Leave blank to \
-                         use only the built-in behavior.",
-                    )
-                    .small()
-                    .weak(),
-                );
+                            RichText::new(
+                                "This optional appendix applies only when connecting an OpenAI Realtime tab. Disable it to send only the editable system prompt below.",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label("System prompt");
+                            if ui.button("Reset to default").clicked() {
+                                self.settings.system_prompt = default_prompt.clone();
+                            }
+                        });
+                        ui.label(
+                            RichText::new(
+                                "This complete prompt is sent to the selected model. Edit it \
+                                 directly to change the assistant's behavior; Reset restores the \
+                                 built-in prompt for the current screen.",
+                            )
+                            .small()
+                            .weak(),
+                        );
                         ui.add_sized(
-                            [ui.available_width(), 96.0],
-                            egui::TextEdit::multiline(&mut self.settings.instructions)
-                                .hint_text("Add your own instructions…"),
+                            [ui.available_width(), 220.0],
+                            egui::TextEdit::multiline(&mut self.settings.system_prompt)
+                                .font(egui::TextStyle::Monospace)
+                                .hint_text("System prompt…"),
+                        );
+                        ui.label(
+                            RichText::new(if self.settings.system_prompt == default_prompt {
+                                "Using the built-in default."
+                            } else {
+                                "Using a customized system prompt."
+                            })
+                            .small()
+                            .weak(),
                         );
                         ui.add_space(10.0);
                         egui::Frame::new()
@@ -4591,15 +5120,42 @@ impl eframe::App for LiveAssistantApp {
                 if self.messages.is_empty() {
                     self.draw_empty(ui);
                 } else {
-                    egui::ScrollArea::vertical()
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            self.draw_messages(ui);
-                            if self.should_scroll {
-                                ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
-                                self.should_scroll = false;
-                            }
-                        });
+                    let button_height = 30.0;
+                    let button_gap = 8.0;
+                    let scroll_height =
+                        (ui.available_height() - button_height - button_gap).max(0.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(ui.available_width(), scroll_height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            egui::ScrollArea::vertical()
+                                .id_salt(("messages", self.active_tab))
+                                .auto_shrink([false, false])
+                                .max_height(scroll_height)
+                                .stick_to_bottom(false)
+                                .show(ui, |ui| {
+                                    self.draw_messages(ui);
+                                    if self.should_scroll {
+                                        ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                                        self.should_scroll = false;
+                                    }
+                                });
+                        },
+                    );
+                    ui.add_space(button_gap);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new("↓").size(18.0))
+                                    .min_size(egui::vec2(38.0, button_height)),
+                            )
+                            .on_hover_text("Scroll to latest message")
+                            .clicked()
+                        {
+                            self.should_scroll = true;
+                            ctx.request_repaint();
+                        }
+                    });
                 }
             });
 
@@ -4647,6 +5203,131 @@ fn should_split_assistant_wav(sample_count: usize) -> bool {
 fn format_duration(seconds: f32) -> String {
     let total = seconds.round() as u32;
     format!("{}:{:02}", total / 60, total % 60)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClockParts {
+    day_key: i64,
+    hour: u32,
+    minute: u32,
+    second: u32,
+}
+
+fn clock_parts_utc(time: SystemTime) -> ClockParts {
+    let total_seconds = time
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let seconds = total_seconds % (24 * 60 * 60);
+    ClockParts {
+        day_key: (total_seconds / (24 * 60 * 60)) as i64,
+        hour: (seconds / 3_600) as u32,
+        minute: ((seconds % 3_600) / 60) as u32,
+        second: (seconds % 60) as u32,
+    }
+}
+
+#[cfg(unix)]
+fn clock_parts(time: SystemTime) -> ClockParts {
+    let timestamp = time
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as libc::time_t;
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    let result = unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()) };
+    if result.is_null() {
+        return clock_parts_utc(time);
+    }
+    let local = unsafe { local.assume_init() };
+    ClockParts {
+        day_key: i64::from(local.tm_year) * 400 + i64::from(local.tm_yday),
+        hour: local.tm_hour.max(0) as u32,
+        minute: local.tm_min.max(0) as u32,
+        second: local.tm_sec.max(0) as u32,
+    }
+}
+
+#[cfg(not(unix))]
+fn clock_parts(time: SystemTime) -> ClockParts {
+    clock_parts_utc(time)
+}
+
+fn format_clock_parts(parts: ClockParts) -> String {
+    format!("{:02}:{:02}:{:02}", parts.hour, parts.minute, parts.second)
+}
+
+fn same_clock_minute(start: ClockParts, end: ClockParts) -> bool {
+    start.day_key == end.day_key && start.hour == end.hour && start.minute == end.minute
+}
+
+fn format_elapsed_duration(duration: Duration) -> String {
+    let milliseconds = duration.as_millis();
+    if milliseconds < 1_000 {
+        return format!("{milliseconds}ms");
+    }
+    if milliseconds < 60_000 {
+        if milliseconds % 1_000 == 0 {
+            return format!("{}s", milliseconds / 1_000);
+        }
+        return format!("{:.1}s", milliseconds as f64 / 1_000.0);
+    }
+
+    let minutes = milliseconds / 60_000;
+    let remaining_ms = milliseconds % 60_000;
+    if remaining_ms % 1_000 == 0 {
+        format!("{minutes}m{:02}s", remaining_ms / 1_000)
+    } else {
+        format!("{minutes}m{:04.1}s", remaining_ms as f64 / 1_000.0)
+    }
+}
+
+fn format_time_range(start: ClockParts, end: ClockParts, elapsed: Duration) -> String {
+    let end_text = if same_clock_minute(start, end) {
+        format!("{:02}", end.second)
+    } else {
+        format_clock_parts(end)
+    };
+    format!(
+        "{}-{end_text},{}",
+        format_clock_parts(start),
+        format_elapsed_duration(elapsed)
+    )
+}
+
+fn format_token_count(value: u64) -> String {
+    if value <= i64::MAX as u64 {
+        format_count(value as i64)
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_message_metadata(message: &ChatMessage, is_assistant: bool) -> String {
+    let start = clock_parts(message.started_at);
+    let timing = match (message.finished_at, message.finished_instant) {
+        (Some(finished_at), Some(finished_instant)) => {
+            let end = clock_parts(finished_at);
+            let elapsed = finished_instant
+                .checked_duration_since(message.started_instant)
+                .unwrap_or_default();
+            format_time_range(start, end, elapsed)
+        }
+        _ => format!("{}-…", format_clock_parts(start)),
+    };
+
+    let mut parts = vec![timing];
+    if let Some(tokens) = message.token_count {
+        let prefix = if message.token_count_is_estimate {
+            "~"
+        } else {
+            ""
+        };
+        parts.push(format!("Tokens {prefix}{}", format_token_count(tokens)));
+    }
+    if is_assistant && let Some(rate) = message.tokens_per_second {
+        parts.push(format!("{rate:.1} token/s"));
+    }
+    parts.join(" · ")
 }
 
 fn assistant_wav_filename(seconds: f32) -> String {
@@ -4871,6 +5552,53 @@ fn pretty_tool_arguments(arguments: &str) -> String {
     visible
 }
 
+fn tool_output_preview(output: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(output) else {
+        return output.to_owned();
+    };
+    if let Some(object) = value.as_object_mut()
+        && object.remove("image_url").is_some()
+    {
+        object.insert(
+            "image_url".to_owned(),
+            serde_json::Value::String("[generated image attached]".to_owned()),
+        );
+    }
+    pretty_tool_arguments(&value.to_string())
+}
+
+fn generated_chat_image(output: &str) -> Option<ChatImage> {
+    let value = serde_json::from_str::<serde_json::Value>(output).ok()?;
+    let data_url = value.get("image_url").and_then(serde_json::Value::as_str)?;
+    let attachment = media::image_from_data_url("Generated image", data_url).ok()?;
+    ChatImage::from_attachment(&attachment)
+}
+
+fn apply_tool_result_to_messages(
+    messages: &mut [ChatMessage],
+    call_id: &str,
+    output: &str,
+) -> bool {
+    let generated_image = generated_chat_image(output);
+    let preview = tool_output_preview(output);
+    for message in messages {
+        let Some(tool) = message
+            .tool_calls
+            .iter_mut()
+            .find(|tool| tool.call_id == call_id)
+        else {
+            continue;
+        };
+        tool.output = Some(preview);
+        if let Some(image) = generated_image {
+            message.images.push(image);
+        }
+        message.refresh_token_estimate();
+        return true;
+    }
+    false
+}
+
 fn install_multilingual_font_fallback(ctx: &egui::Context) -> Option<&'static str> {
     const CANDIDATES: &[(&str, u32)] = &[
         ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
@@ -4926,9 +5654,100 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_voice_tabs_put_gpt_live_first() {
+        let base = Settings::default();
+        let [live, realtime] = default_voice_tab_settings(&base);
+
+        assert_eq!(live.backend, RealtimeBackend::CodexGptLive);
+        assert_eq!(live.model, "gpt-realtime-2.1");
+        assert_eq!(live.voice, "ember");
+        assert_eq!(realtime.backend, RealtimeBackend::OpenAiRealtime);
+        assert_eq!(realtime.model, "gpt-realtime-2.1");
+        assert_eq!(realtime.voice, "marin");
+    }
+
+    #[test]
+    fn openai_realtime_connection_prompt_delegates_clicks_only_for_openai() {
+        let screen = ScreenInfo {
+            origin_x: 0,
+            origin_y: 0,
+            logical_width: 1408,
+            logical_height: 881,
+            backing_width: 2816,
+            backing_height: 1762,
+            scale_factor: 2.0,
+        };
+        let mut realtime = Settings::default();
+        realtime.system_prompt = "base prompt".to_owned();
+        realtime.backend = RealtimeBackend::OpenAiRealtime;
+        let realtime_prompt = connection_system_prompt(&realtime, screen);
+        assert!(realtime_prompt.contains("call the required tool as the first response output"));
+        assert!(realtime_prompt.contains("After the tool result arrives"));
+        assert!(realtime_prompt.contains("ask_text_model"));
+        assert!(realtime_prompt.contains("include_screenshot=true"));
+        assert!(
+            realtime_prompt.contains("Do not estimate coordinates or call click_screen directly")
+        );
+
+        realtime.append_realtime_tool_prompt = false;
+        assert_eq!(connection_system_prompt(&realtime, screen), "base prompt");
+
+        let mut live = realtime.clone();
+        live.backend = RealtimeBackend::CodexGptLive;
+        let live_prompt = connection_system_prompt(&live, screen);
+        assert_eq!(live_prompt, "base prompt");
+    }
+
+    #[test]
+    fn compact_message_time_range_shortens_same_minute_end_time() {
+        let start = ClockParts {
+            day_key: 1,
+            hour: 12,
+            minute: 1,
+            second: 1,
+        };
+        let same_minute_end = ClockParts {
+            day_key: 1,
+            hour: 12,
+            minute: 1,
+            second: 6,
+        };
+        let next_minute_end = ClockParts {
+            day_key: 1,
+            hour: 12,
+            minute: 2,
+            second: 3,
+        };
+
+        assert_eq!(
+            format_time_range(start, same_minute_end, Duration::from_secs(5)),
+            "12:01:01-06,5s"
+        );
+        assert_eq!(
+            format_time_range(start, next_minute_end, Duration::from_secs(62)),
+            "12:01:01-12:02:03,1m02s"
+        );
+    }
+
+    #[test]
+    fn unexpected_direct_voice_clicks_still_use_the_local_tool_path() {
+        assert_eq!(voice_tool_route("click_screen"), VoiceToolRoute::Local);
+        assert_eq!(
+            voice_tool_route("ask_text_model"),
+            VoiceToolRoute::AskTextModel
+        );
+        assert_eq!(
+            voice_tool_route("create_image"),
+            VoiceToolRoute::CreateImage
+        );
+    }
+
+    #[test]
     fn text_defaults_and_thinking_levels_use_the_expected_wire_values() {
         let settings = Settings::default();
         assert_eq!(settings.default_text_model, "gpt-5.6-luna");
+        assert_eq!(settings.default_image_model, "gpt-image-2");
+        assert_eq!(settings.default_image_resolution.wire_value(), "1024x1024");
         assert_eq!(settings.default_thinking_level, ThinkingLevel::Light);
         assert_eq!(settings.thinking_level, ThinkingLevel::Light);
 
@@ -4941,6 +5760,32 @@ mod tests {
             Some(ThinkingLevel::ExtraHigh)
         );
         assert_eq!(parse_thinking_level("not-a-level"), None);
+    }
+
+    #[test]
+    fn message_metadata_uses_backend_usage_and_deduplicates_retries() {
+        let mut message = ChatMessage::assistant();
+        message.started_instant = Instant::now() - Duration::from_secs(2);
+        message.started_at = SystemTime::now() - Duration::from_secs(2);
+        message.begin_response("response-1".to_owned());
+        message.text = "A short answer".to_owned();
+        message.set_actual_usage("response-1", 42);
+        message.set_actual_usage("response-1", 42);
+        message.finish();
+
+        assert_eq!(message.token_count, Some(42));
+        assert!(!message.token_count_is_estimate);
+        assert_eq!(message.actual_token_total, 42);
+        assert!(message.finished_at.is_some());
+        assert!(message.tokens_per_second.is_some());
+
+        let metadata = format_message_metadata(&message, true);
+        assert!(metadata.contains('-'));
+        assert!(metadata.contains(','));
+        assert!(!metadata.contains("Start "));
+        assert!(!metadata.contains("Finish "));
+        assert!(metadata.contains("Tokens 42"));
+        assert!(metadata.contains("token/s"));
     }
 
     #[cfg(target_os = "macos")]

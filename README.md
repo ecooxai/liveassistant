@@ -15,6 +15,10 @@ WebSocket API. It supports:
 - typed text, Command/Ctrl+V image paste, uploaded images/audio, and drag-and-drop
 - sent image and screen-context previews directly in user message bubbles
 - click-to-enlarge viewing of the exact encoded image payload sent to the model
+- compact per-message start/end timing and elapsed cost, plus token totals and completed assistant token rate
+- GPT-Live and Realtime tabs open by default with GPT-Live first and auto-connecting, plus a manual down-arrow control instead of automatic transcript scrolling
+- OpenAI Realtime has an optional tool-first prompt appendix, delegates screenshot-backed clicks to a text model for accuracy, and GPT-Live clicks directly
+- both voice backends pause streaming playback below one second of queued audio and retry every two seconds
 - Realtime function tools for screenshot-relative clicks, Bash commands, and text insertion
 - light interface theme
 - a persistent conversation until the voice session is stopped
@@ -92,8 +96,12 @@ token usage. It also loads the Codex v1/v2 voice-persona catalog. Set
 `CODEX_BIN` if the `codex` executable is not on the app's `PATH`. Codex coding
 models and GPT-Live information are displayed separately from the selectable
 Realtime voice model because the Realtime WebSocket requires a Realtime model
-ID. Settings is scrollable, and its custom system prompt is appended after the
-app's built-in instructions.
+ID. Settings is scrollable, and the complete system prompt is editable directly
+with a Reset to default button. Settings can also disable the OpenAI Realtime
+fast tool-call appendix without changing the editable base prompt. Message timing uses a compact form such as
+`12:01:01-06,5s`; assistant end time is recorded when the backend finishes the
+reply, not when audio playback drains. Token totals use backend usage when a
+transport reports it and a visibly marked local estimate otherwise.
 
 ## Privacy and behavior
 

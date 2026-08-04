@@ -25,26 +25,19 @@ const PLAYBACK_RATE: u32 = 24_000;
 const LOUD_SPEECH_RMS: f32 = 0.004;
 /// Do not reset the sustained-speech timer for tiny natural gaps between syllables.
 const LOUD_SPEECH_QUIET_TOLERANCE_SAMPLES: usize = 24_000 / 5; // 200 ms at 24 kHz
-/// OpenAI Realtime keeps the existing low-latency playback policy.
-const REALTIME_PLAYBACK_BUFFER_LOW_MS: u32 = 40;
-const REALTIME_PLAYBACK_RECHECK_MS: u64 = 5;
-/// GPT-Live's WebRTC audio benefits from a larger jitter buffer. Only speaker
-/// playback is delayed; transcript and tool events use a separate event path.
-const GPT_LIVE_PLAYBACK_BUFFER_LOW_MS: u32 = 500;
-const GPT_LIVE_PLAYBACK_RECHECK_MS: u64 = 1_000;
+/// Both voice transports use the same conservative streaming jitter buffer.
+/// When queued audio drops below one second, playback pauses without consuming
+/// samples. The output callback checks again every two seconds and resumes only
+/// after more than one second has accumulated. Transcript and tool events stay
+/// on their independent low-latency paths.
+const ASSISTANT_PLAYBACK_BUFFER_LOW_MS: u32 = 1_000;
+const ASSISTANT_PLAYBACK_RECHECK_MS: u64 = 2_000;
 
-fn assistant_playback_policy(buffered_gpt_live: bool) -> (u32, u64) {
-    if buffered_gpt_live {
-        (
-            GPT_LIVE_PLAYBACK_BUFFER_LOW_MS,
-            GPT_LIVE_PLAYBACK_RECHECK_MS,
-        )
-    } else {
-        (
-            REALTIME_PLAYBACK_BUFFER_LOW_MS,
-            REALTIME_PLAYBACK_RECHECK_MS,
-        )
-    }
+fn assistant_playback_policy(_buffered_gpt_live: bool) -> (u32, u64) {
+    (
+        ASSISTANT_PLAYBACK_BUFFER_LOW_MS,
+        ASSISTANT_PLAYBACK_RECHECK_MS,
+    )
 }
 
 #[derive(Default)]
@@ -292,10 +285,10 @@ impl Speaker {
             streaming_assistant: false,
             response_complete: true,
             low_watermark_samples: (config.sample_rate.0 as usize
-                * REALTIME_PLAYBACK_BUFFER_LOW_MS as usize)
+                * ASSISTANT_PLAYBACK_BUFFER_LOW_MS as usize)
                 / 1_000,
             resume_check_at: None,
-            resume_check_interval: Duration::from_millis(REALTIME_PLAYBACK_RECHECK_MS),
+            resume_check_interval: Duration::from_millis(ASSISTANT_PLAYBACK_RECHECK_MS),
             native_sample_rate: config.sample_rate.0,
             played_assistant_samples_native: 0,
         }));
@@ -308,8 +301,8 @@ impl Speaker {
             config.sample_rate.0,
             config.channels,
             sample_format,
-            REALTIME_PLAYBACK_BUFFER_LOW_MS,
-            REALTIME_PLAYBACK_RECHECK_MS
+            ASSISTANT_PLAYBACK_BUFFER_LOW_MS,
+            ASSISTANT_PLAYBACK_RECHECK_MS
         );
 
         Ok(Self {
@@ -662,14 +655,14 @@ mod tests {
             response_complete: false,
             low_watermark_samples: 3,
             resume_check_at: None,
-            resume_check_interval: Duration::from_secs(1),
+            resume_check_interval: Duration::from_secs(2),
             native_sample_rate: 48_000,
             played_assistant_samples_native: 0,
         }
     }
 
     #[test]
-    fn gpt_live_speaker_rebuffers_below_low_watermark_for_one_second() {
+    fn voice_speaker_rebuffers_below_one_second_for_two_seconds() {
         let now = Instant::now();
         let mut playback = test_playback([0.25, -0.5]);
         playback.playing = true;
@@ -679,17 +672,17 @@ mod tests {
         playback.samples_native.extend([0.75, 0.5]);
         assert!(!playback_ready_for_callback(
             &mut playback,
-            now + Duration::from_millis(999)
+            now + Duration::from_millis(1_999)
         ));
         assert!(playback_ready_for_callback(
             &mut playback,
-            now + Duration::from_secs(1)
+            now + Duration::from_secs(2)
         ));
         assert_eq!(pop_native_sample(&mut playback), 0.25);
     }
 
     #[test]
-    fn gpt_live_speaker_resumes_only_above_low_watermark() {
+    fn voice_speaker_resumes_only_above_one_second_watermark() {
         let now = Instant::now();
         let mut playback = test_playback([0.25, -0.5, 0.75]);
         playback.resume_check_at = Some(now);
@@ -697,11 +690,11 @@ mod tests {
         playback.samples_native.push_back(0.5);
         assert!(!playback_ready_for_callback(
             &mut playback,
-            now + Duration::from_millis(999)
+            now + Duration::from_millis(1_999)
         ));
         assert!(playback_ready_for_callback(
             &mut playback,
-            now + Duration::from_secs(1)
+            now + Duration::from_secs(2)
         ));
     }
 
@@ -725,9 +718,9 @@ mod tests {
     }
 
     #[test]
-    fn speaker_buffer_policy_is_backend_specific() {
-        assert_eq!(assistant_playback_policy(false), (40, 5));
-        assert_eq!(assistant_playback_policy(true), (500, 1_000));
+    fn speaker_buffer_policy_is_shared_by_both_voice_backends() {
+        assert_eq!(assistant_playback_policy(false), (1_000, 2_000));
+        assert_eq!(assistant_playback_policy(true), (1_000, 2_000));
     }
 
     #[test]

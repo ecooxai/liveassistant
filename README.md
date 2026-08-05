@@ -19,8 +19,8 @@ WebSocket API. It supports:
 - GPT-Live and Realtime tabs open by default with GPT-Live first and auto-connecting, plus a manual down-arrow control instead of automatic transcript scrolling
 - OpenAI Realtime has an optional tool-first prompt appendix, delegates screenshot-backed clicks to a text model for accuracy, and GPT-Live clicks directly
 - OpenAI Realtime retains its conservative one-second playback gate
-- on macOS, GPT-Live uses the app-owned VoiceProcessingIO AEC microphone and WebRTC/CPAL audio path so unrelated system playback is removed from mic input
-- hold either Command key for one second to temporarily let the microphone hear system audio; release Command to restore cancellation immediately
+- on macOS, GPT-Live uses native libWebRTC platform audio for synchronized AEC, adaptive jitter buffering, packet-loss concealment, clock correction, and playout
+- OpenAI Realtime uses the app-owned VoiceProcessingIO AEC path; hold either Command key for one second to temporarily include system audio, then release it to restore cancellation
 - GPT-Live suppresses duplicate sideband PCM notifications while WebRTC owns audio
 - Realtime function tools for screenshot-relative clicks, Bash commands, and text insertion
 - light interface theme
@@ -125,27 +125,28 @@ capture is taken after the first live transcript token (or the local clear-speec
 fallback where available), not continuously. Disable per-turn screenshots in
 Settings. Press **Stop** to close the transport and audio devices.
 
-GPT-Live uses the app-owned WebRTC sender/receiver and normal output device. On
-macOS, microphone capture runs through VoiceProcessingIO so system/speaker audio
-is removed before PCM reaches GPT-Live. App-server
-`thread/realtime/outputAudio/delta` notifications are opted out and ignored
-defensively to prevent duplicate audio. The platform-ADM implementation remains
-available through `--test-gpt-live-native` as a transport diagnostic.
+On macOS, GPT-Live uses native libWebRTC platform audio so microphone capture,
+acoustic echo cancellation, adaptive jitter buffering, Opus packet-loss
+concealment, clock correction, and speaker playout share one synchronized audio
+clock. A capture-only copy of assistant audio is retained for replay/export.
+App-server `thread/realtime/outputAudio/delta` notifications are opted out and
+ignored defensively to prevent duplicate playback. Non-macOS builds retain the
+app-owned WebRTC sender/receiver fallback.
 
 Computer tools run with the current user's permissions. The session prompt
 treats screenshot/application text as untrusted content. Bash commands time out
 after 30 seconds, and their stdout and stderr are capped before being returned
 to the model.
 
-Assistant speech uses the normal native output device at full fidelity and
-volume. The always-open microphone uses OS voice-processing capture, which
-monitors/links system output as its acoustic echo-cancellation reference. On
-Linux, system-wide AEC requires PulseAudio `module-echo-cancel`; macOS uses
-VoiceProcessingIO and Windows uses WASAPI AEC. On macOS 14 and newer, the app
-requests activity-aware near-unity media ducking so cancellation does not make
-normal playback noticeably quieter. Hold either Command key for one second to
-bypass voice processing and include system audio in the microphone only while
-the key remains held.
+OpenAI Realtime assistant speech uses the normal native output device at full
+fidelity and volume. Its always-open microphone uses OS voice-processing
+capture. On Linux, system-wide AEC requires PulseAudio `module-echo-cancel`;
+macOS uses VoiceProcessingIO and Windows uses WASAPI AEC. On macOS 14 and newer,
+the app requests activity-aware near-unity media ducking so cancellation does
+not make normal playback noticeably quieter. While using the app-owned capture
+path, hold either Command key for one second to bypass voice processing and
+include system audio only while the key remains held. Native macOS GPT-Live owns
+its own AEC and playout through libWebRTC instead.
 
 Uploaded audio is decoded locally, converted to mono 24 kHz PCM, and then sent
 as an `input_audio` conversation item. User voice turns can be replayed or

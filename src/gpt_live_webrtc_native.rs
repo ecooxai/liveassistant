@@ -34,7 +34,6 @@ struct SessionHandle {
 struct StartedSession {
     offer_sdp: String,
     handle: SessionHandle,
-    local_audio: UnboundedReceiver<Result<Vec<i16>, String>>,
     remote_audio: UnboundedReceiver<Result<Vec<i16>, String>>,
 }
 
@@ -48,7 +47,6 @@ struct NativePeer {
 /// jitter buffering, Opus PLC, clock drift correction, and speaker playout.
 pub struct GptLivePeer {
     handle: SessionHandle,
-    local_audio: UnboundedReceiver<Result<Vec<i16>, String>>,
     remote_audio: UnboundedReceiver<Result<Vec<i16>, String>>,
 }
 
@@ -60,7 +58,6 @@ impl GptLivePeer {
         Ok((
             Self {
                 handle: started.handle,
-                local_audio: started.local_audio,
                 remote_audio: started.remote_audio,
             },
             started.offer_sdp,
@@ -89,13 +86,6 @@ impl GptLivePeer {
         Ok(())
     }
 
-    /// Return a capture-only copy of the platform microphone track. Native
-    /// libWebRTC still owns capture, AEC, and upstream packetization.
-    pub fn take_local_audio(&mut self) -> UnboundedReceiver<Result<Vec<i16>, String>> {
-        let (_keepalive, replacement) = tokio_mpsc::unbounded_channel();
-        std::mem::replace(&mut self.local_audio, replacement)
-    }
-
     /// Return a capture-only copy of the decoded remote track. Native libWebRTC
     /// continues rendering the same track directly through the platform ADM.
     pub fn take_remote_audio(&mut self) -> UnboundedReceiver<Result<Vec<i16>, String>> {
@@ -111,12 +101,11 @@ impl GptLivePeer {
 fn start_native_session() -> Result<StartedSession> {
     let (command_tx, command_rx) = mpsc::channel();
     let (offer_tx, offer_rx) = mpsc::channel();
-    let (local_audio_tx, local_audio) = tokio_mpsc::unbounded_channel();
     let (remote_audio_tx, remote_audio) = tokio_mpsc::unbounded_channel();
 
     thread::Builder::new()
         .name("live-assistant-gpt-live-webrtc".to_owned())
-        .spawn(move || worker_main(command_rx, offer_tx, local_audio_tx, remote_audio_tx))
+        .spawn(move || worker_main(command_rx, offer_tx, remote_audio_tx))
         .context("Could not spawn native GPT-Live WebRTC worker")?;
 
     let offer_sdp = offer_rx
@@ -125,7 +114,6 @@ fn start_native_session() -> Result<StartedSession> {
     Ok(StartedSession {
         offer_sdp,
         handle: SessionHandle { command_tx },
-        local_audio,
         remote_audio,
     })
 }
@@ -133,7 +121,6 @@ fn start_native_session() -> Result<StartedSession> {
 fn worker_main(
     command_rx: mpsc::Receiver<Command>,
     offer_tx: mpsc::Sender<Result<String>>,
-    local_audio_tx: UnboundedSender<Result<Vec<i16>, String>>,
     remote_audio_tx: UnboundedSender<Result<Vec<i16>, String>>,
 ) {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -148,10 +135,7 @@ fn worker_main(
         }
     };
 
-    let native_peer = match runtime.block_on(create_peer_connection_and_offer(
-        local_audio_tx,
-        remote_audio_tx,
-    )) {
+    let native_peer = match runtime.block_on(create_peer_connection_and_offer(remote_audio_tx)) {
         Ok((peer, offer_sdp)) => {
             let _ = offer_tx.send(Ok(offer_sdp));
             peer
@@ -179,7 +163,6 @@ fn worker_main(
 }
 
 async fn create_peer_connection_and_offer(
-    local_audio_tx: UnboundedSender<Result<Vec<i16>, String>>,
     remote_audio_tx: UnboundedSender<Result<Vec<i16>, String>>,
 ) -> Result<(NativePeer, String)> {
     let factory = PeerConnectionFactory::with_platform_adm();
@@ -201,12 +184,6 @@ async fn create_peer_connection_and_offer(
         .map_err(|error| message_error("Could not add native GPT-Live audio transceiver", error))?;
     let local_audio_source = factory.create_audio_source();
     let local_audio_track = factory.create_audio_track("realtime-mic", local_audio_source);
-    spawn_audio_capture(
-        tokio::runtime::Handle::current(),
-        local_audio_track.clone(),
-        local_audio_tx,
-        "microphone",
-    );
     audio_transceiver
         .sender()
         .set_track(Some(local_audio_track.into()))

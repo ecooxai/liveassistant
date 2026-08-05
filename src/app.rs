@@ -1,5 +1,5 @@
 use crate::{
-    audio::{Microphone, Speaker},
+    audio::{MessageRecorder, Microphone, Speaker},
     auth,
     codex_account::{self, CodexAccountInfo, CodexUsageInfo, RateLimitWindow},
     image_generation, live_pointer,
@@ -1041,6 +1041,7 @@ impl AssistantTab {
 pub struct LiveAssistantApp {
     realtime: RealtimeClient,
     microphone: Option<Microphone>,
+    message_recorder: Option<MessageRecorder>,
     speaker: Option<Speaker>,
     settings: Settings,
     api_key: String,
@@ -1216,6 +1217,65 @@ fn centered_plus_button(
             [
                 egui::pos2(center.x, center.y - arm),
                 egui::pos2(center.x, center.y + arm),
+            ],
+            stroke,
+        );
+    })
+}
+
+fn centered_play_button(
+    ui: &mut egui::Ui,
+    id_source: impl std::hash::Hash,
+    size: f32,
+) -> egui::Response {
+    centered_icon_button(ui, id_source, size, |painter, rect, stroke| {
+        let center = rect.center() + egui::vec2(1.0, 0.0);
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                center + egui::vec2(-4.0, -6.0),
+                center + egui::vec2(5.5, 0.0),
+                center + egui::vec2(-4.0, 6.0),
+            ],
+            stroke.color,
+            Stroke::NONE,
+        ));
+    })
+}
+
+fn centered_save_button(
+    ui: &mut egui::Ui,
+    id_source: impl std::hash::Hash,
+    size: f32,
+) -> egui::Response {
+    centered_icon_button(ui, id_source, size, |painter, rect, mut stroke| {
+        stroke.width = stroke.width.max(1.5);
+        let center = rect.center();
+        let tip_y = center.y + 2.5;
+        painter.line_segment(
+            [
+                egui::pos2(center.x, center.y - 6.0),
+                egui::pos2(center.x, tip_y),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(center.x - 3.8, tip_y - 3.8),
+                egui::pos2(center.x, tip_y),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(center.x + 3.8, tip_y - 3.8),
+                egui::pos2(center.x, tip_y),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(center.x - 5.5, center.y + 6.0),
+                egui::pos2(center.x + 5.5, center.y + 6.0),
             ],
             stroke,
         );
@@ -1400,6 +1460,7 @@ impl LiveAssistantApp {
         let mut app = Self {
             realtime: RealtimeClient::spawn(),
             microphone: None,
+            message_recorder: None,
             speaker,
             settings,
             api_key,
@@ -1759,6 +1820,7 @@ impl LiveAssistantApp {
     fn fail_start(&mut self, message: String, show_settings: bool) {
         let _ = self.realtime.commands.send(Command::Disconnect);
         self.microphone = None;
+        self.message_recorder = None;
         if let Some(speaker) = &mut self.speaker {
             let _ = speaker.clear();
         }
@@ -1845,9 +1907,20 @@ impl LiveAssistantApp {
                 let _ = speaker.clear();
             }
             self.speaker = None;
+            match MessageRecorder::start() {
+                Ok(recorder) => self.message_recorder = Some(recorder),
+                Err(error) => {
+                    self.fail_start(
+                        format!("Could not open message audio recorder: {error:#}"),
+                        false,
+                    );
+                    return;
+                }
+            }
             self.state = ConnectionState::Connecting;
             self.status = "Connecting native WebRTC audio…".to_owned();
         } else {
+            self.message_recorder = None;
             if self.speaker.is_none() {
                 match Speaker::new() {
                     Ok(speaker) => self.speaker = Some(speaker),
@@ -1930,6 +2003,7 @@ impl LiveAssistantApp {
     fn stop(&mut self) {
         let _ = self.realtime.commands.send(Command::Disconnect);
         self.microphone = None;
+        self.message_recorder = None;
         if let Some(speaker) = &mut self.speaker {
             let _ = speaker.clear();
         }
@@ -2067,6 +2141,7 @@ impl LiveAssistantApp {
                 Event::Disconnected => {
                     self.fail_pending_context_uploads();
                     self.microphone = None;
+                    self.message_recorder = None;
                     if let Some(speaker) = &mut self.speaker {
                         let _ = speaker.clear();
                     }
@@ -2086,13 +2161,16 @@ impl LiveAssistantApp {
                 }
                 Event::SpeechStarted => {
                     if self.settings.backend == RealtimeBackend::CodexGptLive {
-                        // Native libWebRTC owns barge-in and full-duplex audio. Keep
-                        // only the UI transcript turn here; do not touch audio devices.
+                        // Native libWebRTC owns barge-in and full-duplex transport.
+                        // The parallel recorder is capture-only and feeds message replay.
                         self.status = if self.active_response_id.is_some() {
                             "Speaking + hearing you…".to_owned()
                         } else {
                             "Hearing you…".to_owned()
                         };
+                        if let Some(recorder) = &self.message_recorder {
+                            recorder.begin_turn();
+                        }
                         self.ensure_active_voice_message();
                         continue;
                     }
@@ -2140,7 +2218,12 @@ impl LiveAssistantApp {
                         && crate::gpt_live_webrtc::uses_platform_audio()
                     {
                         self.status = "Thinking…".to_owned();
-                        self.finish_voice_message(Vec::new());
+                        let audio = self
+                            .message_recorder
+                            .as_ref()
+                            .map(MessageRecorder::finish_turn)
+                            .unwrap_or_default();
+                        self.finish_voice_message(audio);
                         continue;
                     }
                     // OpenAI Realtime only replies on locally confirmed speech.
@@ -2184,23 +2267,6 @@ impl LiveAssistantApp {
                         self.status = "Finishing screen capture…".to_owned();
                     } else {
                         let _ = self.realtime.commands.send(Command::CreateResponse);
-                    }
-                }
-                Event::InputAudio { samples } => {
-                    if samples.is_empty() {
-                        continue;
-                    }
-                    let now = Instant::now();
-                    let index = self
-                        .active_voice_message
-                        .filter(|index| {
-                            self.messages.get(*index).is_some_and(|message| {
-                                message.role == Role::User && message.voice_turn
-                            })
-                        })
-                        .or_else(|| recent_voice_continuation_index(&self.messages, now));
-                    if let Some(index) = index {
-                        append_voice_audio_fragment(&mut self.messages[index], &samples, now);
                     }
                 }
                 Event::InputCommitted { item_id } => {
@@ -3686,7 +3752,6 @@ impl LiveAssistantApp {
             | Event::AssistantSegmentDone { .. }
             | Event::SpeechStarted
             | Event::SpeechStopped
-            | Event::InputAudio { .. }
             | Event::InputCommitted { .. }
             | Event::InputTranscript { .. } => {}
         }
@@ -4377,16 +4442,35 @@ impl LiveAssistantApp {
                                     .color(Color32::from_rgb(70, 80, 94)),
                                 );
                                 ui.horizontal_wrapped(|ui| {
-                                    let play_label = if is_user {
-                                        "▶ Play input"
+                                    let play_tooltip = if is_user {
+                                        "Play voice input"
                                     } else {
-                                        "▶ Play full reply"
+                                        "Play full reply"
                                     };
-                                    if ui.small_button(play_label).clicked()
-                                        && let Some(speaker) = &mut self.speaker
-                                        && let Err(error) = speaker.play_clip(&message.audio)
+                                    if centered_play_button(
+                                        ui,
+                                        ("play-message-audio", index),
+                                        24.0,
+                                    )
+                                    .on_hover_text(play_tooltip)
+                                    .clicked()
                                     {
-                                        self.error = Some(error.to_string());
+                                        let audio = message.audio.clone();
+                                        if self.speaker.is_none() {
+                                            match Speaker::new() {
+                                                Ok(speaker) => self.speaker = Some(speaker),
+                                                Err(error) => {
+                                                    self.error = Some(format!(
+                                                        "Could not open audio output: {error:#}"
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        if let Some(speaker) = &mut self.speaker
+                                            && let Err(error) = speaker.play_clip(&audio)
+                                        {
+                                            self.error = Some(error.to_string());
+                                        }
                                     }
                                     ui.label(
                                         RichText::new(format!("0:00 → {end_time}")).small().weak(),
@@ -4399,12 +4483,13 @@ impl LiveAssistantApp {
                                         .small()
                                         .weak(),
                                     );
-                                    let save_label = if is_user {
-                                        "Save WAV".to_owned()
-                                    } else {
-                                        format!("Save WAV · {end_time}")
-                                    };
-                                    if ui.small_button(save_label).clicked()
+                                    if centered_save_button(
+                                        ui,
+                                        ("save-message-audio", index),
+                                        24.0,
+                                    )
+                                    .on_hover_text(format!("Save WAV · {end_time}"))
+                                    .clicked()
                                         && let Some(path) = rfd::FileDialog::new()
                                             .set_file_name(save_name)
                                             .add_filter("WAV audio", &["wav"])

@@ -261,6 +261,167 @@ impl Drop for Microphone {
     }
 }
 
+/// Capture-only microphone used to attach user audio to native GPT-Live
+/// message cards. It never sends PCM to the model; libWebRTC remains the sole
+/// owner of realtime capture, AEC, and upstream transport.
+pub struct MessageRecorder {
+    _stream: Stream,
+    turn: Arc<Mutex<TurnBuffer>>,
+}
+
+impl MessageRecorder {
+    pub fn start() -> Result<Self> {
+        let host = cpal::default_host();
+        let device = host
+            .default_input_device()
+            .context("No audio input device is available")?;
+        let supported = device
+            .default_input_config()
+            .context("Could not read the default audio input format")?;
+        let sample_format = supported.sample_format();
+        let config = supported.config();
+        let turn = Arc::new(Mutex::new(TurnBuffer::default()));
+        let stream =
+            build_message_input_stream(&device, &config, sample_format, Arc::clone(&turn))?;
+        stream
+            .play()
+            .context("Could not start message audio recording")?;
+        eprintln!(
+            "[live-assistant message-recorder] device={:?} rate={} channels={} format={:?}",
+            device.name().ok(),
+            config.sample_rate.0,
+            config.channels,
+            sample_format
+        );
+        Ok(Self {
+            _stream: stream,
+            turn,
+        })
+    }
+
+    pub fn begin_turn(&self) {
+        if let Ok(mut buffer) = self.turn.lock() {
+            buffer.current = buffer.pre_roll.iter().copied().collect();
+            buffer.pre_roll.clear();
+            buffer.in_speech = true;
+        }
+    }
+
+    pub fn finish_turn(&self) -> Vec<i16> {
+        if let Ok(mut buffer) = self.turn.lock() {
+            buffer.in_speech = false;
+            return std::mem::take(&mut buffer.current);
+        }
+        Vec::new()
+    }
+}
+
+const MESSAGE_RECORDING_PRE_ROLL_SAMPLES: usize = PLAYBACK_RATE as usize * 300 / 1_000;
+
+struct MessageCaptureProcessor {
+    channels: usize,
+    resampler: StreamingResampler,
+    turn: Arc<Mutex<TurnBuffer>>,
+}
+
+impl MessageCaptureProcessor {
+    fn new(sample_rate: u32, channels: usize, turn: Arc<Mutex<TurnBuffer>>) -> Result<Self> {
+        Ok(Self {
+            channels: channels.max(1),
+            resampler: StreamingResampler::new(sample_rate, PLAYBACK_RATE)?,
+            turn,
+        })
+    }
+
+    fn push_f32(&mut self, input: &[f32]) {
+        if input.is_empty() {
+            return;
+        }
+        let mono = input
+            .chunks(self.channels)
+            .map(|frame| frame.iter().copied().sum::<f32>() / frame.len().max(1) as f32)
+            .collect::<Vec<_>>();
+        let output = match self.resampler.process(&mono) {
+            Ok(output) => output,
+            Err(error) => {
+                eprintln!("Message recorder resampling error: {error:#}");
+                return;
+            }
+        };
+        if output.is_empty() {
+            return;
+        }
+        let pcm = output.into_iter().map(f32_to_pcm_i16).collect::<Vec<_>>();
+        if let Ok(mut buffer) = self.turn.lock() {
+            if buffer.in_speech {
+                buffer.current.extend_from_slice(&pcm);
+            } else {
+                for sample in pcm {
+                    buffer.pre_roll.push_back(sample);
+                    if buffer.pre_roll.len() > MESSAGE_RECORDING_PRE_ROLL_SAMPLES {
+                        buffer.pre_roll.pop_front();
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn build_message_input_stream(
+    device: &cpal::Device,
+    config: &StreamConfig,
+    sample_format: SampleFormat,
+    turn: Arc<Mutex<TurnBuffer>>,
+) -> Result<Stream> {
+    let channels = config.channels as usize;
+    let sample_rate = config.sample_rate.0;
+    let error_callback = |error| eprintln!("Message recorder input error: {error}");
+    let stream = match sample_format {
+        SampleFormat::F32 => {
+            let mut processor = MessageCaptureProcessor::new(sample_rate, channels, turn)?;
+            device.build_input_stream(
+                config,
+                move |input: &[f32], _| processor.push_f32(input),
+                error_callback,
+                None,
+            )
+        }
+        SampleFormat::I16 => {
+            let mut processor = MessageCaptureProcessor::new(sample_rate, channels, turn)?;
+            device.build_input_stream(
+                config,
+                move |input: &[i16], _| {
+                    let normalized = input
+                        .iter()
+                        .map(|sample| *sample as f32 / i16::MAX as f32)
+                        .collect::<Vec<_>>();
+                    processor.push_f32(&normalized);
+                },
+                error_callback,
+                None,
+            )
+        }
+        SampleFormat::U16 => {
+            let mut processor = MessageCaptureProcessor::new(sample_rate, channels, turn)?;
+            device.build_input_stream(
+                config,
+                move |input: &[u16], _| {
+                    let normalized = input
+                        .iter()
+                        .map(|sample| (*sample as f32 / u16::MAX as f32) * 2.0 - 1.0)
+                        .collect::<Vec<_>>();
+                    processor.push_f32(&normalized);
+                },
+                error_callback,
+                None,
+            )
+        }
+        format => anyhow::bail!("Unsupported audio input format: {format:?}"),
+    }
+    .context("Could not open the message audio input")?;
+    Ok(stream)
+}
+
 /// Local playback for assistant audio and message replay.
 ///
 /// Incoming 24 kHz PCM is converted once with a band-limited FFT resampler to
@@ -673,6 +834,30 @@ mod tests {
     #[test]
     fn microphone_message_preroll_is_three_seconds() {
         assert_eq!(PRE_ROLL_SAMPLES, 24_000 * 3);
+    }
+
+    #[test]
+    fn message_recorder_keeps_preroll_and_active_turn_audio() {
+        let turn = Arc::new(Mutex::new(TurnBuffer::default()));
+        let mut processor =
+            MessageCaptureProcessor::new(PLAYBACK_RATE, 1, Arc::clone(&turn)).unwrap();
+
+        processor.push_f32(&vec![0.25; MESSAGE_RECORDING_PRE_ROLL_SAMPLES + 480]);
+        {
+            let mut buffer = turn.lock().unwrap();
+            assert_eq!(buffer.pre_roll.len(), MESSAGE_RECORDING_PRE_ROLL_SAMPLES);
+            buffer.current = buffer.pre_roll.iter().copied().collect();
+            buffer.pre_roll.clear();
+            buffer.in_speech = true;
+        }
+
+        processor.push_f32(&vec![0.5; 480]);
+        let buffer = turn.lock().unwrap();
+        assert_eq!(
+            buffer.current.len(),
+            MESSAGE_RECORDING_PRE_ROLL_SAMPLES + 480
+        );
+        assert!(buffer.current.iter().any(|sample| *sample > 10_000));
     }
 
     fn test_playback(samples: impl IntoIterator<Item = f32>) -> PlaybackBuffer {

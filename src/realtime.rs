@@ -4133,7 +4133,6 @@ fn codex_dynamic_tools(screen: ScreenInfo) -> Value {
         .as_array()
         .cloned()
         .unwrap_or_default();
-    tools.extend(note_tools());
     tools.push(create_image_tool());
     codex_dynamic_tools_with_tools(Value::Array(tools))
 }
@@ -4165,107 +4164,9 @@ fn voice_tools(screen: ScreenInfo) -> Value {
         .as_array()
         .cloned()
         .unwrap_or_default();
-    tools.extend(note_tools());
     tools.push(ask_text_model_tool());
     tools.push(create_image_tool());
     Value::Array(tools)
-}
-
-fn note_tools() -> Vec<Value> {
-    vec![
-        json!({
-            "type": "function",
-            "name": "replace_note_text",
-            "description": "Replace exact text in a Markdown/text note stored in ~/liveassistant. Omit note_name to edit the currently open note. Use this instead of keyboard typing when the user asks you to edit a note.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "note_name": {
-                        "type": "string",
-                        "description": "Optional note file name. Omit to use the currently open note."
-                    },
-                    "old_text": {
-                        "type": "string",
-                        "description": "Exact text to find."
-                    },
-                    "new_text": {
-                        "type": "string",
-                        "description": "Replacement text."
-                    },
-                    "replace_all": {
-                        "type": "boolean",
-                        "description": "Replace every exact match instead of only the first match."
-                    }
-                },
-                "required": ["old_text", "new_text"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "type": "function",
-            "name": "remove_note_text",
-            "description": "Remove exact text from a Markdown/text note stored in ~/liveassistant. Omit note_name to edit the currently open note.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "note_name": {
-                        "type": "string",
-                        "description": "Optional note file name. Omit to use the currently open note."
-                    },
-                    "text": {
-                        "type": "string",
-                        "description": "Exact text to remove."
-                    },
-                    "remove_all": {
-                        "type": "boolean",
-                        "description": "Remove every exact match instead of only the first match."
-                    }
-                },
-                "required": ["text"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "type": "function",
-            "name": "rename_note",
-            "description": "Rename a note stored in ~/liveassistant. Omit note_name to rename the currently open note. A .md extension is added when the new name has no extension.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "note_name": {
-                        "type": "string",
-                        "description": "Optional current note file name. Omit to use the currently open note."
-                    },
-                    "new_name": {
-                        "type": "string",
-                        "description": "New file name for the note."
-                    }
-                },
-                "required": ["new_name"],
-                "additionalProperties": false
-            }
-        }),
-        json!({
-            "type": "function",
-            "name": "create_note",
-            "description": "Create a new Markdown/text note in ~/liveassistant and open it in the note editor. A .md extension is added when the name has no extension.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "File name for the new note."
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Initial note content. Defaults to empty."
-                    }
-                },
-                "required": ["name"],
-                "additionalProperties": false
-            }
-        }),
-    ]
 }
 
 fn create_image_tool() -> Value {
@@ -4881,7 +4782,7 @@ fn computer_tools(screen: ScreenInfo) -> Value {
         {
             "type": "function",
             "name": "run_bash",
-            "description": "Run a Bash command on the user's computer for an explicitly requested task such as editing a file, launching an app, or reading system information. Return the exit code, stdout, and stderr. Call this before speaking.",
+            "description": "Run a Bash command on the user's computer for an explicitly requested task such as editing a file or note, launching an app, or reading system information. For note edits, use the absolute Path supplied in the current note context. Return the exit code, stdout, and stderr. Call this before speaking.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -5835,7 +5736,7 @@ Call me Ecoo."
         let params =
             codex_live_thread_start_params(&options, "instructions".to_owned(), "/tmp".to_owned());
         let tools = params["dynamicTools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 6);
         assert!(tools.iter().any(|tool| tool["name"] == "move_pointer"));
         assert!(tools.iter().any(|tool| tool["name"] == "click_screen"));
         assert!(tools.iter().any(|tool| tool["name"] == "run_bash"));
@@ -5848,7 +5749,7 @@ Call me Ecoo."
             "rename_note",
             "create_note",
         ] {
-            assert!(tools.iter().any(|tool| tool["name"] == name));
+            assert!(!tools.iter().any(|tool| tool["name"] == name));
         }
         assert!(tools.iter().all(|tool| tool.get("inputSchema").is_some()));
     }
@@ -6750,7 +6651,7 @@ Call me Ecoo."
         assert_eq!(params["baseInstructions"], "instructions");
         assert_eq!(params["reasoningEffort"], "low");
         let tools = params["dynamicTools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 5);
         assert!(tools.iter().any(|tool| tool["name"] == "click_screen"));
         assert!(tools.iter().any(|tool| tool["name"] == "run_bash"));
         assert!(!tools.iter().any(|tool| tool["name"] == "ask_text_model"));
@@ -6761,7 +6662,7 @@ Call me Ecoo."
             "rename_note",
             "create_note",
         ] {
-            assert!(tools.iter().any(|tool| tool["name"] == name));
+            assert!(!tools.iter().any(|tool| tool["name"] == name));
         }
     }
 

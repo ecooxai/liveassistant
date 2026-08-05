@@ -2192,7 +2192,6 @@ impl LiveAssistantApp {
         }
 
         while let Ok((tab_index, call_id, output)) = self.tool_result_rx.try_recv() {
-            self.apply_note_tool_result(&output);
             if tab_index == self.active_tab {
                 apply_tool_result_to_messages(&mut self.messages, &call_id, &output);
             } else if let Some(tab) = self.tabs.get_mut(tab_index) {
@@ -2712,7 +2711,6 @@ impl LiveAssistantApp {
                     let local_calls = calls
                         .into_iter()
                         .filter(|call| voice_tool_route(&call.name) == VoiceToolRoute::Local)
-                        .map(|call| self.prepare_note_tool_call(call))
                         .collect::<Vec<_>>();
                     if local_calls.is_empty() {
                         continue;
@@ -3953,7 +3951,6 @@ impl LiveAssistantApp {
         let calls = calls
             .into_iter()
             .filter(|call| call.name != "create_image")
-            .map(|call| self.prepare_note_tool_call(call))
             .collect::<Vec<_>>();
         if calls.is_empty() {
             return;
@@ -4707,10 +4704,6 @@ impl LiveAssistantApp {
         }
     }
 
-    fn active_note_name(&self) -> Option<String> {
-        self.active_note.as_deref().map(notes::display_name)
-    }
-
     fn queue_note_changed(&mut self, path: &Path, content: &str) {
         let text = note_change_message(path, content);
         self.append_user_message(ChatMessage::user_text(text.clone(), &[]));
@@ -5019,65 +5012,6 @@ impl LiveAssistantApp {
                 BottomWorkspace::Note => self.draw_note_editor(ui),
             }
         });
-    }
-
-    fn prepare_note_tool_call(
-        &self,
-        mut call: crate::realtime::ToolCall,
-    ) -> crate::realtime::ToolCall {
-        if !notes::uses_current_note(&call.name) {
-            return call;
-        }
-        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&call.arguments) else {
-            return call;
-        };
-        let Some(object) = value.as_object_mut() else {
-            return call;
-        };
-        let needs_name = object
-            .get("note_name")
-            .and_then(serde_json::Value::as_str)
-            .is_none_or(|name| name.trim().is_empty());
-        if needs_name && let Some(name) = self.active_note_name() {
-            object.insert("note_name".to_owned(), serde_json::Value::String(name));
-            call.arguments = value.to_string();
-        }
-        call
-    }
-
-    fn apply_note_tool_result(&mut self, output: &str) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
-            return;
-        };
-        if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
-            || value
-                .get("note_changed")
-                .and_then(serde_json::Value::as_bool)
-                != Some(true)
-        {
-            return;
-        }
-        let Some(name) = value.get("note_name").and_then(serde_json::Value::as_str) else {
-            return;
-        };
-        let Ok(path) = notes::path_for_name(name) else {
-            return;
-        };
-        let content = value
-            .get("content")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| notes::read_note(&path).ok())
-            .unwrap_or_default();
-        self.refresh_note_files();
-        self.active_note = Some(path);
-        self.note_content = content.clone();
-        self.note_saved_content = content;
-        self.note_dirty_since = None;
-        self.renaming_note = None;
-        self.rename_buffer.clear();
-        self.rename_needs_focus = false;
-        self.bottom_workspace = BottomWorkspace::Note;
     }
 
     fn draw_composer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {

@@ -4,12 +4,14 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     io::{Read, Write},
+    path::PathBuf,
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
 };
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 32 * 1024;
 
@@ -355,6 +357,10 @@ fn run_osascript(script: &str, arguments: &[String]) -> Result<()> {
 #[serde(deny_unknown_fields)]
 struct BashArgs {
     command: String,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 fn run_bash(arguments: &str) -> Result<Value> {
@@ -364,6 +370,22 @@ fn run_bash(arguments: &str) -> Result<Value> {
         args.command.len() <= MAX_COMMAND_BYTES,
         "command is too large (maximum {MAX_COMMAND_BYTES} UTF-8 bytes)"
     );
+    let timeout_ms = args
+        .timeout_ms
+        .unwrap_or(COMMAND_TIMEOUT.as_millis() as u64);
+    anyhow::ensure!(timeout_ms > 0, "timeout_ms must be greater than zero");
+    anyhow::ensure!(
+        timeout_ms <= MAX_COMMAND_TIMEOUT.as_millis() as u64,
+        "timeout_ms cannot exceed {}",
+        MAX_COMMAND_TIMEOUT.as_millis()
+    );
+    let timeout = Duration::from_millis(timeout_ms);
+    let cwd = args
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+        .map(PathBuf::from);
 
     let mut command = Command::new("/bin/bash");
     command
@@ -372,6 +394,9 @@ fn run_bash(arguments: &str) -> Result<Value> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(cwd) = &cwd {
+        command.current_dir(cwd);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -393,7 +418,7 @@ fn run_bash(arguments: &str) -> Result<Value> {
         {
             break (status, false);
         }
-        if started.elapsed() >= COMMAND_TIMEOUT {
+        if started.elapsed() >= timeout {
             terminate_process_group(child_id);
             let status = child
                 .wait()
@@ -409,15 +434,17 @@ fn run_bash(arguments: &str) -> Result<Value> {
     let (stderr, stderr_truncated) = stderr_reader
         .join()
         .map_err(|_| anyhow::anyhow!("stderr reader thread failed"))??;
-    let cwd = std::env::current_dir()
-        .map(|path| path.display().to_string())
+    let cwd = cwd
+        .or_else(|| std::env::current_dir().ok())
+        .map(|path| path.canonicalize().unwrap_or(path).display().to_string())
         .unwrap_or_default();
 
     Ok(json!({
         "ok": status.success() && !timed_out,
         "exit_code": status.code(),
         "timed_out": timed_out,
-        "timeout_seconds": COMMAND_TIMEOUT.as_secs(),
+        "timeout_ms": timeout_ms,
+        "timeout_seconds": timeout.as_secs_f64(),
         "cwd": cwd,
         "stdout": String::from_utf8_lossy(&stdout),
         "stderr": String::from_utf8_lossy(&stderr),
@@ -469,13 +496,15 @@ mod tests {
     fn bash_tool_returns_output_and_exit_code() {
         let raw = execute_with_context(
             "run_bash",
-            r#"{"command":"printf tool-ok"}"#,
+            r#"{"command":"printf tool-ok","cwd":"/tmp","timeout_ms":5000}"#,
             ScreenContext::default(),
         );
         let result: Value = serde_json::from_str(&raw).expect("valid tool JSON");
         assert_eq!(result["ok"], true);
         assert_eq!(result["exit_code"], 0);
         assert_eq!(result["stdout"], "tool-ok");
+        assert_eq!(result["timeout_ms"], 5000);
+        assert!(result["cwd"].as_str().unwrap().ends_with("/tmp"));
     }
 
     #[test]

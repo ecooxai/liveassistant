@@ -279,13 +279,15 @@ fn note_result(operation: &str, path: &Path, content: String) -> Value {
         "note_changed": true,
         "operation": operation,
         "note_name": display_name(path),
+        "file_path": path.display().to_string(),
         "content": content,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalized_name;
+    use super::{normalized_name, note_result};
+    use std::path::Path;
 
     #[test]
     fn markdown_extension_is_added_for_new_notes() {
@@ -297,5 +299,13 @@ mod tests {
     fn directory_traversal_is_rejected() {
         assert!(normalized_name("../secret.md", true).is_err());
         assert!(normalized_name("folder/note.md", true).is_err());
+    }
+
+    #[test]
+    fn note_tool_result_includes_file_path() {
+        let result = note_result("replace", Path::new("/tmp/ideas.md"), "hello".to_owned());
+        assert_eq!(result["note_name"], "ideas.md");
+        assert_eq!(result["file_path"], "/tmp/ideas.md");
+        assert_eq!(result["content"], "hello");
     }
 }

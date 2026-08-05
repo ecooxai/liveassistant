@@ -36,6 +36,7 @@ const SPEECH_SCREENSHOT_SAMPLE_TARGET: usize = 24_000 / 2;
 const CODEX_USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const MESSAGE_CONTINUATION_WINDOW: Duration = Duration::from_secs(5);
 const SYSTEM_AUDIO_COMMAND_HOLD_DELAY: Duration = Duration::from_secs(1);
+const NOTE_DISK_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Default)]
 struct CommandHoldState {
@@ -1121,6 +1122,7 @@ pub struct LiveAssistantApp {
     note_content: String,
     note_saved_content: String,
     note_dirty_since: Option<Instant>,
+    note_disk_checked_at: Instant,
     renaming_note: Option<PathBuf>,
     rename_buffer: String,
     rename_needs_focus: bool,
@@ -1406,19 +1408,44 @@ fn centered_down_button(
     })
 }
 
-fn centered_open_button(
+fn centered_file_button(
     ui: &mut egui::Ui,
     id_source: impl std::hash::Hash,
     size: f32,
 ) -> egui::Response {
     centered_icon_button(ui, id_source, size, |painter, rect, mut stroke| {
-        stroke.width = stroke.width.max(1.5);
+        stroke.width = stroke.width.max(1.4);
         let center = rect.center();
-        let start = center + egui::vec2(-4.0, 4.0);
-        let end = center + egui::vec2(4.0, -4.0);
-        painter.line_segment([start, end], stroke);
-        painter.line_segment([end, end + egui::vec2(-4.5, 0.0)], stroke);
-        painter.line_segment([end, end + egui::vec2(0.0, 4.5)], stroke);
+        let left = center.x - 5.0;
+        let right = center.x + 5.0;
+        let top = center.y - 6.0;
+        let bottom = center.y + 6.0;
+        let fold = 3.5;
+        painter.add(egui::Shape::line(
+            vec![
+                egui::pos2(left, bottom),
+                egui::pos2(left, top),
+                egui::pos2(right - fold, top),
+                egui::pos2(right, top + fold),
+                egui::pos2(right, bottom),
+                egui::pos2(left, bottom),
+            ],
+            stroke,
+        ));
+        painter.line_segment(
+            [
+                egui::pos2(right - fold, top),
+                egui::pos2(right - fold, top + fold),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(right - fold, top + fold),
+                egui::pos2(right, top + fold),
+            ],
+            stroke,
+        );
     })
 }
 
@@ -1570,6 +1597,7 @@ impl LiveAssistantApp {
             note_content: String::new(),
             note_saved_content: String::new(),
             note_dirty_since: None,
+            note_disk_checked_at: Instant::now(),
             renaming_note: None,
             rename_buffer: String::new(),
             rename_needs_focus: false,
@@ -4683,8 +4711,8 @@ impl LiveAssistantApp {
         self.active_note.as_deref().map(notes::display_name)
     }
 
-    fn queue_note_changed(&mut self, note_name: &str, content: &str) {
-        let text = note_change_message(note_name, content);
+    fn queue_note_changed(&mut self, path: &Path, content: &str) {
+        let text = note_change_message(path, content);
         self.append_user_message(ChatMessage::user_text(text.clone(), &[]));
         self.pending_turns.push_back(PendingTurn {
             text,
@@ -4715,9 +4743,8 @@ impl LiveAssistantApp {
         self.note_saved_content = self.note_content.clone();
         self.note_dirty_since = None;
         if notify_ai {
-            let name = notes::display_name(&path);
             let content = self.note_content.clone();
-            self.queue_note_changed(&name, &content);
+            self.queue_note_changed(&path, &content);
         }
         true
     }
@@ -4731,6 +4758,36 @@ impl LiveAssistantApp {
         }
     }
 
+    fn sync_notes_from_disk(&mut self) {
+        if self.note_disk_checked_at.elapsed() < NOTE_DISK_POLL_INTERVAL {
+            return;
+        }
+        self.note_disk_checked_at = Instant::now();
+
+        match notes::list_notes() {
+            Ok(files) => self.note_files = files,
+            Err(error) => {
+                self.error = Some(format!("{error:#}"));
+                return;
+            }
+        }
+
+        let Some(path) = self.active_note.clone() else {
+            return;
+        };
+        let Ok(content) = notes::read_note(&path) else {
+            return;
+        };
+        if content == self.note_saved_content {
+            return;
+        }
+
+        self.note_content = content.clone();
+        self.note_saved_content = content.clone();
+        self.note_dirty_since = None;
+        self.queue_note_changed(&path, &content);
+    }
+
     fn select_note(&mut self, path: PathBuf) {
         if self.active_note.as_ref() == Some(&path)
             && self.bottom_workspace == BottomWorkspace::Note
@@ -4742,13 +4799,14 @@ impl LiveAssistantApp {
         }
         match notes::read_note(&path) {
             Ok(content) => {
-                self.active_note = Some(path);
+                self.active_note = Some(path.clone());
                 self.note_content = content.clone();
-                self.note_saved_content = content;
+                self.note_saved_content = content.clone();
                 self.note_dirty_since = None;
                 self.renaming_note = None;
                 self.rename_buffer.clear();
                 self.bottom_workspace = BottomWorkspace::Note;
+                self.queue_note_changed(&path, &content);
             }
             Err(error) => self.error = Some(format!("{error:#}")),
         }
@@ -4811,10 +4869,15 @@ impl LiveAssistantApp {
         }
         match notes::rename_note(&path, &new_name) {
             Ok(new_path) => {
-                if self.active_note.as_ref() == Some(&path) {
+                let renamed_active_note = self.active_note.as_ref() == Some(&path);
+                if renamed_active_note {
                     self.active_note = Some(new_path.clone());
                 }
                 self.refresh_note_files();
+                if renamed_active_note {
+                    let content = self.note_content.clone();
+                    self.queue_note_changed(&new_path, &content);
+                }
             }
             Err(error) => {
                 self.error = Some(format!("{error:#}"));
@@ -4832,7 +4895,7 @@ impl LiveAssistantApp {
             {
                 self.create_note_from_ui();
             }
-            if centered_open_button(ui, "open-note", 24.0)
+            if centered_file_button(ui, "open-note", 24.0)
                 .on_hover_text("Open text file")
                 .clicked()
             {
@@ -4898,15 +4961,26 @@ impl LiveAssistantApp {
             });
             return;
         }
-        let response = ui.add_sized(
-            ui.available_size(),
-            egui::TextEdit::multiline(&mut self.note_content)
-                .code_editor()
-                .desired_width(f32::INFINITY)
-                .lock_focus(true)
-                .hint_text("Write Markdown…"),
-        );
-        if response.changed() {
+        let editor_size = ui.available_size().max(egui::vec2(1.0, 1.0));
+        let editor = egui::ScrollArea::both()
+            .id_salt(("note-editor-scroll", self.active_note.as_ref()))
+            .auto_shrink([false, false])
+            .max_width(editor_size.x)
+            .max_height(editor_size.y)
+            .min_scrolled_width(editor_size.x)
+            .min_scrolled_height(editor_size.y)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.note_content)
+                        .code_editor()
+                        .desired_rows(1)
+                        .desired_width(f32::INFINITY)
+                        .min_size(editor_size)
+                        .lock_focus(true)
+                        .hint_text("Write Markdown…"),
+                )
+            });
+        if editor.inner.changed() {
             self.note_dirty_since = Some(Instant::now());
         }
     }
@@ -5958,6 +6032,7 @@ impl eframe::App for LiveAssistantApp {
             self.pointer_overlay.poll();
         }
         self.process_events(ctx);
+        self.sync_notes_from_disk();
         self.maybe_autosave_note();
         self.maybe_refresh_codex_usage();
         self.maybe_send_speech_screenshot(ctx);
@@ -6181,8 +6256,12 @@ fn format_token_count(value: u64) -> String {
     }
 }
 
-fn note_change_message(note_name: &str, content: &str) -> String {
-    format!("<note_{note_name} >\n{content}\n</note_{note_name}>")
+fn note_change_message(path: &Path, content: &str) -> String {
+    let note_name = notes::display_name(path);
+    format!(
+        "Note file changed.\nName: {note_name}\nPath: {}\n\n<note_{note_name} >\n{content}\n</note_{note_name}>",
+        path.display()
+    )
 }
 
 fn format_message_metadata(message: &ChatMessage, is_assistant: bool) -> String {
@@ -6568,10 +6647,10 @@ mod tests {
     }
 
     #[test]
-    fn note_change_message_uses_filename_tag() {
+    fn note_change_message_includes_name_path_and_content() {
         assert_eq!(
-            note_change_message("ideas.md", "hello"),
-            "<note_ideas.md >\nhello\n</note_ideas.md>"
+            note_change_message(Path::new("/tmp/ideas.md"), "hello"),
+            "Note file changed.\nName: ideas.md\nPath: /tmp/ideas.md\n\n<note_ideas.md >\nhello\n</note_ideas.md>"
         );
     }
 

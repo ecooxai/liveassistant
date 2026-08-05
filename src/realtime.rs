@@ -4881,13 +4881,23 @@ fn computer_tools(screen: ScreenInfo) -> Value {
         {
             "type": "function",
             "name": "run_bash",
-            "description": "Immediately run one Bash command on the user's computer and return its exit code, stdout, and stderr when explicitly requested. Call this before speaking.",
+            "description": "Run a Bash command on the user's computer for an explicitly requested task such as editing a file, launching an app, or reading system information. Return the exit code, stdout, and stderr. Call this before speaking.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
                         "description": "The exact Bash command to run."
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Optional working directory. Use an absolute path when available."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 120000,
+                        "description": "Optional command timeout in milliseconds. Defaults to 30000."
                     }
                 },
                 "required": ["command"],
@@ -6323,17 +6333,17 @@ Call me Ecoo."
                 "callId": "call-77",
                 "namespace": null,
                 "tool": "run_bash",
-                "arguments": {"command": "pwd"}
+                "arguments": {"command": "pwd", "cwd": "/tmp", "timeout_ms": 5000}
             }
         });
         let (request_id, call) = dynamic_tool_request(&message).unwrap();
         assert_eq!(request_id, json!(77));
         assert_eq!(call.call_id, "call-77");
         assert_eq!(call.name, "run_bash");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&call.arguments).unwrap()["command"],
-            "pwd"
-        );
+        let arguments = serde_json::from_str::<serde_json::Value>(&call.arguments).unwrap();
+        assert_eq!(arguments["command"], "pwd");
+        assert_eq!(arguments["cwd"], "/tmp");
+        assert_eq!(arguments["timeout_ms"], 5000);
     }
 
     #[test]

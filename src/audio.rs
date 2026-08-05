@@ -598,11 +598,15 @@ impl Speaker {
         Ok(played_ms)
     }
 
-    pub fn assistant_is_playing(&self) -> bool {
+    pub fn is_playing(&self) -> bool {
         self.playback
             .lock()
             .map(|playback| !playback.samples_native.is_empty())
             .unwrap_or(false)
+    }
+
+    pub fn assistant_is_playing(&self) -> bool {
+        self.is_playing()
     }
 
     fn assistant_played_ms(&self) -> Option<u32> {

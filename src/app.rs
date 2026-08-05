@@ -1043,6 +1043,7 @@ pub struct LiveAssistantApp {
     microphone: Option<Microphone>,
     message_recorder: Option<MessageRecorder>,
     speaker: Option<Speaker>,
+    playing_message_audio: Option<usize>,
     settings: Settings,
     api_key: String,
     show_settings: bool,
@@ -1239,6 +1240,34 @@ fn centered_play_button(
             stroke.color,
             Stroke::NONE,
         ));
+    })
+}
+
+fn centered_pause_button(
+    ui: &mut egui::Ui,
+    id_source: impl std::hash::Hash,
+    size: f32,
+) -> egui::Response {
+    centered_icon_button(ui, id_source, size, |painter, rect, stroke| {
+        let center = rect.center();
+        let bar_width = 3.0;
+        let bar_height = 12.0;
+        painter.rect_filled(
+            egui::Rect::from_center_size(
+                center + egui::vec2(-3.0, 0.0),
+                egui::vec2(bar_width, bar_height),
+            ),
+            0.8,
+            stroke.color,
+        );
+        painter.rect_filled(
+            egui::Rect::from_center_size(
+                center + egui::vec2(3.0, 0.0),
+                egui::vec2(bar_width, bar_height),
+            ),
+            0.8,
+            stroke.color,
+        );
     })
 }
 
@@ -1462,6 +1491,7 @@ impl LiveAssistantApp {
             microphone: None,
             message_recorder: None,
             speaker,
+            playing_message_audio: None,
             settings,
             api_key,
             show_settings: false,
@@ -1606,6 +1636,11 @@ impl LiveAssistantApp {
     fn switch_tab(&mut self, index: usize) {
         if index >= self.tabs.len() || index == self.active_tab {
             return;
+        }
+        if self.playing_message_audio.take().is_some()
+            && let Some(speaker) = &mut self.speaker
+        {
+            let _ = speaker.clear();
         }
         let previous_index = self.active_tab;
         // A tab switch is a view operation. Keep the current transport alive
@@ -1821,6 +1856,7 @@ impl LiveAssistantApp {
         let _ = self.realtime.commands.send(Command::Disconnect);
         self.microphone = None;
         self.message_recorder = None;
+        self.playing_message_audio = None;
         if let Some(speaker) = &mut self.speaker {
             let _ = speaker.clear();
         }
@@ -1891,6 +1927,11 @@ impl LiveAssistantApp {
 
     fn start(&mut self) {
         self.error = None;
+        if self.playing_message_audio.take().is_some()
+            && let Some(speaker) = &mut self.speaker
+        {
+            let _ = speaker.clear();
+        }
         if self.settings.backend == RealtimeBackend::CodexText {
             self.start_text();
             return;
@@ -2004,6 +2045,7 @@ impl LiveAssistantApp {
         let _ = self.realtime.commands.send(Command::Disconnect);
         self.microphone = None;
         self.message_recorder = None;
+        self.playing_message_audio = None;
         if let Some(speaker) = &mut self.speaker {
             let _ = speaker.clear();
         }
@@ -2142,6 +2184,7 @@ impl LiveAssistantApp {
                     self.fail_pending_context_uploads();
                     self.microphone = None;
                     self.message_recorder = None;
+                    self.playing_message_audio = None;
                     if let Some(speaker) = &mut self.speaker {
                         let _ = speaker.clear();
                     }
@@ -2385,6 +2428,11 @@ impl LiveAssistantApp {
                     );
                 }
                 Event::AssistantResponseStarted { response_id } => {
+                    if self.playing_message_audio.take().is_some()
+                        && let Some(speaker) = &mut self.speaker
+                    {
+                        let _ = speaker.clear();
+                    }
                     let now = Instant::now();
                     self.finalize_expired_assistant_group(now);
                     let continue_group = self.assistant_group_is_open(now);
@@ -2646,6 +2694,20 @@ impl LiveAssistantApp {
             ctx.request_repaint();
         }
 
+        if self.playing_message_audio.is_some() {
+            let still_playing = self
+                .speaker
+                .as_ref()
+                .map(Speaker::is_playing)
+                .unwrap_or(false);
+            if still_playing {
+                ctx.request_repaint_after(Duration::from_millis(50));
+            } else {
+                self.playing_message_audio = None;
+                ctx.request_repaint();
+            }
+        }
+
         if self.state == ConnectionState::Live
             && self.settings.backend != RealtimeBackend::CodexText
             && self.active_response_id.is_none()
@@ -2722,6 +2784,9 @@ impl LiveAssistantApp {
         if let Some(index) = self.screenshot_message_index {
             self.screenshot_message_index = Some(remap_message_index(index, placement));
         }
+        if let Some(index) = self.playing_message_audio {
+            self.playing_message_audio = Some(remap_message_index(index, placement));
+        }
         if let Some((message_index, image_index)) = self.image_viewer {
             self.image_viewer = Some((remap_message_index(message_index, placement), image_index));
         }
@@ -2731,6 +2796,11 @@ impl LiveAssistantApp {
     fn remove_message(&mut self, index: usize) {
         if index >= self.messages.len() {
             return;
+        }
+        if self.playing_message_audio == Some(index)
+            && let Some(speaker) = &mut self.speaker
+        {
+            let _ = speaker.clear();
         }
         self.messages.remove(index);
         let remap = |tracked: &mut Option<usize>| {
@@ -2743,6 +2813,7 @@ impl LiveAssistantApp {
         remap(&mut self.active_assistant_message);
         remap(&mut self.active_voice_message);
         remap(&mut self.screenshot_message_index);
+        remap(&mut self.playing_message_audio);
         if let Some((message_index, image_index)) = self.image_viewer {
             self.image_viewer = if message_index == index {
                 None
@@ -4447,29 +4518,58 @@ impl LiveAssistantApp {
                                     } else {
                                         "Play full reply"
                                     };
-                                    if centered_play_button(
-                                        ui,
-                                        ("play-message-audio", index),
-                                        24.0,
-                                    )
-                                    .on_hover_text(play_tooltip)
-                                    .clicked()
-                                    {
-                                        let audio = message.audio.clone();
-                                        if self.speaker.is_none() {
-                                            match Speaker::new() {
-                                                Ok(speaker) => self.speaker = Some(speaker),
-                                                Err(error) => {
-                                                    self.error = Some(format!(
-                                                        "Could not open audio output: {error:#}"
-                                                    ));
+                                    let is_playing = self.playing_message_audio == Some(index)
+                                        && self
+                                            .speaker
+                                            .as_ref()
+                                            .map(Speaker::is_playing)
+                                            .unwrap_or(false);
+                                    let play_response = if is_playing {
+                                        centered_pause_button(
+                                            ui,
+                                            ("pause-message-audio", index),
+                                            24.0,
+                                        )
+                                        .on_hover_text("Stop playback")
+                                    } else {
+                                        centered_play_button(
+                                            ui,
+                                            ("play-message-audio", index),
+                                            24.0,
+                                        )
+                                        .on_hover_text(play_tooltip)
+                                    };
+                                    if play_response.clicked() {
+                                        if is_playing {
+                                            if let Some(speaker) = &mut self.speaker
+                                                && let Err(error) = speaker.clear()
+                                            {
+                                                self.error = Some(error.to_string());
+                                            }
+                                            self.playing_message_audio = None;
+                                        } else {
+                                            let audio = message.audio.clone();
+                                            if self.speaker.is_none() {
+                                                match Speaker::new() {
+                                                    Ok(speaker) => self.speaker = Some(speaker),
+                                                    Err(error) => {
+                                                        self.error = Some(format!(
+                                                            "Could not open audio output: {error:#}"
+                                                        ));
+                                                    }
                                                 }
                                             }
-                                        }
-                                        if let Some(speaker) = &mut self.speaker
-                                            && let Err(error) = speaker.play_clip(&audio)
-                                        {
-                                            self.error = Some(error.to_string());
+                                            if let Some(speaker) = &mut self.speaker {
+                                                match speaker.play_clip(&audio) {
+                                                    Ok(()) => {
+                                                        self.playing_message_audio = Some(index);
+                                                    }
+                                                    Err(error) => {
+                                                        self.playing_message_audio = None;
+                                                        self.error = Some(error.to_string());
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     ui.label(

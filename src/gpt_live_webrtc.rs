@@ -5,10 +5,10 @@ mod fallback;
 #[path = "gpt_live_webrtc_native.rs"]
 mod native;
 
-#[cfg(not(target_os = "macos"))]
+// Production uses the app-owned microphone and speaker path on every platform.
+// This gives macOS VoiceProcessingIO a controllable AEC path and avoids the
+// platform ADM's inability to cancel unrelated system playback.
 pub use fallback::GptLivePeer;
-#[cfg(target_os = "macos")]
-pub use native::GptLivePeer;
 
 // Keep the deterministic raw-RTP peer for transport probes on every platform.
 pub(crate) use fallback::GptLivePeer as GptLiveProbePeer;
@@ -16,11 +16,10 @@ pub(crate) use fallback::GptLivePeer as GptLiveProbePeer;
 #[cfg(target_os = "macos")]
 pub(crate) use native::GptLivePeer as GptLiveNativePeer;
 
-/// True when GPT-Live capture, acoustic echo cancellation, jitter buffering,
-/// packet-loss concealment, clock correction, and speaker playout are owned by
-/// the native platform WebRTC audio device instead of the app's PCM streams.
+/// Production audio is owned by the app so VoiceProcessingIO can remove
+/// unrelated macOS system playback before microphone PCM reaches GPT-Live.
 pub const fn uses_platform_audio() -> bool {
-    cfg!(target_os = "macos")
+    false
 }
 
 #[cfg(test)]
@@ -28,7 +27,7 @@ mod tests {
     use super::uses_platform_audio;
 
     #[test]
-    fn macos_uses_native_platform_audio() {
-        assert_eq!(uses_platform_audio(), cfg!(target_os = "macos"));
+    fn production_uses_app_owned_aec_on_every_platform() {
+        assert!(!uses_platform_audio());
     }
 }

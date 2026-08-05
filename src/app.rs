@@ -1567,8 +1567,9 @@ impl LiveAssistantApp {
         }
         settings.instructions.clear();
         let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-        // Audio devices are opened lazily. OpenAI Realtime uses the app-owned
-        // capture/playout path; macOS GPT-Live uses native libWebRTC platform audio.
+        // Audio devices are opened lazily. Production voice sessions use the
+        // app-owned capture/playout path so macOS AEC and Command passthrough
+        // remain controllable.
         let speaker = None;
         let (tool_result_tx, tool_result_rx) = mpsc::channel();
         let (codex_info_tx, codex_info_rx) = mpsc::channel();

@@ -1,4 +1,4 @@
-use crate::backends::PlaybackCommand;
+use crate::backends::{ControlCommand, PlaybackCommand};
 use crate::AecError;
 use coreaudio::audio_unit::render_callback::{self, data};
 use coreaudio::audio_unit::types::IOType;
@@ -10,8 +10,13 @@ use std::sync::{Arc, Mutex};
 
 // Added in macOS 14. The currently installed SDK may predate the named C
 // constants, so keep the stable values from AudioUnitProperties.h locally.
+const K_AU_VOICE_IO_PROPERTY_BYPASS_VOICE_PROCESSING: u32 = 2100;
 const K_AU_VOICE_IO_PROPERTY_OTHER_AUDIO_DUCKING_CONFIGURATION: u32 = 2108;
-const K_AU_VOICE_IO_OTHER_AUDIO_DUCKING_LEVEL_MIN: u32 = 10;
+/// macOS accepts values below the documented minimum of 10. A value of 1 keeps
+/// the output effectively at unity while retaining the VoiceProcessingIO echo
+/// reference. This avoids the audible media-volume drop caused by normal voice
+/// chat ducking.
+const K_AU_VOICE_IO_OTHER_AUDIO_DUCKING_LEVEL_NEAR_UNITY: u32 = 1;
 
 #[repr(C)]
 struct VoiceIoOtherAudioDuckingConfiguration {
@@ -29,6 +34,7 @@ struct PlaybackBuffer {
 pub fn create_backend(
     public_sender: Sender<Vec<f32>>,
     playback_rx: Receiver<PlaybackCommand>,
+    control_rx: Receiver<ControlCommand>,
 ) -> Result<(u32, usize), AecError> {
     let (callback_tx, callback_rx) = flume::bounded::<Vec<f32>>(32);
 
@@ -45,14 +51,25 @@ pub fn create_backend(
     // coreaudio-rs may auto-initialize; must uninitialize before configuring properties
     let _ = audio_unit.uninitialize();
 
-    // Advanced mode ducks only when VoiceProcessingIO detects voice activity,
-    // instead of reducing other media for the whole live session. Ask for the
-    // minimum available reduction while retaining VoiceProcessingIO's AEC. On
-    // older macOS releases the property is unsupported; keep capture working
-    // with the system default rather than failing microphone startup.
+    // Keep voice processing explicitly enabled. This is also the property we
+    // toggle for the one-second Command-key system-audio passthrough gesture.
+    let bypass_voice_processing: u32 = 0;
+    audio_unit
+        .set_property(
+            K_AU_VOICE_IO_PROPERTY_BYPASS_VOICE_PROCESSING,
+            Scope::Global,
+            Element::Output,
+            Some(&bypass_voice_processing),
+        )
+        .map_err(|e| {
+            AecError::BackendError(format!("failed to enable voice processing: {e:?}"))
+        })?;
+
+    // Advanced mode limits ducking to detected speech. Use a near-unity level
+    // so cancellation does not make ordinary system playback noticeably quieter.
     let ducking = VoiceIoOtherAudioDuckingConfiguration {
         enable_advanced_ducking: 1,
-        ducking_level: K_AU_VOICE_IO_OTHER_AUDIO_DUCKING_LEVEL_MIN,
+        ducking_level: K_AU_VOICE_IO_OTHER_AUDIO_DUCKING_LEVEL_NEAR_UNITY,
     };
     match audio_unit.set_property(
         K_AU_VOICE_IO_PROPERTY_OTHER_AUDIO_DUCKING_CONFIGURATION,
@@ -61,10 +78,10 @@ pub fn create_backend(
         Some(&ducking),
     ) {
         Ok(()) => tracing::info!(
-            "VoiceProcessingIO advanced other-audio ducking enabled at minimum level"
+            "VoiceProcessingIO advanced ducking enabled at near-unity level"
         ),
         Err(error) => tracing::warn!(
-            "VoiceProcessingIO minimum ducking is unavailable; using system default: {error:?}"
+            "VoiceProcessingIO near-unity ducking is unavailable; using system default: {error:?}"
         ),
     }
 
@@ -189,13 +206,49 @@ pub fn create_backend(
         }
     });
 
-    // Spawn task that owns audio_unit and forwards capture - stops on sender disconnect
+    // Spawn task that owns audio_unit, applies live bypass changes, and forwards
+    // capture. Keeping the same unit alive avoids device restarts when the user
+    // holds or releases Command.
     tokio::spawn(async move {
-        let _audio_unit = audio_unit; // Hold for RAII, Drop stops audio
-
-        while let Ok(samples) = callback_rx.recv_async().await {
-            if public_sender.send_async(samples).await.is_err() {
-                break;
+        let mut audio_unit = audio_unit; // Hold for RAII, Drop stops audio
+        let mut control_open = true;
+        loop {
+            if control_open {
+                tokio::select! {
+                    samples = callback_rx.recv_async() => {
+                        let Ok(samples) = samples else { break; };
+                        if public_sender.send_async(samples).await.is_err() {
+                            break;
+                        }
+                    }
+                    command = control_rx.recv_async() => {
+                        match command {
+                            Ok(ControlCommand::SetVoiceProcessingBypassed(bypassed)) => {
+                                let value: u32 = u32::from(bypassed);
+                                if let Err(error) = audio_unit.set_property(
+                                    K_AU_VOICE_IO_PROPERTY_BYPASS_VOICE_PROCESSING,
+                                    Scope::Global,
+                                    Element::Output,
+                                    Some(&value),
+                                ) {
+                                    tracing::warn!(
+                                        "Could not set VoiceProcessingIO bypass={bypassed}: {error:?}"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        "VoiceProcessingIO system-audio passthrough={bypassed}"
+                                    );
+                                }
+                            }
+                            Err(_) => control_open = false,
+                        }
+                    }
+                }
+            } else {
+                let Ok(samples) = callback_rx.recv_async().await else { break; };
+                if public_sender.send_async(samples).await.is_err() {
+                    break;
+                }
             }
         }
     });

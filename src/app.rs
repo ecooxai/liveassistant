@@ -14,6 +14,7 @@ use crate::{
 };
 use anyhow::Context as _;
 use base64::{Engine, engine::general_purpose::STANDARD};
+use device_query::{DeviceState, Keycode};
 use eframe::egui::{self, Color32, RichText, Stroke};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -34,6 +35,68 @@ const SETTINGS_KEY: &str = "live_assistant.settings";
 const SPEECH_SCREENSHOT_SAMPLE_TARGET: usize = 24_000 / 2;
 const CODEX_USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const MESSAGE_CONTINUATION_WINDOW: Duration = Duration::from_secs(5);
+const SYSTEM_AUDIO_COMMAND_HOLD_DELAY: Duration = Duration::from_secs(1);
+
+#[derive(Default)]
+struct CommandHoldState {
+    pressed_at: Option<Instant>,
+    active: bool,
+}
+
+impl CommandHoldState {
+    fn update(&mut self, command_down: bool, now: Instant) -> bool {
+        if !command_down {
+            self.pressed_at = None;
+            self.active = false;
+            return false;
+        }
+
+        let pressed_at = self.pressed_at.get_or_insert(now);
+        self.active = now.saturating_duration_since(*pressed_at) >= SYSTEM_AUDIO_COMMAND_HOLD_DELAY;
+        self.active
+    }
+}
+
+#[derive(Default)]
+struct SystemAudioCommandHold {
+    device_state: Option<DeviceState>,
+    input_initialization_attempted: bool,
+    hold: CommandHoldState,
+}
+
+impl SystemAudioCommandHold {
+    fn command_is_down(&mut self, ctx: &egui::Context) -> bool {
+        if !self.input_initialization_attempted {
+            self.input_initialization_attempted = true;
+            self.device_state = DeviceState::checked_new();
+        }
+
+        if let Some(device_state) = &self.device_state {
+            let keys = device_state.query_keymap();
+            if keys.iter().any(|key| {
+                matches!(
+                    key,
+                    Keycode::Command | Keycode::RCommand | Keycode::LMeta | Keycode::RMeta
+                )
+            }) {
+                return true;
+            }
+        }
+
+        // This fallback works while the app is focused if global input access is
+        // unavailable or has not yet been granted.
+        ctx.input(|input| input.modifiers.command)
+    }
+
+    fn poll(&mut self, ctx: &egui::Context, now: Instant) -> bool {
+        let command_down = self.command_is_down(ctx);
+        self.hold.update(command_down, now)
+    }
+
+    fn reset(&mut self) {
+        self.hold = CommandHoldState::default();
+    }
+}
 
 fn app_plays_live_assistant_audio(backend: RealtimeBackend) -> bool {
     backend != RealtimeBackend::CodexText
@@ -1041,6 +1104,7 @@ impl AssistantTab {
 pub struct LiveAssistantApp {
     realtime: RealtimeClient,
     microphone: Option<Microphone>,
+    system_audio_command_hold: SystemAudioCommandHold,
     message_recorder: Option<MessageRecorder>,
     speaker: Option<Speaker>,
     playing_message_audio: Option<usize>,
@@ -1476,8 +1540,8 @@ impl LiveAssistantApp {
         }
         settings.instructions.clear();
         let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-        // Audio devices are opened lazily. GPT-Live on macOS delegates both
-        // capture and playout to native libWebRTC's platform audio device module.
+        // Audio devices are opened lazily. Production voice sessions use the
+        // app-owned capture/playout path so macOS AEC and Command passthrough are controllable.
         let speaker = None;
         let (tool_result_tx, tool_result_rx) = mpsc::channel();
         let (codex_info_tx, codex_info_rx) = mpsc::channel();
@@ -1489,6 +1553,7 @@ impl LiveAssistantApp {
         let mut app = Self {
             realtime: RealtimeClient::spawn(),
             microphone: None,
+            system_audio_command_hold: SystemAudioCommandHold::default(),
             message_recorder: None,
             speaker,
             playing_message_audio: None,
@@ -5051,11 +5116,21 @@ impl LiveAssistantApp {
                         .as_ref()
                         .map(Microphone::level)
                         .unwrap_or(0.0);
-                    if self.microphone.is_some() {
+                    if let Some(microphone) = &self.microphone {
                         ui.add(
                             egui::ProgressBar::new((level * 5.0).clamp(0.0, 1.0))
                                 .desired_width(70.0),
                         );
+                        if microphone.system_audio_passthrough() {
+                            ui.label(
+                                RichText::new("System audio")
+                                    .color(Color32::from_rgb(185, 90, 20))
+                                    .strong(),
+                            )
+                            .on_hover_text(
+                                "Command has been held for 1 second. Release it to restore echo cancellation.",
+                            );
+                        }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
@@ -5849,6 +5924,22 @@ impl LiveAssistantApp {
     }
 }
 
+impl LiveAssistantApp {
+    fn update_system_audio_command_hold(&mut self, ctx: &egui::Context) {
+        let enabled = self.system_audio_command_hold.poll(ctx, Instant::now());
+        let Some(microphone) = &self.microphone else {
+            self.system_audio_command_hold.reset();
+            return;
+        };
+
+        if let Err(error) = microphone.set_system_audio_passthrough(enabled) {
+            self.error = Some(format!(
+                "Could not switch system-audio microphone passthrough: {error:#}"
+            ));
+        }
+    }
+}
+
 impl eframe::App for LiveAssistantApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         // Child pointer viewports need a genuinely transparent swapchain clear.
@@ -5862,6 +5953,7 @@ impl eframe::App for LiveAssistantApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.update_system_audio_command_hold(ctx);
         if self.state == ConnectionState::Live && self.settings.show_live_pointer {
             self.pointer_overlay.poll();
         }
@@ -6443,6 +6535,37 @@ fn configure_style(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_hold_enables_system_audio_only_after_one_second() {
+        let started = Instant::now();
+        let mut hold = CommandHoldState::default();
+
+        assert!(!hold.update(true, started));
+        assert!(!hold.update(
+            true,
+            started + SYSTEM_AUDIO_COMMAND_HOLD_DELAY - Duration::from_millis(1)
+        ));
+        assert!(hold.update(true, started + SYSTEM_AUDIO_COMMAND_HOLD_DELAY));
+        assert!(hold.update(
+            true,
+            started + SYSTEM_AUDIO_COMMAND_HOLD_DELAY + Duration::from_secs(2)
+        ));
+    }
+
+    #[test]
+    fn command_hold_release_immediately_restores_cancellation_and_resets_timer() {
+        let started = Instant::now();
+        let mut hold = CommandHoldState::default();
+
+        assert!(!hold.update(true, started));
+        assert!(hold.update(true, started + SYSTEM_AUDIO_COMMAND_HOLD_DELAY));
+        assert!(!hold.update(false, started + SYSTEM_AUDIO_COMMAND_HOLD_DELAY));
+        assert!(!hold.update(
+            true,
+            started + SYSTEM_AUDIO_COMMAND_HOLD_DELAY + Duration::from_millis(1)
+        ));
+    }
 
     #[test]
     fn note_change_message_uses_filename_tag() {

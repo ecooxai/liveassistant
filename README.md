@@ -11,7 +11,7 @@ WebSocket API. It supports:
 - logical-resolution screenshots on Retina/HiDPI displays
 - transparent Live pointer overlay with one-second left/right click colors and
   bottom-right coordinates while a mouse button is held
-- visible and replayable user audio for OpenAI Realtime and the non-macOS GPT-Live fallback; macOS native GPT-Live stores the transcript while libWebRTC owns PCM
+- visible and replayable user audio for OpenAI Realtime and GPT-Live
 - typed text, Command/Ctrl+V image paste, uploaded images/audio, and drag-and-drop
 - sent image and screen-context previews directly in user message bubbles
 - click-to-enlarge viewing of the exact encoded image payload sent to the model
@@ -19,8 +19,9 @@ WebSocket API. It supports:
 - GPT-Live and Realtime tabs open by default with GPT-Live first and auto-connecting, plus a manual down-arrow control instead of automatic transcript scrolling
 - OpenAI Realtime has an optional tool-first prompt appendix, delegates screenshot-backed clicks to a text model for accuracy, and GPT-Live clicks directly
 - OpenAI Realtime retains its conservative one-second playback gate
-- on macOS, GPT-Live uses Google libWebRTC's platform audio device module for microphone capture, AEC, adaptive jitter buffering, packet-loss concealment, clock correction, and speaker playout
-- GPT-Live suppresses duplicate sideband PCM notifications while WebRTC owns audio; Linux retains the raw-RTP/CPAL fallback
+- on macOS, GPT-Live uses the app-owned VoiceProcessingIO AEC microphone and WebRTC/CPAL audio path so unrelated system playback is removed from mic input
+- hold either Command key for one second to temporarily let the microphone hear system audio; release Command to restore cancellation immediately
+- GPT-Live suppresses duplicate sideband PCM notifications while WebRTC owns audio
 - Realtime function tools for screenshot-relative clicks, Bash commands, and text insertion
 - light interface theme
 - a persistent conversation until the voice session is stopped
@@ -97,8 +98,7 @@ Open **Settings** and choose one of:
 
 For OpenAI Realtime, Platform API keys connect directly to
 `wss://api.openai.com/v1/realtime`. For GPT-Live V3, Codex app-server manages
-ChatGPT OAuth and call creation while Live Assistant supplies the native WebRTC
-audio peer. If the stored OAuth access token is near expiry and a `refresh_token`
+ChatGPT OAuth and call creation while Live Assistant supplies the WebRTC audio peer. If the stored OAuth access token is near expiry and a `refresh_token`
 is present, Live Assistant refreshes it via `https://auth.openai.com/oauth/token`
 and updates `auth.json`.
 
@@ -118,21 +118,19 @@ transport reports it and a visibly marked local estimate otherwise.
 
 ## Privacy and behavior
 
-For OpenAI Realtime and the non-macOS GPT-Live fallback, microphone capture
-starts as soon as **Start voice** is clicked. Audio recorded while the transport
-connects is kept in order (up to the latest 60 seconds), then flushed when the
-session is ready. On macOS GPT-Live, native libWebRTC owns microphone and speaker
-access directly; the app does not open competing CPAL or VoiceProcessingIO audio
-streams. A screen capture is taken after the first live transcript token (or the
-local clear-speech fallback where available), not continuously. Disable per-turn
-screenshots in Settings. Press **Stop** to close the transport and audio devices.
+For OpenAI Realtime and GPT-Live, microphone capture starts as soon as **Start
+voice** is clicked. Audio recorded while the transport connects is kept in order
+(up to the latest 60 seconds), then flushed when the session is ready. A screen
+capture is taken after the first live transcript token (or the local clear-speech
+fallback where available), not continuously. Disable per-turn screenshots in
+Settings. Press **Stop** to close the transport and audio devices.
 
-The macOS GPT-Live path mirrors Codex's former native transport: a send/receive
-audio transceiver is attached to `PeerConnectionFactory::with_platform_adm()`.
-WebRTC therefore handles device timing, adaptive jitter buffering, Opus recovery,
-and full-duplex playout end to end. App-server `thread/realtime/outputAudio/delta`
-notifications are opted out and ignored defensively to prevent duplicate audio.
-Linux continues to use the existing raw-RTP receiver and CPAL playback fallback.
+GPT-Live uses the app-owned WebRTC sender/receiver and normal output device. On
+macOS, microphone capture runs through VoiceProcessingIO so system/speaker audio
+is removed before PCM reaches GPT-Live. App-server
+`thread/realtime/outputAudio/delta` notifications are opted out and ignored
+defensively to prevent duplicate audio. The platform-ADM implementation remains
+available through `--test-gpt-live-native` as a transport diagnostic.
 
 Computer tools run with the current user's permissions. The session prompt
 treats screenshot/application text as untrusted content. Bash commands time out
@@ -144,9 +142,10 @@ volume. The always-open microphone uses OS voice-processing capture, which
 monitors/links system output as its acoustic echo-cancellation reference. On
 Linux, system-wide AEC requires PulseAudio `module-echo-cancel`; macOS uses
 VoiceProcessingIO and Windows uses WASAPI AEC. On macOS 14 and newer, the app
-requests activity-aware, minimum-level media ducking so other audio is not
-reduced throughout the entire connection; macOS can still apply a small
-reduction while VoiceProcessingIO detects speech.
+requests activity-aware near-unity media ducking so cancellation does not make
+normal playback noticeably quieter. Hold either Command key for one second to
+bypass voice processing and include system audio in the microphone only while
+the key remains held.
 
 Uploaded audio is decoded locally, converted to mono 24 kHz PCM, and then sent
 as an `input_audio` conversation item. User voice turns can be replayed or

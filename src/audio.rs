@@ -13,7 +13,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use sys_voice::{AecConfig, CaptureHandle, Channels};
+use sys_voice::{AecConfig, CaptureControl, CaptureHandle, Channels};
 use tokio::sync::mpsc::UnboundedSender;
 
 const PRE_ROLL_SAMPLES: usize = 24_000 * 3;
@@ -115,6 +115,8 @@ pub struct Microphone {
     _reader: JoinHandle<()>,
     turn: Arc<Mutex<TurnBuffer>>,
     level_bits: Arc<AtomicU32>,
+    capture_control: CaptureControl,
+    system_audio_passthrough: AtomicBool,
 }
 
 impl Microphone {
@@ -136,6 +138,7 @@ impl Microphone {
             AEC_CAPTURE_RATE
         );
 
+        let capture_control = capture.control_handle();
         let turn = Arc::new(Mutex::new(TurnBuffer::default()));
         let level_bits = Arc::new(AtomicU32::new(0));
         let stop = Arc::new(AtomicBool::new(false));
@@ -203,9 +206,31 @@ impl Microphone {
             _reader: reader,
             turn,
             level_bits,
+            capture_control,
+            system_audio_passthrough: AtomicBool::new(false),
         })
     }
 
+    /// Temporarily bypass acoustic echo cancellation so the microphone includes
+    /// speaker/system audio. The normal mode is cancellation enabled.
+    pub fn set_system_audio_passthrough(&self, enabled: bool) -> Result<()> {
+        let previous = self
+            .system_audio_passthrough
+            .swap(enabled, Ordering::Relaxed);
+        if previous == enabled {
+            return Ok(());
+        }
+        if let Err(error) = self.capture_control.set_voice_processing_bypassed(enabled) {
+            self.system_audio_passthrough
+                .store(previous, Ordering::Relaxed);
+            return Err(anyhow::anyhow!(error));
+        }
+        Ok(())
+    }
+
+    pub fn system_audio_passthrough(&self) -> bool {
+        self.system_audio_passthrough.load(Ordering::Relaxed)
+    }
     pub fn begin_turn(&self) {
         if let Ok(mut buffer) = self.turn.lock() {
             buffer.current = buffer.pre_roll.iter().copied().collect();

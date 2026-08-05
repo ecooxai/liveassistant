@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+use crate::gpt_live_webrtc::GptLiveNativePeer;
 use crate::{
     gpt_live_webrtc::{GptLivePeer, GptLiveProbePeer},
     media::{Attachment, ScreenInfo},
@@ -3571,7 +3573,7 @@ pub fn probe_codex_gpt_live_native() -> Result<()> {
             .context("Codex app-server did not return a native probe thread id")?
             .to_owned();
 
-        let (peer, offer_sdp) = GptLivePeer::create().await?;
+        let (peer, offer_sdp) = GptLiveNativePeer::create().await?;
         server
             .call(
                 "thread/realtime/start",

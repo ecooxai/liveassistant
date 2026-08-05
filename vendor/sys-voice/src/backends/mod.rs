@@ -22,6 +22,7 @@ use crate::AecError;
 #[derive(Clone)]
 pub struct BackendHandle {
     playback_tx: flume::Sender<PlaybackCommand>,
+    control_tx: Option<flume::Sender<ControlCommand>>,
     native_sample_rate: u32,
 }
 pub(crate) enum PlaybackCommand {
@@ -29,7 +30,21 @@ pub(crate) enum PlaybackCommand {
     StartStream(flume::Receiver<Vec<f32>>),
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ControlCommand {
+    SetVoiceProcessingBypassed(bool),
+}
+
 impl BackendHandle {
+    pub fn set_voice_processing_bypassed(&self, bypassed: bool) -> Result<(), AecError> {
+        let Some(control_tx) = &self.control_tx else {
+            return Ok(());
+        };
+        control_tx
+            .send(ControlCommand::SetVoiceProcessingBypassed(bypassed))
+            .map_err(|_| AecError::BackendError("voice-processing control channel closed".to_string()))
+    }
+
     /// Play a complete audio buffer. For streaming audio, use `start_playback_stream`.
     pub fn play_audio(&self, samples: Vec<f32>, sample_rate: u32) -> Result<(), AecError> {
         let samples = resample_oneshot(samples, sample_rate, self.native_sample_rate)?;
@@ -105,12 +120,14 @@ pub(crate) fn create_backend(
     sender: flume::Sender<Vec<f32>>,
 ) -> Result<(u32, usize, BackendHandle), AecError> {
     let (playback_tx, playback_rx) = flume::bounded::<PlaybackCommand>(16);
+    let (control_tx, control_rx) = flume::bounded::<ControlCommand>(8);
 
     #[cfg(target_os = "macos")]
     {
-        let (rate, size) = macos::create_backend(sender, playback_rx)?;
+        let (rate, size) = macos::create_backend(sender, playback_rx, control_rx)?;
         let handle = BackendHandle {
             playback_tx,
+            control_tx: Some(control_tx),
             native_sample_rate: rate,
         };
         Ok((rate, size, handle))
@@ -118,9 +135,11 @@ pub(crate) fn create_backend(
 
     #[cfg(target_os = "ios")]
     {
+        let _ = control_rx;
         let (rate, size) = ios::create_backend(sender, playback_rx)?;
         let handle = BackendHandle {
             playback_tx,
+            control_tx: None,
             native_sample_rate: rate,
         };
         Ok((rate, size, handle))
@@ -128,9 +147,11 @@ pub(crate) fn create_backend(
 
     #[cfg(target_os = "windows")]
     {
+        let _ = control_rx;
         let (rate, size) = windows::create_backend(sender, playback_rx)?;
         let handle = BackendHandle {
             playback_tx,
+            control_tx: None,
             native_sample_rate: rate,
         };
         Ok((rate, size, handle))
@@ -138,9 +159,11 @@ pub(crate) fn create_backend(
 
     #[cfg(target_os = "linux")]
     {
+        let _ = control_rx;
         let (rate, size) = linux::create_backend(sender, playback_rx)?;
         let handle = BackendHandle {
             playback_tx,
+            control_tx: None,
             native_sample_rate: rate,
         };
         Ok((rate, size, handle))
@@ -148,9 +171,11 @@ pub(crate) fn create_backend(
 
     #[cfg(target_os = "android")]
     {
+        let _ = control_rx;
         let (rate, size) = android::create_backend(sender, playback_rx)?;
         let handle = BackendHandle {
             playback_tx,
+            control_tx: None,
             native_sample_rate: rate,
         };
         Ok((rate, size, handle))
@@ -164,7 +189,7 @@ pub(crate) fn create_backend(
         target_os = "android"
     )))]
     {
-        let _ = (sender, playback_rx);
+        let _ = (sender, playback_rx, control_rx, control_tx);
         Err(AecError::AecNotSupported)
     }
 }

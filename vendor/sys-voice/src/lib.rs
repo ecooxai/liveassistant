@@ -77,6 +77,19 @@ pub struct CaptureHandle {
     sample_rate: u32,
 }
 
+#[derive(Clone)]
+pub struct CaptureControl {
+    backend: backends::BackendHandle,
+}
+
+impl CaptureControl {
+    /// Bypass voice processing while preserving microphone capture.
+    /// On macOS this temporarily lets speaker/system audio pass through the mic.
+    pub fn set_voice_processing_bypassed(&self, bypassed: bool) -> Result<(), AecError> {
+        self.backend.set_voice_processing_bypassed(bypassed)
+    }
+}
+
 impl CaptureHandle {
     /// Create and start a new AEC capture stream.
     /// Audio samples are received via the async recv() or blocking recv_blocking() methods.
@@ -128,6 +141,14 @@ impl CaptureHandle {
             backend: backend_handle,
             sample_rate: target_rate,
         })
+    }
+
+    /// Return a lightweight control handle that remains usable while capture is
+    /// owned by another thread.
+    pub fn control_handle(&self) -> CaptureControl {
+        CaptureControl {
+            backend: self.backend.clone(),
+        }
     }
 
     /// Receive audio samples asynchronously.

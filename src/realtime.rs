@@ -306,6 +306,9 @@ pub enum Event {
     Disconnected,
     SpeechStarted,
     SpeechStopped,
+    InputAudio {
+        samples: Vec<i16>,
+    },
     InputCommitted {
         item_id: String,
     },
@@ -1174,6 +1177,137 @@ fn codex_live_initialize_capabilities() -> Value {
     })
 }
 
+const NATIVE_INPUT_PRE_ROLL_SAMPLES: usize = AUDIO_SAMPLE_RATE * 300 / 1_000;
+const NATIVE_REMOTE_PRE_ROLL_SAMPLES: usize = AUDIO_SAMPLE_RATE * 150 / 1_000;
+const NATIVE_REMOTE_TAIL_SAMPLES: usize = AUDIO_SAMPLE_RATE * 600 / 1_000;
+const NATIVE_REMOTE_VOICE_RMS: f64 = 12.0;
+
+#[derive(Default)]
+struct NativeInputAudioCapture {
+    pre_roll: VecDeque<Vec<i16>>,
+    pre_roll_samples: usize,
+    active: bool,
+}
+
+impl NativeInputAudioCapture {
+    fn sync(&mut self, speech_active: bool, events: &std::sync::mpsc::Sender<Event>) {
+        if speech_active == self.active {
+            return;
+        }
+        self.active = speech_active;
+        if speech_active {
+            while let Some(samples) = self.pre_roll.pop_front() {
+                self.pre_roll_samples = self.pre_roll_samples.saturating_sub(samples.len());
+                let _ = events.send(Event::InputAudio { samples });
+            }
+        } else {
+            self.pre_roll.clear();
+            self.pre_roll_samples = 0;
+        }
+    }
+
+    fn push(
+        &mut self,
+        samples: Vec<i16>,
+        speech_active: bool,
+        events: &std::sync::mpsc::Sender<Event>,
+    ) {
+        if samples.is_empty() {
+            return;
+        }
+        self.sync(speech_active, events);
+        if self.active {
+            let _ = events.send(Event::InputAudio { samples });
+            return;
+        }
+        self.pre_roll_samples = self.pre_roll_samples.saturating_add(samples.len());
+        self.pre_roll.push_back(samples);
+        while self.pre_roll_samples > NATIVE_INPUT_PRE_ROLL_SAMPLES {
+            let overflow = self.pre_roll_samples - NATIVE_INPUT_PRE_ROLL_SAMPLES;
+            let Some(front) = self.pre_roll.front_mut() else {
+                self.pre_roll_samples = 0;
+                break;
+            };
+            if front.len() <= overflow {
+                self.pre_roll_samples = self.pre_roll_samples.saturating_sub(front.len());
+                self.pre_roll.pop_front();
+            } else {
+                front.drain(..overflow);
+                self.pre_roll_samples = self.pre_roll_samples.saturating_sub(overflow);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct NativeRemoteAudioGate {
+    pre_roll: VecDeque<Vec<i16>>,
+    pre_roll_samples: usize,
+    active: bool,
+    quiet_samples: usize,
+}
+
+impl NativeRemoteAudioGate {
+    fn push(&mut self, samples: Vec<i16>) -> Vec<Vec<i16>> {
+        if samples.is_empty() {
+            return Vec::new();
+        }
+        let voiced = pcm_rms(&samples) >= NATIVE_REMOTE_VOICE_RMS;
+        if !self.active {
+            self.pre_roll_samples = self.pre_roll_samples.saturating_add(samples.len());
+            self.pre_roll.push_back(samples);
+            while self.pre_roll_samples > NATIVE_REMOTE_PRE_ROLL_SAMPLES {
+                let overflow = self.pre_roll_samples - NATIVE_REMOTE_PRE_ROLL_SAMPLES;
+                let Some(front) = self.pre_roll.front_mut() else {
+                    self.pre_roll_samples = 0;
+                    break;
+                };
+                if front.len() <= overflow {
+                    self.pre_roll_samples = self.pre_roll_samples.saturating_sub(front.len());
+                    self.pre_roll.pop_front();
+                } else {
+                    front.drain(..overflow);
+                    self.pre_roll_samples = self.pre_roll_samples.saturating_sub(overflow);
+                }
+            }
+            if !voiced {
+                return Vec::new();
+            }
+            self.active = true;
+            self.quiet_samples = 0;
+            self.pre_roll_samples = 0;
+            return self.pre_roll.drain(..).collect();
+        }
+
+        if voiced {
+            self.quiet_samples = 0;
+        } else {
+            self.quiet_samples = self.quiet_samples.saturating_add(samples.len());
+        }
+        if self.quiet_samples >= NATIVE_REMOTE_TAIL_SAMPLES {
+            self.active = false;
+            self.quiet_samples = 0;
+            self.pre_roll.clear();
+            self.pre_roll_samples = 0;
+        }
+        vec![samples]
+    }
+}
+
+fn pcm_rms(samples: &[i16]) -> f64 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let square_sum = samples
+        .iter()
+        .map(|sample| {
+            let sample = f64::from(*sample);
+            sample * sample
+        })
+        .sum::<f64>();
+    (square_sum / samples.len() as f64).sqrt()
+}
+
 #[derive(Default)]
 struct CodexLiveState {
     response_number: u64,
@@ -1521,6 +1655,7 @@ async fn run_codex_live_connection(
         connection_started.elapsed().as_millis(),
     );
 
+    let mut local_audio = Some(peer.take_local_audio());
     let mut remote_audio = peer.take_remote_audio();
     let _ = events.send(Event::Connected);
     if pending_audio.sample_count() > 0 {
@@ -1536,6 +1671,9 @@ async fn run_codex_live_connection(
         }
     }
     let mut state = CodexLiveState::default();
+    let mut native_input_audio = NativeInputAudioCapture::default();
+    let mut native_remote_audio =
+        crate::gpt_live_webrtc::uses_platform_audio().then(NativeRemoteAudioGate::default);
     let mut handoff_state = CodexHandoffState::default();
     let mut latency_trace = GptLiveToolLatencyTrace::default();
     let mut in_flight_context_images = HashMap::<u64, InFlightContextImage>::new();
@@ -1769,12 +1907,37 @@ async fn run_codex_live_connection(
                     Some(Command::Connect(_)) => {}
                 }
             }
+            audio = async {
+                match local_audio.as_mut() {
+                    Some(receiver) => receiver.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match audio {
+                    Some(Ok(samples)) => native_input_audio.push(
+                        samples,
+                        state.input_item_id.is_some(),
+                        events,
+                    ),
+                    Some(Err(detail)) => {
+                        let _ = events.send(Event::Error(detail));
+                    }
+                    None => local_audio = None,
+                }
+            }
             audio = remote_audio.recv() => {
                 match audio {
                     Some(Ok(samples)) if !samples.is_empty() => {
-                        response_watchdog = None;
-                        handoff_state.note_spoken_output();
-                        emit_codex_live_remote_audio(&mut state, events, samples);
+                        let chunks = if let Some(gate) = &mut native_remote_audio {
+                            gate.push(samples)
+                        } else {
+                            vec![samples]
+                        };
+                        for samples in chunks {
+                            response_watchdog = None;
+                            handoff_state.note_spoken_output();
+                            emit_codex_live_remote_audio(&mut state, events, samples);
+                        }
                     }
                     Some(Ok(_)) => {}
                     Some(Err(detail)) => {
@@ -1896,6 +2059,7 @@ async fn run_codex_live_connection(
                     CodexHandoffAction::Handled => continue,
                 }
                 handle_codex_live_message(&message, events, &mut state)?;
+                native_input_audio.sync(state.input_item_id.is_some(), events);
             }
             _ = finish_tick.tick() => {
                 let now = Instant::now();
@@ -5484,7 +5648,8 @@ mod tests {
         CODEX_HANDOFF_FALLBACK_DELAY, CONNECT_AUDIO_BUFFER_MAX_SAMPLES,
         CONTEXT_IMAGE_UPLOAD_TIMEOUT, CodexContextImageResponse, CodexHandoffAction,
         CodexHandoffState, CodexLiveState, CodexTextState, ConnectOptions, Event,
-        InFlightContextImage, OPENAI_VAD_SILENCE_MS, PendingAudioBuffer,
+        InFlightContextImage, NATIVE_INPUT_PRE_ROLL_SAMPLES, NATIVE_REMOTE_TAIL_SAMPLES,
+        NativeInputAudioCapture, NativeRemoteAudioGate, OPENAI_VAD_SILENCE_MS, PendingAudioBuffer,
         PendingOpenAiContextUpload, RealtimeBackend, ServerSignal,
         codex_context_image_inject_params, codex_dynamic_tools, codex_live_initialize_capabilities,
         codex_live_realtime_start_params, codex_live_start_error, codex_live_thread_start_params,
@@ -5506,6 +5671,46 @@ mod tests {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use image::ImageFormat;
     use serde_json::{Value, json};
+
+    #[test]
+    fn native_input_audio_capture_flushes_bounded_preroll_and_active_audio() {
+        let (events, received) = std::sync::mpsc::channel();
+        let mut capture = NativeInputAudioCapture::default();
+        capture.push(vec![1; NATIVE_INPUT_PRE_ROLL_SAMPLES / 2], false, &events);
+        capture.push(vec![2; NATIVE_INPUT_PRE_ROLL_SAMPLES], false, &events);
+        assert!(received.try_recv().is_err());
+
+        capture.sync(true, &events);
+        assert!(matches!(
+            received.recv().unwrap(),
+            Event::InputAudio { samples }
+                if samples == vec![2; NATIVE_INPUT_PRE_ROLL_SAMPLES]
+        ));
+
+        capture.push(vec![3; 240], true, &events);
+        assert!(matches!(
+            received.recv().unwrap(),
+            Event::InputAudio { samples } if samples == vec![3; 240]
+        ));
+        capture.sync(false, &events);
+        capture.push(vec![4; 240], false, &events);
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
+    fn native_remote_audio_gate_ignores_comfort_noise_and_keeps_one_tail() {
+        let mut gate = NativeRemoteAudioGate::default();
+        assert!(gate.push(vec![0; 240]).is_empty());
+
+        let started = gate.push(vec![100; 240]);
+        assert_eq!(started, vec![vec![0; 240], vec![100; 240]]);
+
+        assert_eq!(
+            gate.push(vec![0; NATIVE_REMOTE_TAIL_SAMPLES]),
+            vec![vec![0; NATIVE_REMOTE_TAIL_SAMPLES]]
+        );
+        assert!(gate.push(vec![0; 240]).is_empty());
+    }
 
     #[test]
     fn preconnect_audio_buffer_preserves_chunk_order() {

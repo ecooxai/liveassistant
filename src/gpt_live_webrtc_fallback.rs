@@ -175,6 +175,9 @@ pub struct GptLivePeer {
     _rtp_sender: Arc<RTCRtpSender>,
     _events_channel: Arc<RTCDataChannel>,
     local_audio_tx: mpsc::UnboundedSender<Vec<i16>>,
+    #[allow(dead_code)]
+    local_capture: UnboundedReceiver<Result<Vec<i16>, String>>,
+    _local_capture_keepalive: UnboundedSender<Result<Vec<i16>, String>>,
     remote_audio: UnboundedReceiver<Result<Vec<i16>, String>>,
 }
 
@@ -227,6 +230,7 @@ impl GptLivePeer {
         tokio::spawn(async move { while rtcp_sender.read_rtcp().await.is_ok() {} });
 
         let (remote_audio_tx, remote_audio) = mpsc::unbounded_channel();
+        let (local_capture_keepalive, local_capture) = mpsc::unbounded_channel();
         let mut encoder = Encoder::new(INPUT_RATE as u32, Channels::Mono, Application::Voip)
             .context("Could not initialize GPT-Live Opus encoder")?;
         encoder
@@ -439,6 +443,8 @@ impl GptLivePeer {
                 _rtp_sender: rtp_sender,
                 _events_channel: events_channel,
                 local_audio_tx,
+                local_capture,
+                _local_capture_keepalive: local_capture_keepalive,
                 remote_audio,
             },
             offer_sdp,
@@ -473,6 +479,14 @@ impl GptLivePeer {
         self.local_audio_tx
             .send(samples.to_vec())
             .map_err(|_| anyhow::anyhow!("GPT-Live microphone sender stopped"))
+    }
+
+    /// The fallback path already exposes microphone PCM through the app capture
+    /// pipeline, so keep this transport-level receiver silent.
+    #[allow(dead_code)]
+    pub fn take_local_audio(&mut self) -> UnboundedReceiver<Result<Vec<i16>, String>> {
+        let (_sender, replacement) = mpsc::unbounded_channel();
+        std::mem::replace(&mut self.local_capture, replacement)
     }
 
     pub fn take_remote_audio(&mut self) -> UnboundedReceiver<Result<Vec<i16>, String>> {

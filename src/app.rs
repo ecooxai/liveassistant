@@ -33,8 +33,13 @@ const SETTINGS_KEY: &str = "live_assistant.settings";
 /// already visible and uploading before the user finishes the sentence.
 const SPEECH_SCREENSHOT_SAMPLE_TARGET: usize = 24_000 / 2;
 const CODEX_USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
-const ASSISTANT_WAV_SPLIT_MIN_SAMPLES: usize = 24_000 * 5;
 const MESSAGE_CONTINUATION_WINDOW: Duration = Duration::from_secs(5);
+
+fn app_plays_live_assistant_audio(backend: RealtimeBackend) -> bool {
+    backend != RealtimeBackend::CodexText
+        && !(backend == RealtimeBackend::CodexGptLive
+            && crate::gpt_live_webrtc::uses_platform_audio())
+}
 const LEGACY_CLICK_INSTRUCTION: &str = " Do not claim to click or change anything on the computer.";
 const LEGACY_DEFAULT_INSTRUCTIONS: &str = "You are a concise, helpful desktop voice assistant. \
     Stay silent until the user has finished speaking; never greet or speak just because the \
@@ -2181,6 +2186,23 @@ impl LiveAssistantApp {
                         let _ = self.realtime.commands.send(Command::CreateResponse);
                     }
                 }
+                Event::InputAudio { samples } => {
+                    if samples.is_empty() {
+                        continue;
+                    }
+                    let now = Instant::now();
+                    let index = self
+                        .active_voice_message
+                        .filter(|index| {
+                            self.messages.get(*index).is_some_and(|message| {
+                                message.role == Role::User && message.voice_turn
+                            })
+                        })
+                        .or_else(|| recent_voice_continuation_index(&self.messages, now));
+                    if let Some(index) = index {
+                        append_voice_audio_fragment(&mut self.messages[index], &samples, now);
+                    }
+                }
                 Event::InputCommitted { item_id } => {
                     let now = Instant::now();
                     let active = self.active_voice_message.filter(|index| {
@@ -2310,7 +2332,7 @@ impl LiveAssistantApp {
                                 .get(index)
                                 .is_some_and(|message| !message.text.trim().is_empty())
                         });
-                    if self.settings.backend != RealtimeBackend::CodexText
+                    if app_plays_live_assistant_audio(self.settings.backend)
                         && let Some(speaker) = &mut self.speaker
                     {
                         speaker.begin_assistant_response(
@@ -2375,7 +2397,7 @@ impl LiveAssistantApp {
                     if !self.response_is_active(&response_id) {
                         continue;
                     }
-                    if self.settings.backend != RealtimeBackend::CodexText
+                    if app_plays_live_assistant_audio(self.settings.backend)
                         && let Some(speaker) = &mut self.speaker
                     {
                         speaker.append_assistant(samples.clone());
@@ -2386,20 +2408,9 @@ impl LiveAssistantApp {
                 }
                 Event::AssistantSegmentDone { response_id } => {
                     if self.response_is_active(&response_id) {
-                        let long_segment = self
-                            .active_assistant_message
-                            .and_then(|index| self.messages.get(index))
-                            .is_some_and(|message| {
-                                message.role == Role::Assistant
-                                    && should_split_assistant_wav(message.audio.len())
-                            });
+                        // Keep the complete GPT-Live reply in one message WAV. The
+                        // transcript boundary only extends the continuation window.
                         self.touch_assistant_group(Instant::now());
-                        if long_segment {
-                            eprintln!(
-                                "[live-assistant assistant-group] long WAV split deferred for {}s",
-                                MESSAGE_CONTINUATION_WINDOW.as_secs()
-                            );
-                        }
                     }
                 }
                 Event::AssistantDone { response_id } => {
@@ -2413,7 +2424,7 @@ impl LiveAssistantApp {
                         {
                             message.finish();
                         }
-                        if self.settings.backend != RealtimeBackend::CodexText
+                        if app_plays_live_assistant_audio(self.settings.backend)
                             && let Some(speaker) = &mut self.speaker
                         {
                             speaker.finish_assistant_response();
@@ -3675,6 +3686,7 @@ impl LiveAssistantApp {
             | Event::AssistantSegmentDone { .. }
             | Event::SpeechStarted
             | Event::SpeechStopped
+            | Event::InputAudio { .. }
             | Event::InputCommitted { .. }
             | Event::InputTranscript { .. } => {}
         }
@@ -5790,10 +5802,6 @@ fn prompt_requires_screen_click(prompt: &str) -> bool {
     prompt.to_ascii_lowercase().contains("click")
 }
 
-fn should_split_assistant_wav(sample_count: usize) -> bool {
-    sample_count > ASSISTANT_WAV_SPLIT_MIN_SAMPLES
-}
-
 fn format_duration(seconds: f32) -> String {
     let total = seconds.round() as u32;
     format!("{}:{:02}", total / 60, total % 60)
@@ -6466,17 +6474,6 @@ mod tests {
         assert_eq!(messages[1].role, Role::Assistant);
         assert_eq!(messages[1].text, "current reply");
         assert_eq!(messages[1].audio, vec![1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn assistant_wav_splits_only_after_more_than_five_seconds() {
-        assert!(!should_split_assistant_wav(
-            ASSISTANT_WAV_SPLIT_MIN_SAMPLES - 1
-        ));
-        assert!(!should_split_assistant_wav(ASSISTANT_WAV_SPLIT_MIN_SAMPLES));
-        assert!(should_split_assistant_wav(
-            ASSISTANT_WAV_SPLIT_MIN_SAMPLES + 1
-        ));
     }
 
     #[test]

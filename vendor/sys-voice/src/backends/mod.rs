@@ -28,6 +28,7 @@ pub struct BackendHandle {
 pub(crate) enum PlaybackCommand {
     OneShot(Vec<f32>),
     StartStream(flume::Receiver<Vec<f32>>),
+    Clear,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -43,6 +44,16 @@ impl BackendHandle {
         control_tx
             .send(ControlCommand::SetVoiceProcessingBypassed(bypassed))
             .map_err(|_| AecError::BackendError("voice-processing control channel closed".to_string()))
+    }
+
+    pub fn clear_audio(&self) -> Result<(), AecError> {
+        self.playback_tx
+            .send(PlaybackCommand::Clear)
+            .map_err(|_| AecError::BackendError("playback channel closed".to_string()))
+    }
+
+    pub fn native_sample_rate(&self) -> u32 {
+        self.native_sample_rate
     }
 
     /// Play a complete audio buffer. For streaming audio, use `start_playback_stream`.

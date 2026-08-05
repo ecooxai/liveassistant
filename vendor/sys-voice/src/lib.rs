@@ -78,6 +78,25 @@ pub struct CaptureHandle {
 }
 
 #[derive(Clone)]
+pub struct PlaybackHandle {
+    backend: backends::BackendHandle,
+}
+
+impl PlaybackHandle {
+    pub fn play_audio(&self, samples: Vec<f32>, sample_rate: u32) -> Result<(), AecError> {
+        self.backend.play_audio(samples, sample_rate)
+    }
+
+    pub fn clear(&self) -> Result<(), AecError> {
+        self.backend.clear_audio()
+    }
+
+    pub fn native_sample_rate(&self) -> u32 {
+        self.backend.native_sample_rate()
+    }
+}
+
+#[derive(Clone)]
 pub struct CaptureControl {
     backend: backends::BackendHandle,
 }
@@ -147,6 +166,12 @@ impl CaptureHandle {
     /// owned by another thread.
     pub fn control_handle(&self) -> CaptureControl {
         CaptureControl {
+            backend: self.backend.clone(),
+        }
+    }
+
+    pub fn playback_handle(&self) -> PlaybackHandle {
+        PlaybackHandle {
             backend: self.backend.clone(),
         }
     }

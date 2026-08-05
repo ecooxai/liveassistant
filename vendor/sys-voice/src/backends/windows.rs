@@ -229,6 +229,7 @@ fn playback_loop(playback_rx: flume::Receiver<PlaybackCommand>) -> Result<(), Ae
                     );
                 }
             }
+            PlaybackCommand::Clear => {}
         }
     }
 

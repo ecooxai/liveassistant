@@ -60,6 +60,7 @@ fn run_playback(playback_rx: flume::Receiver<PlaybackCommand>) -> Result<(), Aec
                     write_samples(&playback_simple, &samples)?;
                 }
             }
+            PlaybackCommand::Clear => {}
         }
     }
 

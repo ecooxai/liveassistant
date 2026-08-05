@@ -13,7 +13,7 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-use sys_voice::{AecConfig, CaptureControl, CaptureHandle, Channels};
+use sys_voice::{AecConfig, CaptureControl, CaptureHandle, Channels, PlaybackHandle};
 use tokio::sync::mpsc::UnboundedSender;
 
 const PRE_ROLL_SAMPLES: usize = 24_000 * 3;
@@ -116,6 +116,7 @@ pub struct Microphone {
     turn: Arc<Mutex<TurnBuffer>>,
     level_bits: Arc<AtomicU32>,
     capture_control: CaptureControl,
+    playback_handle: PlaybackHandle,
     system_audio_passthrough: AtomicBool,
 }
 
@@ -139,6 +140,7 @@ impl Microphone {
         );
 
         let capture_control = capture.control_handle();
+        let playback_handle = capture.playback_handle();
         let turn = Arc::new(Mutex::new(TurnBuffer::default()));
         let level_bits = Arc::new(AtomicU32::new(0));
         let stop = Arc::new(AtomicBool::new(false));
@@ -207,6 +209,7 @@ impl Microphone {
             turn,
             level_bits,
             capture_control,
+            playback_handle,
             system_audio_passthrough: AtomicBool::new(false),
         })
     }
@@ -230,6 +233,10 @@ impl Microphone {
 
     pub fn system_audio_passthrough(&self) -> bool {
         self.system_audio_passthrough.load(Ordering::Relaxed)
+    }
+
+    pub fn playback_handle(&self) -> PlaybackHandle {
+        self.playback_handle.clone()
     }
     pub fn begin_turn(&self) {
         if let Ok(mut buffer) = self.turn.lock() {
@@ -453,12 +460,23 @@ fn build_message_input_stream(
 /// the output device's native rate. The device callback then performs only a
 /// transparent queue read: no gain, nonlinear limiting, or second resampling.
 pub struct Speaker {
-    _stream: Stream,
+    output: SpeakerOutput,
     playback: Arc<Mutex<PlaybackBuffer>>,
     output_resampler: StreamingResampler,
     assistant_started_at: Option<Instant>,
     assistant_received_samples: usize,
     assistant_logged_seconds: usize,
+}
+
+enum SpeakerOutput {
+    Cpal {
+        _stream: Stream,
+    },
+    Aec {
+        playback_handle: PlaybackHandle,
+        stop: Arc<AtomicBool>,
+        worker: Option<JoinHandle<()>>,
+    },
 }
 
 struct PlaybackBuffer {
@@ -485,27 +503,12 @@ impl Speaker {
             .context("Could not read the default audio output format")?;
         let sample_format = supported.sample_format();
         let config = supported.config();
-        let playback = Arc::new(Mutex::new(PlaybackBuffer {
-            samples_native: VecDeque::new(),
-            playing: false,
-            streaming_assistant: false,
-            response_complete: true,
-            low_watermark_samples: (config.sample_rate.0 as usize
-                * REALTIME_PLAYBACK_LOW_MS as usize)
-                / 1_000,
-            resume_watermark_samples: (config.sample_rate.0 as usize
-                * REALTIME_PLAYBACK_RESUME_MS as usize)
-                / 1_000,
-            resume_check_at: None,
-            resume_check_interval: Duration::from_millis(REALTIME_PLAYBACK_RECHECK_MS),
-            native_sample_rate: config.sample_rate.0,
-            played_assistant_samples_native: 0,
-        }));
+        let playback = new_playback_buffer(config.sample_rate.0);
         let stream = build_output_stream(&device, &config, sample_format, playback.clone())?;
         stream.play().context("Could not start the audio output")?;
         let output_resampler = StreamingResampler::new(PLAYBACK_RATE, config.sample_rate.0)?;
         eprintln!(
-            "[live-assistant speaker] device={:?} rate={} channels={} format={:?} gain=unity buffer_low_ms={} recheck_ms={}",
+            "[live-assistant speaker] mode=cpal device={:?} rate={} channels={} format={:?} gain=unity buffer_low_ms={} recheck_ms={}",
             device.name().ok(),
             config.sample_rate.0,
             config.channels,
@@ -515,7 +518,40 @@ impl Speaker {
         );
 
         Ok(Self {
-            _stream: stream,
+            output: SpeakerOutput::Cpal { _stream: stream },
+            playback,
+            output_resampler,
+            assistant_started_at: None,
+            assistant_received_samples: 0,
+            assistant_logged_seconds: 0,
+        })
+    }
+
+    /// Play assistant audio through the same VoiceProcessingIO unit that captures
+    /// the microphone. Feeding the far-end signal into that unit gives macOS AEC
+    /// an exact reference instead of asking it to infer separate CPAL playback.
+    pub fn new_aec(playback_handle: PlaybackHandle) -> Result<Self> {
+        let native_sample_rate = playback_handle.native_sample_rate();
+        let playback = new_playback_buffer(native_sample_rate);
+        let output_resampler = StreamingResampler::new(PLAYBACK_RATE, native_sample_rate)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = spawn_aec_output_worker(
+            playback.clone(),
+            playback_handle.clone(),
+            stop.clone(),
+            native_sample_rate,
+        )?;
+        eprintln!(
+            "[live-assistant speaker] mode=voice-processing-aec rate={} channels=1 gain=unity buffer_low_ms={} recheck_ms={}",
+            native_sample_rate, REALTIME_PLAYBACK_LOW_MS, REALTIME_PLAYBACK_RECHECK_MS
+        );
+
+        Ok(Self {
+            output: SpeakerOutput::Aec {
+                playback_handle,
+                stop,
+                worker: Some(worker),
+            },
             playback,
             output_resampler,
             assistant_started_at: None,
@@ -613,6 +649,14 @@ impl Speaker {
     pub fn clear(&mut self) -> Result<()> {
         self.reset_assistant_clock();
         self.replace_native_output(&[]);
+        if let SpeakerOutput::Aec {
+            playback_handle, ..
+        } = &self.output
+        {
+            playback_handle
+                .clear()
+                .context("Could not clear VoiceProcessingIO playback")?;
+        }
         Ok(())
     }
 
@@ -667,6 +711,93 @@ impl Speaker {
             playback.playing = !samples.is_empty();
             playback.resume_check_at = None;
             playback.played_assistant_samples_native = 0;
+        }
+    }
+}
+
+fn new_playback_buffer(native_sample_rate: u32) -> Arc<Mutex<PlaybackBuffer>> {
+    Arc::new(Mutex::new(PlaybackBuffer {
+        samples_native: VecDeque::new(),
+        playing: false,
+        streaming_assistant: false,
+        response_complete: true,
+        low_watermark_samples: (native_sample_rate as usize * REALTIME_PLAYBACK_LOW_MS as usize)
+            / 1_000,
+        resume_watermark_samples: (native_sample_rate as usize
+            * REALTIME_PLAYBACK_RESUME_MS as usize)
+            / 1_000,
+        resume_check_at: None,
+        resume_check_interval: Duration::from_millis(REALTIME_PLAYBACK_RECHECK_MS),
+        native_sample_rate,
+        played_assistant_samples_native: 0,
+    }))
+}
+
+fn aec_output_chunk_samples(native_sample_rate: u32) -> usize {
+    (native_sample_rate as usize / 100).max(1)
+}
+
+fn spawn_aec_output_worker(
+    playback: Arc<Mutex<PlaybackBuffer>>,
+    playback_handle: PlaybackHandle,
+    stop: Arc<AtomicBool>,
+    native_sample_rate: u32,
+) -> Result<JoinHandle<()>> {
+    let chunk_samples = aec_output_chunk_samples(native_sample_rate);
+    let chunk_period = Duration::from_secs_f64(chunk_samples as f64 / native_sample_rate as f64);
+    thread::Builder::new()
+        .name("aec-speaker-writer".into())
+        .spawn(move || {
+            let mut next_write = Instant::now();
+            while !stop.load(Ordering::Relaxed) {
+                let now = Instant::now();
+                let samples = if let Ok(mut playback) = playback.lock() {
+                    if playback_ready_for_callback(&mut playback, now) {
+                        let sample_count = chunk_samples.min(playback.samples_native.len());
+                        let samples = (0..sample_count)
+                            .map(|_| pop_native_sample(&mut playback))
+                            .collect::<Vec<_>>();
+                        finish_output_callback(&mut playback, now);
+                        samples
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                if !samples.is_empty()
+                    && let Err(error) = playback_handle.play_audio(samples, native_sample_rate)
+                {
+                    eprintln!("VoiceProcessingIO playback error: {error}");
+                    break;
+                }
+
+                next_write += chunk_period;
+                let now = Instant::now();
+                if next_write > now {
+                    thread::sleep(next_write - now);
+                } else {
+                    next_write = now;
+                }
+            }
+        })
+        .context("Could not start the AEC speaker writer thread")
+}
+
+impl Drop for Speaker {
+    fn drop(&mut self) {
+        if let SpeakerOutput::Aec {
+            playback_handle,
+            stop,
+            worker,
+        } = &mut self.output
+        {
+            stop.store(true, Ordering::Relaxed);
+            let _ = playback_handle.clear();
+            if let Some(worker) = worker.take() {
+                let _ = worker.join();
+            }
         }
     }
 }
@@ -863,6 +994,12 @@ mod tests {
     #[test]
     fn microphone_message_preroll_is_three_seconds() {
         assert_eq!(PRE_ROLL_SAMPLES, 24_000 * 3);
+    }
+
+    #[test]
+    fn aec_output_uses_ten_millisecond_chunks() {
+        assert_eq!(aec_output_chunk_samples(48_000), 480);
+        assert_eq!(aec_output_chunk_samples(24_000), 240);
     }
 
     #[test]

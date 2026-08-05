@@ -19,7 +19,7 @@ WebSocket API. It supports:
 - GPT-Live and Realtime tabs open by default with GPT-Live first and auto-connecting, plus a manual down-arrow control instead of automatic transcript scrolling
 - OpenAI Realtime has an optional tool-first prompt appendix, delegates screenshot-backed clicks to a text model for accuracy, and GPT-Live clicks directly
 - OpenAI Realtime retains its conservative one-second playback gate
-- on macOS, GPT-Live uses the app-owned VoiceProcessingIO AEC microphone and WebRTC/CPAL audio path so unrelated system playback is removed from mic input
+- on macOS, GPT-Live routes microphone capture and assistant playback through one VoiceProcessingIO unit so AEC receives the exact far-end signal before mic PCM reaches WebRTC
 - hold either Command key for one second to temporarily let the microphone hear system audio; release Command to restore cancellation immediately
 - GPT-Live suppresses duplicate sideband PCM notifications while WebRTC owns audio
 - Realtime function tools for screenshot-relative clicks, Bash commands, and text insertion
@@ -125,9 +125,9 @@ capture is taken after the first live transcript token (or the local clear-speec
 fallback where available), not continuously. Disable per-turn screenshots in
 Settings. Press **Stop** to close the transport and audio devices.
 
-GPT-Live uses the app-owned WebRTC sender/receiver and normal output device. On
-macOS, microphone capture runs through VoiceProcessingIO so system/speaker audio
-is removed before PCM reaches GPT-Live. App-server
+GPT-Live uses the app-owned WebRTC sender/receiver. On macOS, microphone
+capture and assistant playback share one VoiceProcessingIO unit, giving acoustic
+echo cancellation the exact speaker signal before PCM reaches GPT-Live. App-server
 `thread/realtime/outputAudio/delta` notifications are opted out and ignored
 defensively to prevent duplicate audio. The platform-ADM implementation remains
 available through `--test-gpt-live-native` as a transport diagnostic.
@@ -137,15 +137,16 @@ treats screenshot/application text as untrusted content. Bash commands time out
 after 30 seconds, and their stdout and stderr are capped before being returned
 to the model.
 
-Assistant speech uses the normal native output device at full fidelity and
-volume. The always-open microphone uses OS voice-processing capture, which
-monitors/links system output as its acoustic echo-cancellation reference. On
-Linux, system-wide AEC requires PulseAudio `module-echo-cancel`; macOS uses
-VoiceProcessingIO and Windows uses WASAPI AEC. On macOS 14 and newer, the app
-requests activity-aware near-unity media ducking so cancellation does not make
-normal playback noticeably quieter. Hold either Command key for one second to
-bypass voice processing and include system audio in the microphone only while
-the key remains held.
+During a voice session, assistant speech is played at unity gain through the
+same OS voice-processing engine that owns microphone capture. This paired path
+provides the strongest available echo reference while keeping the microphone
+fully duplex for barge-in. On Linux, system-wide AEC requires PulseAudio
+`module-echo-cancel`; macOS uses VoiceProcessingIO and Windows uses WASAPI AEC.
+On macOS 14 and newer, the app requests activity-aware near-unity media ducking
+so cancellation does not make normal playback noticeably quieter. Hold either
+Command key for one second to bypass voice processing and include system audio
+in the microphone only while the key remains held. Offline WAV replay uses the
+normal output device.
 
 Uploaded audio is decoded locally, converted to mono 24 kHz PCM, and then sent
 as an `input_audio` conversation item. User voice turns can be replayed or

@@ -95,15 +95,15 @@ pub fn create_backend(
         )
         .map_err(|e| AecError::BackendError(format!("failed to enable input: {e:?}")))?;
 
-    // let enable_output: u32 = 1;
-    // audio_unit
-    //     .set_property(
-    //         coreaudio::sys::kAudioOutputUnitProperty_EnableIO,
-    //         Scope::Output,
-    //         Element::Output,
-    //         Some(&enable_output),
-    //     )
-    //     .map_err(|e| AecError::BackendError(format!("failed to enable output: {e:?}")))?;
+    let enable_output: u32 = 1;
+    audio_unit
+        .set_property(
+            coreaudio::sys::kAudioOutputUnitProperty_EnableIO,
+            Scope::Output,
+            Element::Output,
+            Some(&enable_output),
+        )
+        .map_err(|e| AecError::BackendError(format!("failed to enable output: {e:?}")))?;
 
     // Query native format - VoiceProcessingIO has strict requirements
     let native_format = audio_unit
@@ -201,6 +201,11 @@ pub fn create_backend(
                             b.samples.extend(samples);
                         }
                     });
+                }
+                PlaybackCommand::Clear => {
+                    if let Ok(mut buf) = buffer_for_playback.lock() {
+                        buf.samples.clear();
+                    }
                 }
             }
         }

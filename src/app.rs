@@ -1946,14 +1946,31 @@ impl LiveAssistantApp {
         }
     }
 
-    fn fail_start(&mut self, message: String, show_settings: bool) {
-        let _ = self.realtime.commands.send(Command::Disconnect);
-        self.microphone = None;
-        self.message_recorder = None;
+    fn close_audio_devices(&mut self) {
         self.playing_message_audio = None;
         if let Some(speaker) = &mut self.speaker {
             let _ = speaker.clear();
         }
+        // Drop the paired output before capture. The AEC speaker owns a playback
+        // handle into the microphone's VoiceProcessingIO unit.
+        self.speaker = None;
+        self.microphone = None;
+        self.message_recorder = None;
+    }
+
+    fn open_voice_audio(&mut self) -> anyhow::Result<()> {
+        self.close_audio_devices();
+        let microphone = Microphone::start(self.realtime.commands.clone())?;
+        let speaker = Speaker::new_aec(microphone.playback_handle())
+            .context("Could not open paired AEC audio output")?;
+        self.microphone = Some(microphone);
+        self.speaker = Some(speaker);
+        Ok(())
+    }
+
+    fn fail_start(&mut self, message: String, show_settings: bool) {
+        let _ = self.realtime.commands.send(Command::Disconnect);
+        self.close_audio_devices();
         self.state = ConnectionState::Offline;
         self.status = "Ready".to_owned();
         self.show_settings |= show_settings;
@@ -2021,12 +2038,8 @@ impl LiveAssistantApp {
 
     fn start(&mut self) {
         self.error = None;
-        if self.playing_message_audio.take().is_some()
-            && let Some(speaker) = &mut self.speaker
-        {
-            let _ = speaker.clear();
-        }
         if self.settings.backend == RealtimeBackend::CodexText {
+            self.close_audio_devices();
             self.start_text();
             return;
         }
@@ -2035,13 +2048,7 @@ impl LiveAssistantApp {
         {
             // Match Codex's native WebRTC architecture: one platform ADM owns
             // microphone capture, AEC, jitter buffering, and speaker playout.
-            // Opening parallel CPAL/VoiceProcessingIO streams here can compete
-            // with libWebRTC and cause stalls or broken acoustic timing.
-            self.microphone = None;
-            if let Some(speaker) = &mut self.speaker {
-                let _ = speaker.clear();
-            }
-            self.speaker = None;
+            self.close_audio_devices();
             match MessageRecorder::start() {
                 Ok(recorder) => self.message_recorder = Some(recorder),
                 Err(error) => {
@@ -2055,23 +2062,11 @@ impl LiveAssistantApp {
             self.state = ConnectionState::Connecting;
             self.status = "Connecting native WebRTC audio…".to_owned();
         } else {
-            self.message_recorder = None;
-            if self.speaker.is_none() {
-                match Speaker::new() {
-                    Ok(speaker) => self.speaker = Some(speaker),
-                    Err(error) => {
-                        self.fail_start(format!("Could not open audio output: {error:#}"), false);
-                        return;
-                    }
-                }
-            }
-
-            // Open capture as the first connection action. Audio chunks produced while
-            // credentials, screen metadata, and the transport are being prepared stay
-            // ordered in the realtime supervisor's bounded pre-connect buffer.
-            match Microphone::start(self.realtime.commands.clone()) {
-                Ok(microphone) => {
-                    self.microphone = Some(microphone);
+            // Open capture and its paired VoiceProcessingIO output as the first
+            // connection action. Audio produced while credentials and transport
+            // setup run stays ordered in the pre-connect buffer.
+            match self.open_voice_audio() {
+                Ok(()) => {
                     self.state = ConnectionState::Connecting;
                     self.status = "Recording while connecting…".to_owned();
                 }
@@ -2137,12 +2132,7 @@ impl LiveAssistantApp {
 
     fn stop(&mut self) {
         let _ = self.realtime.commands.send(Command::Disconnect);
-        self.microphone = None;
-        self.message_recorder = None;
-        self.playing_message_audio = None;
-        if let Some(speaker) = &mut self.speaker {
-            let _ = speaker.clear();
-        }
+        self.close_audio_devices();
         self.state = ConnectionState::Offline;
         self.active_response_id = None;
         self.last_assistant_item_id = None;
@@ -2256,17 +2246,12 @@ impl LiveAssistantApp {
                     self.error = None;
                     self.flush_pending_turn();
                 }
-                Event::Connected => match Microphone::start(self.realtime.commands.clone()) {
-                    Ok(mic) if self.speaker.is_some() => {
-                        self.microphone = Some(mic);
+                Event::Connected => match self.open_voice_audio() {
+                    Ok(()) => {
                         self.state = ConnectionState::Live;
                         self.status = "AEC listening".to_owned();
                         self.error = None;
                         self.flush_pending_turn();
-                    }
-                    Ok(_) => {
-                        self.error = Some("No audio output device is available".to_owned());
-                        self.stop();
                     }
                     Err(error) => {
                         self.error = Some(format!("{error:#}"));
@@ -2275,12 +2260,7 @@ impl LiveAssistantApp {
                 },
                 Event::Disconnected => {
                     self.fail_pending_context_uploads();
-                    self.microphone = None;
-                    self.message_recorder = None;
-                    self.playing_message_audio = None;
-                    if let Some(speaker) = &mut self.speaker {
-                        let _ = speaker.clear();
-                    }
+                    self.close_audio_devices();
                     self.state = ConnectionState::Offline;
                     self.active_response_id = None;
                     self.last_assistant_item_id = None;

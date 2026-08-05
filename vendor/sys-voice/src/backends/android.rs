@@ -188,6 +188,11 @@ fn run_playback_loop(
                     }
                 });
             }
+            PlaybackCommand::Clear => {
+                if let Ok(mut buffer) = playback_buffer.lock() {
+                    buffer.clear();
+                }
+            }
         }
     }
 }

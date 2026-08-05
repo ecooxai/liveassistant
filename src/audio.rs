@@ -35,6 +35,10 @@ const REALTIME_PLAYBACK_RECHECK_MS: u64 = 2_000;
 const GPT_LIVE_PLAYBACK_LOW_MS: u32 = 80;
 const GPT_LIVE_PLAYBACK_RESUME_MS: u32 = 320;
 const GPT_LIVE_PLAYBACK_RECHECK_MS: u64 = 20;
+/// VoiceProcessingIO has its own render queue. Feed it in short bursts with
+/// enough headroom to survive normal scheduler jitter without adding a second
+/// start/stop hysteresis after playback has begun.
+const AEC_OUTPUT_BURST_MS: u32 = 120;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct AssistantPlaybackPolicy {
@@ -737,6 +741,45 @@ fn aec_output_chunk_samples(native_sample_rate: u32) -> usize {
     (native_sample_rate as usize / 100).max(1)
 }
 
+fn aec_output_burst_samples(native_sample_rate: u32) -> usize {
+    (native_sample_rate as usize * AEC_OUTPUT_BURST_MS as usize / 1_000).max(1)
+}
+
+fn aec_playback_ready(playback: &mut PlaybackBuffer, now: Instant) -> bool {
+    if playback.samples_native.is_empty() {
+        // The VoiceProcessingIO render queue may still contain audio that was
+        // already handed off. Do not reset `playing` here: doing so made every
+        // brief producer gap wait for the full resume watermark again.
+        return false;
+    }
+
+    if !playback.streaming_assistant || playback.response_complete {
+        playback.playing = true;
+        playback.resume_check_at = None;
+        return true;
+    }
+
+    if playback.playing {
+        return true;
+    }
+
+    let Some(check_at) = playback.resume_check_at else {
+        playback.resume_check_at = Some(now + playback.resume_check_interval);
+        return false;
+    };
+    if now < check_at {
+        return false;
+    }
+    if playback.samples_native.len() > playback.resume_watermark_samples {
+        playback.playing = true;
+        playback.resume_check_at = None;
+        return true;
+    }
+
+    playback.resume_check_at = Some(now + playback.resume_check_interval);
+    false
+}
+
 fn spawn_aec_output_worker(
     playback: Arc<Mutex<PlaybackBuffer>>,
     playback_handle: PlaybackHandle,
@@ -744,6 +787,7 @@ fn spawn_aec_output_worker(
     native_sample_rate: u32,
 ) -> Result<JoinHandle<()>> {
     let chunk_samples = aec_output_chunk_samples(native_sample_rate);
+    let burst_samples = aec_output_burst_samples(native_sample_rate);
     let chunk_period = Duration::from_secs_f64(chunk_samples as f64 / native_sample_rate as f64);
     thread::Builder::new()
         .name("aec-speaker-writer".into())
@@ -752,13 +796,15 @@ fn spawn_aec_output_worker(
             while !stop.load(Ordering::Relaxed) {
                 let now = Instant::now();
                 let samples = if let Ok(mut playback) = playback.lock() {
-                    if playback_ready_for_callback(&mut playback, now) {
-                        let sample_count = chunk_samples.min(playback.samples_native.len());
-                        let samples = (0..sample_count)
+                    if aec_playback_ready(&mut playback, now) {
+                        // Hand off a burst rather than one exactly-timed 10 ms
+                        // frame. The audio unit consumes this queue on its own
+                        // hardware clock, so the extra headroom prevents gaps
+                        // when this normal-priority writer wakes a little late.
+                        let sample_count = burst_samples.min(playback.samples_native.len());
+                        (0..sample_count)
                             .map(|_| pop_native_sample(&mut playback))
-                            .collect::<Vec<_>>();
-                        finish_output_callback(&mut playback, now);
-                        samples
+                            .collect::<Vec<_>>()
                     } else {
                         Vec::new()
                     }
@@ -1000,6 +1046,32 @@ mod tests {
     fn aec_output_uses_ten_millisecond_chunks() {
         assert_eq!(aec_output_chunk_samples(48_000), 480);
         assert_eq!(aec_output_chunk_samples(24_000), 240);
+    }
+
+    #[test]
+    fn aec_output_bursts_keep_scheduler_headroom() {
+        assert_eq!(aec_output_burst_samples(48_000), 5_760);
+        assert_eq!(aec_output_burst_samples(24_000), 2_880);
+    }
+
+    #[test]
+    fn aec_output_does_not_rebuffer_after_a_short_staging_gap() {
+        let now = Instant::now();
+        let mut playback = test_playback([0.25, -0.5, 0.75, 0.5]);
+        playback.playing = true;
+
+        assert!(aec_playback_ready(&mut playback, now));
+        while !playback.samples_native.is_empty() {
+            let _ = pop_native_sample(&mut playback);
+        }
+        assert!(!aec_playback_ready(&mut playback, now));
+        assert!(playback.playing);
+
+        playback.samples_native.push_back(0.125);
+        assert!(aec_playback_ready(
+            &mut playback,
+            now + Duration::from_millis(1)
+        ));
     }
 
     #[test]

@@ -1,10 +1,12 @@
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
-use std::{fmt::Display, sync::mpsc, thread, time::Duration};
+use std::{collections::VecDeque, fmt::Display, sync::mpsc, thread, time::Duration};
 use tokio::sync::mpsc::{self as tokio_mpsc, UnboundedReceiver, UnboundedSender};
 
 use libwebrtc::{
     MediaType,
+    audio_frame::AudioFrame,
+    audio_source::{AudioSourceOptions, native::NativeAudioSource},
     audio_stream::native::{NativeAudioStream, NativeAudioStreamOptions},
     data_channel::{DataChannel, DataChannelInit},
     media_stream_track::MediaStreamTrack,
@@ -17,6 +19,8 @@ use libwebrtc::{
 };
 
 const ICE_GATHER_TIMEOUT: Duration = Duration::from_secs(15);
+const AUDIO_SAMPLE_RATE: u32 = 24_000;
+const AUDIO_FRAME_SAMPLES: usize = AUDIO_SAMPLE_RATE as usize / 100;
 
 enum Command {
     ApplyAnswer {
@@ -34,19 +38,23 @@ struct SessionHandle {
 struct StartedSession {
     offer_sdp: String,
     handle: SessionHandle,
+    local_audio_tx: UnboundedSender<Vec<i16>>,
     remote_audio: UnboundedReceiver<Result<Vec<i16>, String>>,
 }
 
 struct NativePeer {
     peer_connection: PeerConnection,
     _events_channel: DataChannel,
+    _local_audio_source: NativeAudioSource,
 }
 
-/// macOS GPT-Live transport using the same architecture as Codex's native
-/// implementation: Google libWebRTC owns microphone capture, AEC, adaptive
-/// jitter buffering, Opus PLC, clock drift correction, and speaker playout.
+/// macOS GPT-Live transport with app-owned audio devices and native
+/// libWebRTC media processing. VoiceProcessingIO performs acoustic echo
+/// cancellation while libWebRTC provides Opus, NetEQ jitter buffering,
+/// packet-loss concealment, clock correction, and remote decoding.
 pub struct GptLivePeer {
     handle: SessionHandle,
+    local_audio_tx: UnboundedSender<Vec<i16>>,
     remote_audio: UnboundedReceiver<Result<Vec<i16>, String>>,
 }
 
@@ -58,6 +66,7 @@ impl GptLivePeer {
         Ok((
             Self {
                 handle: started.handle,
+                local_audio_tx: started.local_audio_tx,
                 remote_audio: started.remote_audio,
             },
             started.offer_sdp,
@@ -80,14 +89,19 @@ impl GptLivePeer {
         .context("GPT-Live native WebRTC answer task panicked")?
     }
 
-    /// Native libWebRTC captures and packetizes the microphone itself. The app
-    /// deliberately does not inject a second PCM/RTP microphone stream.
-    pub async fn send_pcm24k(&self, _samples: &[i16]) -> Result<()> {
-        Ok(())
+    /// Inject VoiceProcessingIO-cleaned 24 kHz mono microphone PCM into
+    /// libWebRTC's encoder.
+    pub async fn send_pcm24k(&self, samples: &[i16]) -> Result<()> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        self.local_audio_tx
+            .send(samples.to_vec())
+            .map_err(|_| anyhow::anyhow!("GPT-Live native microphone sender stopped"))
     }
 
-    /// Return a capture-only copy of the decoded remote track. Native libWebRTC
-    /// continues rendering the same track directly through the platform ADM.
+    /// Return NetEQ-decoded remote PCM for VoiceProcessingIO playout and
+    /// message replay/export.
     pub fn take_remote_audio(&mut self) -> UnboundedReceiver<Result<Vec<i16>, String>> {
         let (_keepalive, replacement) = tokio_mpsc::unbounded_channel();
         std::mem::replace(&mut self.remote_audio, replacement)
@@ -101,11 +115,12 @@ impl GptLivePeer {
 fn start_native_session() -> Result<StartedSession> {
     let (command_tx, command_rx) = mpsc::channel();
     let (offer_tx, offer_rx) = mpsc::channel();
+    let (local_audio_tx, local_audio_rx) = tokio_mpsc::unbounded_channel();
     let (remote_audio_tx, remote_audio) = tokio_mpsc::unbounded_channel();
 
     thread::Builder::new()
         .name("live-assistant-gpt-live-webrtc".to_owned())
-        .spawn(move || worker_main(command_rx, offer_tx, remote_audio_tx))
+        .spawn(move || worker_main(command_rx, offer_tx, local_audio_rx, remote_audio_tx))
         .context("Could not spawn native GPT-Live WebRTC worker")?;
 
     let offer_sdp = offer_rx
@@ -114,6 +129,7 @@ fn start_native_session() -> Result<StartedSession> {
     Ok(StartedSession {
         offer_sdp,
         handle: SessionHandle { command_tx },
+        local_audio_tx,
         remote_audio,
     })
 }
@@ -121,6 +137,7 @@ fn start_native_session() -> Result<StartedSession> {
 fn worker_main(
     command_rx: mpsc::Receiver<Command>,
     offer_tx: mpsc::Sender<Result<String>>,
+    local_audio_rx: UnboundedReceiver<Vec<i16>>,
     remote_audio_tx: UnboundedSender<Result<Vec<i16>, String>>,
 ) {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -135,7 +152,10 @@ fn worker_main(
         }
     };
 
-    let native_peer = match runtime.block_on(create_peer_connection_and_offer(remote_audio_tx)) {
+    let native_peer = match runtime.block_on(create_peer_connection_and_offer(
+        local_audio_rx,
+        remote_audio_tx,
+    )) {
         Ok((peer, offer_sdp)) => {
             let _ = offer_tx.send(Ok(offer_sdp));
             peer
@@ -163,9 +183,16 @@ fn worker_main(
 }
 
 async fn create_peer_connection_and_offer(
+    mut local_audio_rx: UnboundedReceiver<Vec<i16>>,
     remote_audio_tx: UnboundedSender<Result<Vec<i16>, String>>,
 ) -> Result<(NativePeer, String)> {
-    let factory = PeerConnectionFactory::with_platform_adm();
+    // The app owns VoiceProcessingIO capture and playout. An external-audio
+    // factory avoids a second platform ADM competing for the same devices.
+    let factory = PeerConnectionFactory::default();
+    eprintln!(
+        "[live-assistant webrtc-native] mode=external-audio mic_rate={} remote=neteq aec=voiceprocessingio",
+        AUDIO_SAMPLE_RATE
+    );
     let peer_connection = factory
         .create_peer_connection(RtcConfiguration::default())
         .map_err(|error| {
@@ -182,12 +209,47 @@ async fn create_peer_connection_and_offer(
             },
         )
         .map_err(|error| message_error("Could not add native GPT-Live audio transceiver", error))?;
-    let local_audio_source = factory.create_audio_source();
-    let local_audio_track = factory.create_audio_track("realtime-mic", local_audio_source);
+    let local_audio_source = NativeAudioSource::new(
+        AudioSourceOptions {
+            // VoiceProcessingIO already performed input processing. A second
+            // APM pass causes pumping, clipping, and intelligibility loss.
+            echo_cancellation: false,
+            noise_suppression: false,
+            auto_gain_control: false,
+        },
+        AUDIO_SAMPLE_RATE,
+        1,
+        1_000,
+    );
+    let local_audio_track = factory.create_audio_track("realtime-mic", local_audio_source.clone());
     audio_transceiver
         .sender()
         .set_track(Some(local_audio_track.into()))
         .map_err(|error| message_error("Could not attach native GPT-Live microphone", error))?;
+
+    let local_audio_writer = local_audio_source.clone();
+    let local_audio_errors = remote_audio_tx.clone();
+    tokio::spawn(async move {
+        let mut pending = VecDeque::<i16>::new();
+        while let Some(samples) = local_audio_rx.recv().await {
+            pending.extend(samples);
+            while pending.len() >= AUDIO_FRAME_SAMPLES {
+                let frame_samples = pending.drain(..AUDIO_FRAME_SAMPLES).collect::<Vec<_>>();
+                let frame = AudioFrame {
+                    data: frame_samples.into(),
+                    sample_rate: AUDIO_SAMPLE_RATE,
+                    num_channels: 1,
+                    samples_per_channel: AUDIO_FRAME_SAMPLES as u32,
+                };
+                if let Err(error) = local_audio_writer.capture_frame(&frame).await {
+                    let _ = local_audio_errors.send(Err(format!(
+                        "Could not inject microphone PCM into GPT-Live libWebRTC: {error}"
+                    )));
+                    return;
+                }
+            }
+        }
+    });
 
     let remote_runtime = tokio::runtime::Handle::current();
     peer_connection.on_track(Some(Box::new(move |event| {
@@ -247,6 +309,7 @@ async fn create_peer_connection_and_offer(
         NativePeer {
             peer_connection,
             _events_channel: events_channel,
+            _local_audio_source: local_audio_source,
         },
         offer_sdp,
     ))

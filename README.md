@@ -19,7 +19,7 @@ WebSocket API. It supports:
 - GPT-Live and Realtime tabs open by default with GPT-Live first and auto-connecting, plus a manual down-arrow control instead of automatic transcript scrolling
 - OpenAI Realtime has an optional tool-first prompt appendix, delegates screenshot-backed clicks to a text model for accuracy, and GPT-Live clicks directly
 - OpenAI Realtime retains its conservative one-second playback gate
-- on macOS, GPT-Live routes microphone capture and assistant playback through one VoiceProcessingIO unit so AEC receives the exact far-end signal before mic PCM reaches WebRTC
+- on macOS, VoiceProcessingIO keeps system-audio cancellation while native libWebRTC NetEQ supplies smooth decoded assistant PCM for both live playback and WAV replay
 - hold either Command key for one second to temporarily let the microphone hear system audio; release Command to restore cancellation immediately
 - GPT-Live suppresses duplicate sideband PCM notifications while WebRTC owns audio
 - Realtime function tools for screenshot-relative clicks, Bash commands, and text insertion
@@ -125,12 +125,13 @@ capture is taken after the first live transcript token (or the local clear-speec
 fallback where available), not continuously. Disable per-turn screenshots in
 Settings. Press **Stop** to close the transport and audio devices.
 
-GPT-Live uses the app-owned WebRTC sender/receiver. On macOS, microphone
-capture and assistant playback share one VoiceProcessingIO unit, giving acoustic
-echo cancellation the exact speaker signal before PCM reaches GPT-Live. App-server
-`thread/realtime/outputAudio/delta` notifications are opted out and ignored
-defensively to prevent duplicate audio. The platform-ADM implementation remains
-available through `--test-gpt-live-native` as a transport diagnostic.
+On macOS, GPT-Live keeps microphone capture and assistant playback paired in
+one VoiceProcessingIO unit so acoustic echo cancellation receives the exact
+far-end signal. The cleaned microphone PCM is injected into native libWebRTC,
+and assistant audio comes back through libWebRTC NetEQ for adaptive jitter
+buffering, packet-loss concealment, clock correction, and clean WAV replay.
+App-server `thread/realtime/outputAudio/delta` notifications remain opted out to
+prevent duplicate audio.
 
 Computer tools run with the current user's permissions. The session prompt
 treats screenshot/application text as untrusted content. Bash commands time out

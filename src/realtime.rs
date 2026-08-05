@@ -1612,7 +1612,7 @@ async fn run_codex_live_connection(
     }
     let mut state = CodexLiveState::default();
     let mut native_remote_audio =
-        crate::gpt_live_webrtc::uses_platform_audio().then(NativeRemoteAudioGate::default);
+        crate::gpt_live_webrtc::uses_native_remote_audio().then(NativeRemoteAudioGate::default);
     let mut handoff_state = CodexHandoffState::default();
     let mut latency_trace = GptLiveToolLatencyTrace::default();
     let mut in_flight_context_images = HashMap::<u64, InFlightContextImage>::new();

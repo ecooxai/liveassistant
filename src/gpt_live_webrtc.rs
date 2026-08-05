@@ -5,10 +5,12 @@ mod fallback;
 #[path = "gpt_live_webrtc_native.rs"]
 mod native;
 
-// Production uses the app-owned microphone and speaker path on every platform.
-// This gives macOS VoiceProcessingIO a controllable AEC path and avoids the
-// platform ADM's inability to cancel unrelated system playback.
+// macOS combines app-owned VoiceProcessingIO devices with libWebRTC's
+// external-audio encoder and NetEQ decoder. Other platforms retain raw RTP.
+#[cfg(not(target_os = "macos"))]
 pub use fallback::GptLivePeer;
+#[cfg(target_os = "macos")]
+pub use native::GptLivePeer;
 
 // Keep the deterministic raw-RTP peer for transport probes on every platform.
 pub(crate) use fallback::GptLivePeer as GptLiveProbePeer;
@@ -16,18 +18,29 @@ pub(crate) use fallback::GptLivePeer as GptLiveProbePeer;
 #[cfg(target_os = "macos")]
 pub(crate) use native::GptLivePeer as GptLiveNativePeer;
 
-/// Production audio is owned by the app so VoiceProcessingIO can remove
-/// unrelated macOS system playback before microphone PCM reaches GPT-Live.
+/// Audio devices stay app-owned so VoiceProcessingIO can cancel unrelated
+/// system playback and receive the exact assistant-output reference.
 pub const fn uses_platform_audio() -> bool {
     false
 }
 
+/// macOS remote audio comes from libWebRTC NetEQ and includes continuous
+/// decoded frames, so apply the existing remote speech gate.
+pub const fn uses_native_remote_audio() -> bool {
+    cfg!(target_os = "macos")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::uses_platform_audio;
+    use super::{uses_native_remote_audio, uses_platform_audio};
 
     #[test]
-    fn production_uses_app_owned_aec_on_every_platform() {
+    fn production_keeps_audio_devices_app_owned() {
         assert!(!uses_platform_audio());
+    }
+
+    #[test]
+    fn macos_uses_native_remote_audio_processing() {
+        assert_eq!(uses_native_remote_audio(), cfg!(target_os = "macos"));
     }
 }

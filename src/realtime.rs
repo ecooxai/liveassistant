@@ -143,12 +143,156 @@ pub struct ToolCall {
     pub call_id: String,
     pub name: String,
     pub arguments: String,
+    pub requested_at: Instant,
 }
 
 #[derive(Clone, Debug)]
 pub struct ToolOutput {
     pub call_id: String,
     pub output: String,
+}
+
+struct PendingDynamicTool {
+    request_id: Value,
+    name: String,
+    received_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct ConnectorProxyTool {
+    server: String,
+    tool: String,
+    app_name: String,
+}
+
+#[derive(Default)]
+struct ConnectorProxyCatalog {
+    dynamic_tools: Vec<Value>,
+    tools: HashMap<String, ConnectorProxyTool>,
+}
+
+fn calendar_connector_metadata_matches(tool_name: &str, tool: &Value) -> bool {
+    let mut candidates = vec![
+        tool_name.split('.').next().unwrap_or(tool_name),
+        tool.get("title")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    ];
+    if let Some(meta) = tool.get("_meta").and_then(Value::as_object) {
+        for key in [
+            "connector_name",
+            "connectorName",
+            "app_name",
+            "appName",
+            "openai/appName",
+        ] {
+            if let Some(value) = meta.get(key).and_then(Value::as_str) {
+                candidates.push(value);
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .any(|candidate| candidate.to_ascii_lowercase().contains("calendar"))
+}
+
+fn calendar_proxy_name(index: usize, tool_name: &str) -> String {
+    let mut suffix = tool_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    suffix.truncate(48);
+    format!("calendar_fast_{index}_{suffix}")
+}
+
+fn calendar_proxy_catalog_from_inventory(inventory: &Value) -> ConnectorProxyCatalog {
+    let mut catalog = ConnectorProxyCatalog::default();
+    let Some(server) = inventory
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|server| server.get("name").and_then(Value::as_str) == Some("codex_apps"))
+    else {
+        return catalog;
+    };
+    let Some(tools) = server.get("tools").and_then(Value::as_object) else {
+        return catalog;
+    };
+    for (index, (tool_name, tool)) in tools
+        .iter()
+        .filter(|(name, tool)| calendar_connector_metadata_matches(name, tool))
+        .take(32)
+        .enumerate()
+    {
+        let proxy_name = calendar_proxy_name(index, tool_name);
+        let title = tool
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or(tool_name);
+        let description = tool
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let app_name = tool
+            .pointer("/_meta/app_name")
+            .or_else(|| tool.pointer("/_meta/appName"))
+            .or_else(|| tool.pointer("/_meta/openai~1appName"))
+            .and_then(Value::as_str)
+            .unwrap_or("Calendar")
+            .to_owned();
+        catalog.dynamic_tools.push(json!({
+            "type": "function",
+            "name": proxy_name,
+            "description": format!(
+                "Low-latency direct Calendar connector operation `{tool_name}` ({title}). Use this instead of MCP/app discovery for Calendar requests. {description}"
+            ),
+            "inputSchema": tool
+                .get("inputSchema")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object"})),
+        }));
+        catalog.tools.insert(
+            proxy_name,
+            ConnectorProxyTool {
+                server: "codex_apps".to_owned(),
+                tool: tool_name.to_owned(),
+                app_name,
+            },
+        );
+    }
+    catalog
+}
+
+async fn discover_calendar_connector_proxies(
+    server: &mut CodexAppServer,
+    connector_thread_id: &str,
+) -> Result<ConnectorProxyCatalog> {
+    let started = Instant::now();
+    let inventory = server
+        .call(
+            "mcpServerStatus/list",
+            json!({
+                "detail": "toolsAndAuthOnly",
+                "limit": 100,
+                "threadId": connector_thread_id,
+            }),
+        )
+        .await
+        .context("Could not read Calendar connector tool inventory")?;
+    let catalog = calendar_proxy_catalog_from_inventory(&inventory);
+    eprintln!(
+        "[live-assistant latency] stage=connection.calendar_proxy_inventory tools={} elapsed_ms={}",
+        catalog.tools.len(),
+        started.elapsed().as_millis(),
+    );
+    Ok(catalog)
 }
 
 #[derive(Clone, Debug)]
@@ -717,6 +861,66 @@ impl CodexAppServer {
         }
     }
 
+    async fn refresh_mcp_and_wait_for_server(
+        &mut self,
+        target_name: &str,
+        timeout: Duration,
+    ) -> Result<Duration> {
+        let started = Instant::now();
+        self.call("config/mcpServer/reload", Value::Null)
+            .await
+            .context("Could not refresh Codex MCP runtime")?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut deferred = VecDeque::new();
+        loop {
+            let message = if let Some(message) = self.queued.pop_front() {
+                message
+            } else {
+                tokio::time::timeout_at(deadline, self.incoming.recv())
+                    .await
+                    .context("Timed out refreshing Codex MCP runtime")?
+                    .context("Codex app-server closed while refreshing MCP runtime")?
+            };
+            if message.get("method").and_then(Value::as_str)
+                == Some("mcpServer/startupStatus/updated")
+            {
+                let name = message
+                    .pointer("/params/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let status = message
+                    .pointer("/params/status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                eprintln!(
+                    "[live-assistant latency] stage=connection.mcp_refresh name={} status={} elapsed_ms={}",
+                    name,
+                    status,
+                    started.elapsed().as_millis(),
+                );
+                if name == target_name {
+                    match status {
+                        "ready" => {
+                            deferred.append(&mut self.queued);
+                            self.queued = deferred;
+                            return Ok(started.elapsed());
+                        }
+                        "failed" | "cancelled" => {
+                            deferred.append(&mut self.queued);
+                            self.queued = deferred;
+                            bail!(
+                                "MCP server `{target_name}` refresh ended with status `{status}`"
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            deferred.push_back(message);
+        }
+    }
+
     async fn next_message(&mut self) -> Option<Value> {
         match self.queued.pop_front() {
             Some(message) => Some(message),
@@ -733,6 +937,233 @@ impl Drop for CodexAppServer {
 }
 
 const CODEX_RESPONSE_QUIET_TAIL: Duration = Duration::from_millis(1_200);
+const CODEX_HANDOFF_FALLBACK_DELAY: Duration = Duration::from_millis(1_500);
+const CODEX_LIVE_DELEGATED_REASONING_EFFORT: &str = "none";
+
+#[derive(Default)]
+struct GptLiveToolLatencyTrace {
+    sequence: u64,
+    started_at: Option<Instant>,
+    active_turn_id: Option<String>,
+    connector_calls: HashMap<String, (Instant, String)>,
+    first_result_logged: bool,
+    first_spoken_logged: bool,
+}
+
+impl GptLiveToolLatencyTrace {
+    fn begin(&mut self, stage: &str) {
+        self.sequence = self.sequence.saturating_add(1);
+        self.started_at = Some(Instant::now());
+        self.active_turn_id = None;
+        self.connector_calls.clear();
+        self.first_result_logged = false;
+        self.first_spoken_logged = false;
+        self.log(stage, "");
+    }
+
+    fn ensure_started(&mut self, stage: &str) {
+        if self.started_at.is_none() {
+            self.begin(stage);
+        }
+    }
+
+    fn elapsed_ms(&self) -> u128 {
+        self.started_at
+            .map(|started| started.elapsed().as_millis())
+            .unwrap_or(0)
+    }
+
+    fn log(&self, stage: &str, detail: &str) {
+        eprintln!(
+            "[live-assistant latency] trace={} stage={} elapsed_ms={}{}{}",
+            self.sequence,
+            stage,
+            self.elapsed_ms(),
+            if detail.is_empty() { "" } else { " " },
+            detail,
+        );
+    }
+
+    fn observe(&mut self, message: &Value) {
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match method {
+            "thread/realtime/transcript/done"
+                if message.pointer("/params/role").and_then(Value::as_str) == Some("user") =>
+            {
+                self.ensure_started("user.transcript.done");
+                self.log("user.transcript.done", "");
+            }
+            "thread/realtime/itemAdded"
+                if message.pointer("/params/item/type").and_then(Value::as_str)
+                    == Some("handoff_request") =>
+            {
+                self.ensure_started("delegation.request");
+                self.log("delegation.request", "mode=automatic_streaming");
+            }
+            "turn/started" => {
+                self.ensure_started("codex.turn.started");
+                self.active_turn_id = message
+                    .pointer("/params/turn/id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                self.log(
+                    "codex.turn.started",
+                    &format!(
+                        "turn_id={}",
+                        self.active_turn_id.as_deref().unwrap_or("unknown")
+                    ),
+                );
+            }
+            "mcpServer/startupStatus/updated" => {
+                self.ensure_started("connector.runtime.status");
+                let name = message
+                    .pointer("/params/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let status = message
+                    .pointer("/params/status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                self.log(
+                    "connector.runtime.status",
+                    &format!("name={name} status={status}"),
+                );
+            }
+            "mcpServer/oauthLogin/completed" => {
+                self.ensure_started("connector.auth.completed");
+                let name = message
+                    .pointer("/params/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let success = message
+                    .pointer("/params/success")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.log(
+                    "connector.auth.completed",
+                    &format!("name={name} success={success}"),
+                );
+            }
+            "item/started"
+                if message.pointer("/params/item/type").and_then(Value::as_str)
+                    == Some("mcpToolCall") =>
+            {
+                self.ensure_started("connector.call.started");
+                let item_id = message
+                    .pointer("/params/item/id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned();
+                let server = message
+                    .pointer("/params/item/server")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let tool = message
+                    .pointer("/params/item/tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let app = message
+                    .pointer("/params/item/appContext/appName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("none");
+                self.connector_calls.insert(
+                    item_id.clone(),
+                    (
+                        Instant::now(),
+                        format!("server={server} tool={tool} app={app}"),
+                    ),
+                );
+                self.log(
+                    "connector.call.started",
+                    &format!("item_id={item_id} server={server} tool={tool} app={app}"),
+                );
+            }
+            "item/completed"
+                if message.pointer("/params/item/type").and_then(Value::as_str)
+                    == Some("mcpToolCall") =>
+            {
+                self.ensure_started("connector.call.completed");
+                let item_id = message
+                    .pointer("/params/item/id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let reported_ms = message
+                    .pointer("/params/item/durationMs")
+                    .and_then(Value::as_i64);
+                let status = message
+                    .pointer("/params/item/status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let error = message
+                    .pointer("/params/item/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let local = self.connector_calls.remove(item_id);
+                let local_ms = local
+                    .as_ref()
+                    .map(|(started, _)| started.elapsed().as_millis());
+                let detail = local.map(|(_, detail)| detail).unwrap_or_default();
+                self.log(
+                    "connector.call.completed",
+                    &format!(
+                        "item_id={item_id} status={status} provider_ms={} observed_ms={} error={error:?} {detail}",
+                        reported_ms
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                        local_ms
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "unknown".to_owned()),
+                    ),
+                );
+            }
+            "item/mcpToolCall/progress" => {
+                self.ensure_started("connector.call.progress");
+                let item_id = message
+                    .pointer("/params/itemId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let progress = message
+                    .pointer("/params/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                self.log(
+                    "connector.call.progress",
+                    &format!("item_id={item_id} message={progress:?}"),
+                );
+            }
+            "item/agentMessage/delta" if !self.first_result_logged => {
+                self.ensure_started("result.first_delta");
+                self.first_result_logged = true;
+                let chars = message
+                    .pointer("/params/delta")
+                    .and_then(Value::as_str)
+                    .map(str::len)
+                    .unwrap_or(0);
+                self.log("result.first_delta", &format!("chars={chars}"));
+            }
+            "thread/realtime/transcript/delta"
+                if message.pointer("/params/role").and_then(Value::as_str) == Some("assistant")
+                    && !self.first_spoken_logged =>
+            {
+                self.ensure_started("speech.first_delta");
+                self.first_spoken_logged = true;
+                self.log("speech.first_delta", "");
+            }
+            "turn/completed" => {
+                self.ensure_started("codex.turn.completed");
+                let status = message
+                    .pointer("/params/turn/status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                self.log("codex.turn.completed", &format!("status={status}"));
+            }
+            _ => {}
+        }
+    }
+}
 
 fn codex_live_initialize_capabilities() -> Value {
     json!({
@@ -851,16 +1282,44 @@ fn emit_codex_live_remote_audio(
         .is_ok()
 }
 
+struct ScheduledHandoffFallback {
+    deadline: Instant,
+    text: String,
+}
+
 #[derive(Default)]
 struct CodexHandoffState {
     active_turn_id: Option<String>,
     response_text: String,
+    fallback: Option<ScheduledHandoffFallback>,
 }
 
 impl CodexHandoffState {
-    fn clear(&mut self) {
+    fn clear_turn(&mut self) {
         self.active_turn_id = None;
         self.response_text.clear();
+    }
+
+    fn schedule_fallback(&mut self, text: String) {
+        self.fallback = Some(ScheduledHandoffFallback {
+            deadline: Instant::now() + CODEX_HANDOFF_FALLBACK_DELAY,
+            text,
+        });
+    }
+
+    fn note_spoken_output(&mut self) {
+        self.fallback = None;
+    }
+
+    fn take_fallback_if_due(&mut self, now: Instant) -> Option<String> {
+        if self
+            .fallback
+            .as_ref()
+            .is_none_or(|fallback| now < fallback.deadline)
+        {
+            return None;
+        }
+        self.fallback.take().map(|fallback| fallback.text)
     }
 }
 
@@ -868,7 +1327,30 @@ impl CodexHandoffState {
 enum CodexHandoffAction {
     NotHandled,
     Handled,
-    Speak(String),
+}
+
+fn codex_live_realtime_start_params(
+    thread_id: &str,
+    offer_sdp: String,
+    voice: &str,
+    prompt: String,
+) -> Value {
+    json!({
+        "threadId": thread_id,
+        "outputModality": "audio",
+        "version": "v3",
+        "model": "gpt-live-1-boulder-alpha",
+        "voice": voice,
+        "transport": {"type": "webrtc", "sdp": offer_sdp},
+        // Automatic Frameless Bidi handoffs stream delegated text in roughly
+        // 200 ms chunks instead of waiting for the completed Codex turn.
+        "clientManagedHandoffs": false,
+        "delegationAckFiller": false,
+        "codexResponsesAsItems": false,
+        "codexResponseHandoffMode": "thinking",
+        "includeStartupContext": false,
+        "prompt": prompt,
+    })
 }
 
 async fn run_codex_live_connection(
@@ -883,7 +1365,15 @@ async fn run_codex_live_connection(
         .chatgpt_account_id
         .is_none()
         .then_some(options.api_key.as_str());
+    let connection_started = Instant::now();
+    let stage_started = Instant::now();
     let mut server = CodexAppServer::start(platform_api_key)?;
+    eprintln!(
+        "[live-assistant latency] stage=connection.app_server_spawn elapsed_ms={} total_ms={}",
+        stage_started.elapsed().as_millis(),
+        connection_started.elapsed().as_millis(),
+    );
+    let stage_started = Instant::now();
     server
         .call(
             "initialize",
@@ -898,46 +1388,63 @@ async fn run_codex_live_connection(
         )
         .await?;
     server.notify("initialized", json!({}))?;
+    eprintln!(
+        "[live-assistant latency] stage=connection.initialize elapsed_ms={} total_ms={} auth={}",
+        stage_started.elapsed().as_millis(),
+        connection_started.elapsed().as_millis(),
+        if options.chatgpt_account_id.is_some() {
+            "codex_oauth"
+        } else {
+            "platform_key"
+        },
+    );
 
     let system_prompt = options.system_prompt.clone();
     let realtime_prompt = gpt_live_system_prompt(&system_prompt);
-    let thread_start_params = codex_live_thread_start_params(
-        &options,
-        system_prompt.clone(),
-        std::env::current_dir()
-            .context("Could not read the current working directory")?
-            .to_string_lossy()
-            .into_owned(),
-    );
+    let codex_prompt = gpt_live_codex_system_prompt(&system_prompt);
+    let cwd = std::env::current_dir()
+        .context("Could not read the current working directory")?
+        .to_string_lossy()
+        .into_owned();
+    let thread_start_params = codex_live_thread_start_params(&options, codex_prompt, cwd);
+    let stage_started = Instant::now();
     let thread = server.call("thread/start", thread_start_params).await?;
+    eprintln!(
+        "[live-assistant latency] stage=connection.thread_start elapsed_ms={} total_ms={} reasoning={}",
+        stage_started.elapsed().as_millis(),
+        connection_started.elapsed().as_millis(),
+        CODEX_LIVE_DELEGATED_REASONING_EFFORT,
+    );
     let thread_id = thread
         .pointer("/thread/id")
         .and_then(Value::as_str)
         .context("Codex app-server did not return a thread id")?
         .to_owned();
 
+    let stage_started = Instant::now();
     let (mut peer, offer_sdp) = GptLivePeer::create().await?;
+    eprintln!(
+        "[live-assistant latency] stage=connection.webrtc_offer elapsed_ms={} total_ms={}",
+        stage_started.elapsed().as_millis(),
+        connection_started.elapsed().as_millis(),
+    );
+    let stage_started = Instant::now();
     server
         .call(
             "thread/realtime/start",
-            json!({
-                "threadId": thread_id,
-                "outputModality": "audio",
-                "version": "v3",
-                "model": "gpt-live-1-boulder-alpha",
-                "voice": options.voice,
-                "transport": {"type": "webrtc", "sdp": offer_sdp},
-                // Deliver completed Codex results explicitly with appendSpeech.
-                // This avoids the automatic V3 thinking-channel race where a
-                // correct delegated image answer can remain silent.
-                "clientManagedHandoffs": true,
-                "delegationAckFiller": false,
-                "codexResponsesAsItems": false,
-                "includeStartupContext": false,
-                "prompt": realtime_prompt,
-            }),
+            codex_live_realtime_start_params(
+                &thread_id,
+                offer_sdp,
+                &options.voice,
+                realtime_prompt,
+            ),
         )
         .await?;
+    eprintln!(
+        "[live-assistant latency] stage=connection.realtime_start_request elapsed_ms={} total_ms={} handoff=automatic_streaming",
+        stage_started.elapsed().as_millis(),
+        connection_started.elapsed().as_millis(),
+    );
 
     let mut answer_applied = false;
     let mut started = false;
@@ -952,10 +1459,22 @@ async fn run_codex_live_connection(
                     .pointer("/params/sdp")
                     .and_then(Value::as_str)
                     .context("Codex GPT-Live did not return an SDP answer")?;
+                let stage_started = Instant::now();
                 peer.accept_answer(answer.to_owned()).await?;
                 answer_applied = true;
+                eprintln!(
+                    "[live-assistant latency] stage=connection.sdp_applied elapsed_ms={} total_ms={}",
+                    stage_started.elapsed().as_millis(),
+                    connection_started.elapsed().as_millis(),
+                );
             }
-            Some("thread/realtime/started") => started = true,
+            Some("thread/realtime/started") => {
+                started = true;
+                eprintln!(
+                    "[live-assistant latency] stage=connection.realtime_started total_ms={}",
+                    connection_started.elapsed().as_millis(),
+                );
+            }
             Some("thread/realtime/error") => {
                 let detail = message
                     .pointer("/params/message")
@@ -972,21 +1491,35 @@ async fn run_codex_live_connection(
         }
     }
 
-    // A cold Codex app-server may still be finishing plugin/MCP discovery after
-    // realtime/started. Read the new thread before reporting Connected
-    // so that one-time startup work cannot consume a screenshot's strict
-    // 10-second upload budget. Reading metadata changes no model context, and its
-    // acknowledgement proves the request loop is ready for the first JPEG.
-    server
-        .call(
-            "thread/read",
-            json!({
-                "threadId": thread_id,
-                "includeTurns": false,
-            }),
-        )
+    match server
+        .refresh_mcp_and_wait_for_server("codex_apps", Duration::from_secs(15))
         .await
-        .context("Could not prepare Codex GPT-Live screenshot uploads")?;
+    {
+        Ok(mcp_refresh_duration) => eprintln!(
+            "[live-assistant latency] stage=connection.codex_apps_ready elapsed_ms={} total_ms={}",
+            mcp_refresh_duration.as_millis(),
+            connection_started.elapsed().as_millis(),
+        ),
+        Err(error) => eprintln!(
+            "[live-assistant latency] stage=connection.codex_apps_warmup_failed total_ms={} error={error:#}",
+            connection_started.elapsed().as_millis(),
+        ),
+    }
+
+    // Do not block the live connection on metadata/plugin discovery. Warm the
+    // app-server request path opportunistically; its response is queued while
+    // the realtime session can already accept speech and tool delegations.
+    let _ = server.send_request(
+        "thread/read",
+        json!({
+            "threadId": thread_id,
+            "includeTurns": false,
+        }),
+    );
+    eprintln!(
+        "[live-assistant latency] stage=connection.ready total_ms={}",
+        connection_started.elapsed().as_millis(),
+    );
 
     let mut remote_audio = peer.take_remote_audio();
     let _ = events.send(Event::Connected);
@@ -1004,10 +1537,11 @@ async fn run_codex_live_connection(
     }
     let mut state = CodexLiveState::default();
     let mut handoff_state = CodexHandoffState::default();
+    let mut latency_trace = GptLiveToolLatencyTrace::default();
     let mut in_flight_context_images = HashMap::<u64, InFlightContextImage>::new();
     let mut latest_context_image_upload_id = 0_u64;
     let mut latest_ready_context_image_upload_id: Option<u64> = None;
-    let mut pending_dynamic_tools: HashMap<String, Value> = HashMap::new();
+    let mut pending_dynamic_tools: HashMap<String, PendingDynamicTool> = HashMap::new();
     let mut response_watchdog: Option<Instant> = None;
     // The WebRTC receive task filters continuous comfort noise and emits only
     // reordered speech packets. Start UI/playback from the first real audio
@@ -1158,8 +1692,8 @@ async fn run_codex_live_connection(
                         let _ = events.send(Event::ContextImageAccepted { upload_id });
                     }
                     Some(Command::CreateResponse) => {
-                        // Frameless GPT-Live owns output turn creation. Completed
-                        // Codex handoffs are returned through appendSpeech below.
+                        // Frameless GPT-Live owns output turn creation. Automatic
+                        // app-server handoffs stream delegated results directly.
                         response_watchdog =
                             Some(Instant::now() + Duration::from_millis(4_000));
                     }
@@ -1169,22 +1703,57 @@ async fn run_codex_live_connection(
                     Some(Command::ToolOutputs(outputs)) => {
                         let mut submitted = 0usize;
                         for output in outputs {
-                            let Some(request_id) = pending_dynamic_tools.remove(&output.call_id) else {
+                            let Some(pending) = pending_dynamic_tools.remove(&output.call_id) else {
                                 continue;
                             };
                             let (content_items, success) =
                                 dynamic_tool_content_items(&output.output);
+                            let respond_started = Instant::now();
                             eprintln!(
-                                "[live-assistant tool] result call_id={} success={} output={}",
-                                output.call_id, success, output.output
+                                "[live-assistant latency] call_id={} name={} stage=local.result_ready total_ms={} success={}",
+                                output.call_id,
+                                pending.name,
+                                pending.received_at.elapsed().as_millis(),
+                                success,
                             );
                             server.respond(
-                                request_id,
+                                pending.request_id,
                                 json!({
                                     "contentItems": content_items,
                                     "success": success
                                 }),
                             )?;
+                            eprintln!(
+                                "[live-assistant latency] call_id={} name={} stage=app_server.result_submitted submit_ms={} total_ms={}",
+                                output.call_id,
+                                pending.name,
+                                respond_started.elapsed().as_millis(),
+                                pending.received_at.elapsed().as_millis(),
+                            );
+                            if pending_dynamic_tools.is_empty()
+                                && let Some(text) =
+                                    local_tool_fast_speech(&pending.name, &output.output, success)
+                            {
+                                let turn_id = handoff_state.active_turn_id.clone();
+                                send_fast_tool_speech(
+                                    &mut server,
+                                    &thread_id,
+                                    turn_id.as_deref(),
+                                    text,
+                                )?;
+                                latency_trace.log(
+                                    "fast_result.local_speech",
+                                    &format!(
+                                        "call_id={} name={} total_ms={}",
+                                        output.call_id,
+                                        pending.name,
+                                        pending.received_at.elapsed().as_millis(),
+                                    ),
+                                );
+                                handoff_state.clear_turn();
+                                handoff_state.fallback = None;
+                                response_watchdog = None;
+                            }
                             submitted = submitted.saturating_add(1);
                         }
                         let _ = events.send(Event::ToolOutputsSubmitted { count: submitted });
@@ -1204,6 +1773,7 @@ async fn run_codex_live_connection(
                 match audio {
                     Some(Ok(samples)) if !samples.is_empty() => {
                         response_watchdog = None;
+                        handoff_state.note_spoken_output();
                         emit_codex_live_remote_audio(&mut state, events, samples);
                     }
                     Some(Ok(_)) => {}
@@ -1219,6 +1789,7 @@ async fn run_codex_live_connection(
                     bail!("Codex app-server closed unexpectedly");
                 };
                 eprintln!("[live-assistant codex] {}", codex_message_summary(&message));
+                latency_trace.observe(&message);
                 match handle_codex_context_image_response(
                     &message,
                     &mut in_flight_context_images,
@@ -1272,10 +1843,27 @@ async fn run_codex_live_connection(
                         continue;
                     }
                 }
+                if let Some(fast) = mcp_tool_fast_speech(&message) {
+                    send_fast_tool_speech(
+                        &mut server,
+                        &thread_id,
+                        Some(&fast.turn_id),
+                        fast.text,
+                    )?;
+                    latency_trace.log(
+                        "fast_result.mcp_speech",
+                        &format!("label={} turn_id={}", fast.label, fast.turn_id),
+                    );
+                    handoff_state.clear_turn();
+                    handoff_state.fallback = None;
+                    response_watchdog = None;
+                    continue;
+                }
                 if codex_message_starts_reply(&message) {
                     response_watchdog = None;
                 }
                 if codex_message_is_assistant_transcript(&message) {
+                    handoff_state.note_spoken_output();
                     state.ensure_response(events);
                 }
                 if let Some((request_id, call)) = dynamic_tool_request(&message) {
@@ -1283,7 +1871,19 @@ async fn run_codex_live_connection(
                         "[live-assistant tool] request call_id={} name={} arguments={}",
                         call.call_id, call.name, call.arguments
                     );
-                    pending_dynamic_tools.insert(call.call_id.clone(), request_id);
+                    latency_trace.ensure_started("dynamic_tool.request");
+                    latency_trace.log(
+                        "dynamic_tool.request",
+                        &format!("call_id={} name={}", call.call_id, call.name),
+                    );
+                    pending_dynamic_tools.insert(
+                        call.call_id.clone(),
+                        PendingDynamicTool {
+                            request_id,
+                            name: call.name.clone(),
+                            received_at: call.requested_at,
+                        },
+                    );
                     let _ = events.send(Event::ToolCalls(vec![call]));
                     continue;
                 }
@@ -1294,26 +1894,24 @@ async fn run_codex_live_connection(
                 )? {
                     CodexHandoffAction::NotHandled => {}
                     CodexHandoffAction::Handled => continue,
-                    CodexHandoffAction::Speak(text) => {
-                        eprintln!(
-                            "[live-assistant codex] delivering delegated response to GPT-Live speech chars={}",
-                            text.chars().count()
-                        );
-                        server.send_request(
-                            "thread/realtime/appendSpeech",
-                            json!({
-                                "threadId": thread_id,
-                                "text": text,
-                            }),
-                        )?;
-                        response_watchdog = None;
-                        continue;
-                    }
                 }
                 handle_codex_live_message(&message, events, &mut state)?;
             }
             _ = finish_tick.tick() => {
                 let now = Instant::now();
+                if let Some(text) = handoff_state.take_fallback_if_due(now) {
+                    latency_trace.log(
+                        "handoff.fallback_append_speech",
+                        &format!("chars={}", text.chars().count()),
+                    );
+                    server.send_request(
+                        "thread/realtime/appendSpeech",
+                        json!({
+                            "threadId": thread_id,
+                            "text": text,
+                        }),
+                    )?;
+                }
                 let expired_upload_ids = expire_codex_context_images(
                     &mut in_flight_context_images,
                     now,
@@ -1859,9 +2457,15 @@ fn codex_live_thread_start_params(
         "dynamicTools": codex_dynamic_tools_with_tools(
             voice_tools(options.screen_info),
         ),
+        "reasoningEffort": CODEX_LIVE_DELEGATED_REASONING_EFFORT,
         "config": {
             "features.realtime_conversation": true,
             "suppress_unstable_features_warning": true,
+            // GPT-Live connector turns do not need the local Node REPL or
+            // OpenAI documentation MCP. Starting them adds several seconds to
+            // every small calendar/app request.
+            "mcp_servers.node_repl.enabled": false,
+            "mcp_servers.openaiDeveloperDocs.enabled": false,
         }
     })
 }
@@ -2756,6 +3360,7 @@ fn handle_codex_handoff_message(
         .unwrap_or_default();
     match method {
         "turn/started" => {
+            state.fallback = None;
             state.active_turn_id = message
                 .pointer("/params/turn/id")
                 .and_then(Value::as_str)
@@ -2802,12 +3407,15 @@ fn handle_codex_handoff_message(
                     let _ =
                         events.send(Event::Error(format!("Codex tool handoff failed: {detail}")));
                 }
-                let speakable = (status == "completed")
+                let fallback = (status == "completed")
                     .then(|| state.response_text.trim().to_owned())
                     .filter(|text| !text.is_empty());
-                state.clear();
-                if let Some(text) = speakable {
-                    return Ok(CodexHandoffAction::Speak(text));
+                state.clear_turn();
+                if let Some(text) = fallback {
+                    // Automatic handoff streaming is the primary path. Retain the
+                    // completed text only as a short delayed fallback for backend
+                    // variants that fail to produce any spoken output.
+                    state.schedule_fallback(text);
                 }
             }
             Ok(CodexHandoffAction::Handled)
@@ -2819,6 +3427,8 @@ fn handle_codex_handoff_message(
                 .and_then(Value::as_str)
                 .unwrap_or("Unknown Codex handoff error");
             let _ = events.send(Event::Error(format!("Codex tool handoff error: {detail}")));
+            state.clear_turn();
+            state.fallback = None;
             Ok(CodexHandoffAction::Handled)
         }
         _ => Ok(CodexHandoffAction::NotHandled),
@@ -2992,6 +3602,374 @@ pub fn probe_codex_gpt_live_native() -> Result<()> {
     })
 }
 
+/// End-to-end GPT-Live tool latency probe. The delegated Codex turn calls a
+/// deterministic local dynamic tool, receives an immediate result, and streams
+/// the answer back through the same automatic handoff path used by calendar/MCP
+/// tools. This isolates model/dispatch/handoff overhead from provider latency.
+pub fn probe_codex_gpt_live_tool_latency() -> Result<()> {
+    let credentials = crate::auth::codex_credentials()?;
+    let runtime = tokio::runtime::Runtime::new()
+        .context("Could not create GPT-Live tool latency probe runtime")?;
+    runtime.block_on(async move {
+        let platform_api_key = credentials
+            .chatgpt_account_id
+            .is_none()
+            .then_some(credentials.bearer_token.as_str());
+        let connection_started = Instant::now();
+        let mut server = CodexAppServer::start(platform_api_key)?;
+        server
+            .call(
+                "initialize",
+                json!({
+                    "clientInfo": {
+                        "name": "live-assistant-tool-latency-probe",
+                        "title": "Live Assistant GPT-Live Tool Latency Probe",
+                        "version": env!("CARGO_PKG_VERSION")
+                    },
+                    "capabilities": codex_live_initialize_capabilities()
+                }),
+            )
+            .await?;
+        server.notify("initialized", json!({}))?;
+        let cwd = std::env::current_dir()
+            .context("Could not read the current working directory")?
+            .to_string_lossy()
+            .into_owned();
+        let thread = server
+            .call(
+                "thread/start",
+                json!({
+                    "cwd": cwd,
+                    "ephemeral": true,
+                    "approvalPolicy": "never",
+                    "sandbox": "read-only",
+                    "baseInstructions": "This is a strict latency test. When the user asks for the latency probe or hidden nonce, call latency_probe immediately as the first action. Its result contains an unpredictable nonce. After success, emit only that nonce as the final answer. Do not perform discovery, planning, retries, or any other tool call.",
+                    "dynamicTools": [{
+                        "type": "function",
+                        "name": "latency_probe",
+                        "description": "Return an immediate deterministic success value for realtime latency measurement. Call this immediately.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false
+                        }
+                    }],
+                    "reasoningEffort": CODEX_LIVE_DELEGATED_REASONING_EFFORT,
+                    "config": {
+                        "features.realtime_conversation": true,
+                        "suppress_unstable_features_warning": true,
+                        "mcp_servers.node_repl.enabled": false,
+                        "mcp_servers.openaiDeveloperDocs.enabled": false
+                    }
+                }),
+            )
+            .await?;
+        let thread_id = thread
+            .pointer("/thread/id")
+            .and_then(Value::as_str)
+            .context("Codex app-server did not return a tool latency probe thread id")?
+            .to_owned();
+
+        let (mut peer, offer_sdp) = GptLiveProbePeer::create().await?;
+        server
+            .call(
+                "thread/realtime/start",
+                json!({
+                    "threadId": thread_id,
+                    "outputModality": "audio",
+                    "version": "v3",
+                    "model": "gpt-live-1-boulder-alpha",
+                    "voice": "ember",
+                    "transport": {"type": "webrtc", "sdp": offer_sdp},
+                    "clientManagedHandoffs": false,
+                    "delegationAckFiller": false,
+                    "codexResponsesAsItems": false,
+                    "codexResponseHandoffMode": "thinking",
+                    "includeStartupContext": false,
+                    "prompt": "This is a strict realtime latency test. Immediately delegate the user request to Codex so it can call latency_probe. Do not speak before delegation. Speak the streamed final result as soon as it arrives."
+                }),
+            )
+            .await?;
+
+        let mut answer_applied = false;
+        let mut started = false;
+        while !answer_applied || !started {
+            let message = tokio::time::timeout(Duration::from_secs(45), server.next_message())
+                .await
+                .context("Timed out starting GPT-Live tool latency probe")?
+                .context("Codex app-server closed during tool latency startup")?;
+            match message.get("method").and_then(Value::as_str) {
+                Some("thread/realtime/sdp") => {
+                    let answer = message
+                        .pointer("/params/sdp")
+                        .and_then(Value::as_str)
+                        .context("Tool latency probe did not receive an SDP answer")?;
+                    peer.accept_answer(answer.to_owned()).await?;
+                    answer_applied = true;
+                }
+                Some("thread/realtime/started") => started = true,
+                Some("thread/realtime/error") => {
+                    bail!(
+                        "GPT-Live tool latency startup failed: {}",
+                        realtime_error_detail(&message)
+                    );
+                }
+                Some("thread/realtime/closed") => {
+                    bail!("GPT-Live tool latency session closed during startup");
+                }
+                _ => {}
+            }
+        }
+
+        let mcp_refresh_duration = server
+            .refresh_mcp_and_wait_for_server("codex_apps", Duration::from_secs(15))
+            .await?;
+        eprintln!(
+            "[gpt-live tool latency] stage=codex_apps_ready ms={}",
+            mcp_refresh_duration.as_millis(),
+        );
+        let mut remote_audio = peer.take_remote_audio();
+
+        // Exercise the real GPT-Live microphone/VAD/delegation path. Pace the
+        // spoken portion in real time, then keep the RTP clock moving with silence
+        // on a separate task while tool notifications are dispatched immediately.
+        let prompt = "Use latency probe. Tell me its hidden nonce.";
+        let samples = synthesize_latest_image_probe_speech(prompt)?;
+        let silence_samples = AUDIO_SAMPLE_RATE * 2;
+        anyhow::ensure!(
+            samples.len() > silence_samples,
+            "Synthesized latency probe speech did not contain a spoken segment"
+        );
+        let spoken_samples = &samples[..samples.len() - silence_samples];
+        let audio_sender = peer.audio_sender();
+        for frame in spoken_samples.chunks(480) {
+            audio_sender.send_pcm24k(frame)?;
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let request_started = Instant::now();
+        let silence_sender = audio_sender.clone();
+        let silence_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let silence_stop_task = silence_stop.clone();
+        let silence_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(20));
+            while !silence_stop_task.load(std::sync::atomic::Ordering::Relaxed) {
+                interval.tick().await;
+                if silence_sender.send_pcm24k(&[0_i16; 480]).is_err() {
+                    break;
+                }
+            }
+        });
+        eprintln!(
+            "[gpt-live tool latency] stage=user_speech_ended spoken_ms={} connection_ms={}",
+            spoken_samples.len() * 1_000 / AUDIO_SAMPLE_RATE,
+            connection_started.elapsed().as_millis(),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut tool_requested_at: Option<Duration> = None;
+        let mut result_submitted_at: Option<Duration> = None;
+        let mut first_result_delta_at: Option<Duration> = None;
+        let mut first_audio_after_result_at: Option<Duration> = None;
+        let mut first_speech_at: Option<Duration> = None;
+        let mut pre_tool_audio_chunks = 0usize;
+        let mut assistant_text = String::new();
+        let mut trace = GptLiveToolLatencyTrace::default();
+        let mut handoff_state = CodexHandoffState::default();
+        let (probe_events, _probe_events_rx) = std::sync::mpsc::channel();
+        trace.begin("probe.request");
+
+        while Instant::now() < deadline && first_speech_at.is_none() {
+            loop {
+                match remote_audio.try_recv() {
+                    Ok(Ok(samples)) if !samples.is_empty() => {
+                        if result_submitted_at.is_some() {
+                            if first_audio_after_result_at.is_none() {
+                                first_audio_after_result_at = Some(request_started.elapsed());
+                                trace.log(
+                                    "audio.first_after_result",
+                                    &format!("samples={}", samples.len()),
+                                );
+                            }
+                            continue;
+                        }
+                        pre_tool_audio_chunks = pre_tool_audio_chunks.saturating_add(1);
+                        if pre_tool_audio_chunks == 1 {
+                            trace.log(
+                                "audio.pre_tool_ignored",
+                                &format!("samples={}", samples.len()),
+                            );
+                        }
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => bail!("GPT-Live audio probe failed: {error}"),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                }
+            }
+            if let Some(text) = handoff_state.take_fallback_if_due(Instant::now()) {
+                trace.log(
+                    "handoff.fallback_append_speech",
+                    &format!("chars={}", text.chars().count()),
+                );
+                server.send_request(
+                    "thread/realtime/appendSpeech",
+                    json!({
+                        "threadId": thread_id,
+                        "text": text,
+                    }),
+                )?;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let poll = remaining.min(Duration::from_millis(50));
+            let message = match tokio::time::timeout(poll, server.next_message()).await {
+                Ok(Some(message)) => message,
+                Ok(None) => bail!("Codex app-server closed during GPT-Live tool latency probe"),
+                Err(_) => continue,
+            };
+            eprintln!(
+                "[gpt-live tool latency] {}",
+                codex_message_summary(&message)
+            );
+            trace.observe(&message);
+            let _ = handle_codex_handoff_message(
+                &message,
+                &probe_events,
+                &mut handoff_state,
+            )?;
+            if let Some((request_id, call)) = dynamic_tool_request(&message) {
+                anyhow::ensure!(
+                    call.name == "latency_probe",
+                    "Unexpected tool `{}` during latency probe",
+                    call.name
+                );
+                tool_requested_at.get_or_insert_with(|| request_started.elapsed());
+                let submit_started = Instant::now();
+                server.respond(
+                    request_id,
+                    json!({
+                        "contentItems": [{
+                            "type": "inputText",
+                            "text": "success nonce: 7F3A-91C2"
+                        }],
+                        "success": true
+                    }),
+                )?;
+                result_submitted_at.get_or_insert_with(|| request_started.elapsed());
+                assistant_text.clear();
+                send_fast_tool_speech(
+                    &mut server,
+                    &thread_id,
+                    handoff_state.active_turn_id.as_deref(),
+                    "The hidden nonce is 7F3A-91C2.".to_owned(),
+                )?;
+                handoff_state.clear_turn();
+                handoff_state.fallback = None;
+                trace.log(
+                    "fast_result.probe_speech",
+                    &format!("call_id={}", call.call_id),
+                );
+                eprintln!(
+                    "[gpt-live tool latency] stage=tool_result_submitted call_id={} tool_ms={} submit_us={} total_ms={}",
+                    call.call_id,
+                    tool_requested_at.unwrap_or_default().as_millis(),
+                    submit_started.elapsed().as_micros(),
+                    request_started.elapsed().as_millis(),
+                );
+                continue;
+            }
+            match message.get("method").and_then(Value::as_str) {
+                Some("item/agentMessage/delta") => {
+                    first_result_delta_at.get_or_insert_with(|| request_started.elapsed());
+                }
+                Some("thread/realtime/transcript/delta")
+                    if message.pointer("/params/role").and_then(Value::as_str)
+                        == Some("assistant") =>
+                {
+                    if result_submitted_at.is_some() {
+                        handoff_state.note_spoken_output();
+                        if let Some(delta) = message.pointer("/params/delta").and_then(Value::as_str) {
+                            assistant_text.push_str(delta);
+                        }
+                        if assistant_text.to_ascii_lowercase().contains("7f3a") {
+                            first_speech_at.get_or_insert_with(|| request_started.elapsed());
+                        }
+                    } else {
+                        trace.log("speech.pre_tool_ignored", "");
+                    }
+                }
+                Some("thread/realtime/transcript/done")
+                    if message.pointer("/params/role").and_then(Value::as_str)
+                        == Some("assistant") =>
+                {
+                    if result_submitted_at.is_some() {
+                        handoff_state.note_spoken_output();
+                        if assistant_text.is_empty()
+                            && let Some(text) = message.pointer("/params/text").and_then(Value::as_str)
+                        {
+                            assistant_text.push_str(text);
+                        }
+                        if assistant_text.to_ascii_lowercase().contains("7f3a") {
+                            first_speech_at.get_or_insert_with(|| request_started.elapsed());
+                        }
+                    } else {
+                        trace.log("speech.pre_tool_done_ignored", "");
+                    }
+                }
+                Some("thread/realtime/error") => {
+                    bail!(
+                        "GPT-Live tool latency response failed: {}",
+                        realtime_error_detail(&message)
+                    );
+                }
+                Some("thread/realtime/closed") => {
+                    bail!("GPT-Live tool latency session closed before speaking");
+                }
+                _ => {}
+            }
+        }
+
+        silence_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = silence_task.await;
+        let _ = server.send_request(
+            "thread/realtime/stop",
+            json!({"threadId": thread_id}),
+        );
+        peer.close().await;
+
+        let tool_requested_at = tool_requested_at
+            .context("GPT-Live never emitted the latency_probe tool call")?;
+        let result_submitted_at = result_submitted_at
+            .context("The latency_probe result was never submitted")?;
+        let first_speech_at = first_speech_at
+            .context("GPT-Live produced no spoken response after the tool result")?;
+        anyhow::ensure!(
+            tool_requested_at < Duration::from_secs(8),
+            "GPT-Live took {:.2}s to emit a trivial tool call",
+            tool_requested_at.as_secs_f64()
+        );
+        anyhow::ensure!(
+            first_speech_at < Duration::from_secs(8),
+            "GPT-Live took {:.2}s to begin speaking after a trivial tool request",
+            first_speech_at.as_secs_f64()
+        );
+        eprintln!(
+            "[gpt-live tool latency] result=success tool_request_ms={} result_submit_ms={} first_result_delta_ms={} first_audio_after_result_ms={} first_useful_speech_ms={} pre_tool_audio_chunks={} transcript={:?}",
+            tool_requested_at.as_millis(),
+            result_submitted_at.as_millis(),
+            first_result_delta_at
+                .map(|value| value.as_millis().to_string())
+                .unwrap_or_else(|| "not_observed".to_owned()),
+            first_audio_after_result_at
+                .map(|value| value.as_millis().to_string())
+                .unwrap_or_else(|| "not_observed".to_owned()),
+            first_speech_at.as_millis(),
+            pre_tool_audio_chunks,
+            assistant_text.trim(),
+        );
+        Ok(())
+    })
+}
+
 fn realtime_error_detail(message: &Value) -> String {
     let direct = message
         .pointer("/params/message")
@@ -3071,6 +4049,7 @@ fn codex_dynamic_tools(screen: ScreenInfo) -> Value {
         .as_array()
         .cloned()
         .unwrap_or_default();
+    tools.extend(note_tools());
     tools.push(create_image_tool());
     codex_dynamic_tools_with_tools(Value::Array(tools))
 }
@@ -3102,9 +4081,107 @@ fn voice_tools(screen: ScreenInfo) -> Value {
         .as_array()
         .cloned()
         .unwrap_or_default();
+    tools.extend(note_tools());
     tools.push(ask_text_model_tool());
     tools.push(create_image_tool());
     Value::Array(tools)
+}
+
+fn note_tools() -> Vec<Value> {
+    vec![
+        json!({
+            "type": "function",
+            "name": "replace_note_text",
+            "description": "Replace exact text in a Markdown/text note stored in ~/liveassistant. Omit note_name to edit the currently open note. Use this instead of keyboard typing when the user asks you to edit a note.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_name": {
+                        "type": "string",
+                        "description": "Optional note file name. Omit to use the currently open note."
+                    },
+                    "old_text": {
+                        "type": "string",
+                        "description": "Exact text to find."
+                    },
+                    "new_text": {
+                        "type": "string",
+                        "description": "Replacement text."
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every exact match instead of only the first match."
+                    }
+                },
+                "required": ["old_text", "new_text"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "remove_note_text",
+            "description": "Remove exact text from a Markdown/text note stored in ~/liveassistant. Omit note_name to edit the currently open note.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_name": {
+                        "type": "string",
+                        "description": "Optional note file name. Omit to use the currently open note."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Exact text to remove."
+                    },
+                    "remove_all": {
+                        "type": "boolean",
+                        "description": "Remove every exact match instead of only the first match."
+                    }
+                },
+                "required": ["text"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "rename_note",
+            "description": "Rename a note stored in ~/liveassistant. Omit note_name to rename the currently open note. A .md extension is added when the new name has no extension.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "note_name": {
+                        "type": "string",
+                        "description": "Optional current note file name. Omit to use the currently open note."
+                    },
+                    "new_name": {
+                        "type": "string",
+                        "description": "New file name for the note."
+                    }
+                },
+                "required": ["new_name"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
+            "type": "function",
+            "name": "create_note",
+            "description": "Create a new Markdown/text note in ~/liveassistant and open it in the note editor. A .md extension is added when the name has no extension.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "File name for the new note."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Initial note content. Defaults to empty."
+                    }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }
+        }),
+    ]
 }
 
 fn create_image_tool() -> Value {
@@ -3195,6 +4272,125 @@ pub(crate) fn available_tool_descriptions(screen: ScreenInfo) -> Vec<(String, St
 /// Convert a local dynamic-tool result to the app-server content-item shape.
 /// Image bytes stay in an inputImage item instead of being duplicated inside
 /// the text item, so the text model can inspect the generated image directly.
+const FAST_TOOL_RESULT_MAX_CHARS: usize = 2_000;
+
+struct FastToolSpeech {
+    turn_id: String,
+    label: String,
+    text: String,
+}
+
+fn bounded_tool_result(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() || text.chars().count() > FAST_TOOL_RESULT_MAX_CHARS {
+        return None;
+    }
+    Some(text.to_owned())
+}
+
+fn local_tool_fast_speech(name: &str, output: &str, success: bool) -> Option<String> {
+    if !success {
+        return None;
+    }
+    let value = serde_json::from_str::<Value>(output).ok()?;
+    if let Some(reply) = value
+        .get("assistant_reply")
+        .and_then(Value::as_str)
+        .and_then(bounded_tool_result)
+    {
+        return Some(reply);
+    }
+    match name {
+        "insert_text" => Some("Done.".to_owned()),
+        "run_bash" => value
+            .get("stdout")
+            .and_then(Value::as_str)
+            .and_then(bounded_tool_result),
+        _ => None,
+    }
+}
+
+fn mcp_tool_fast_speech(message: &Value) -> Option<FastToolSpeech> {
+    if message.get("method").and_then(Value::as_str) != Some("item/completed") {
+        return None;
+    }
+    let item = message.pointer("/params/item")?;
+    if item.get("type").and_then(Value::as_str) != Some("mcpToolCall")
+        || item.get("status").and_then(Value::as_str) != Some("completed")
+        || item.get("error").is_some_and(|error| !error.is_null())
+    {
+        return None;
+    }
+    let turn_id = message.pointer("/params/turnId")?.as_str()?.to_owned();
+    let app_name = item
+        .pointer("/appContext/appName")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty());
+    let server = item
+        .get("server")
+        .and_then(Value::as_str)
+        .unwrap_or("connector");
+    let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+    let label = app_name
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{server}/{tool}"));
+    let result = item.get("result")?;
+    let mut parts = result
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|content| content.get("text").and_then(Value::as_str))
+        .filter_map(bounded_tool_result)
+        .collect::<Vec<_>>();
+    if parts.is_empty()
+        && let Some(structured) = result.get("structuredContent")
+        && !structured.is_null()
+    {
+        parts.push(bounded_tool_result(&structured.to_string())?);
+    }
+    let raw = bounded_tool_result(&parts.join("\n"))?;
+    let trimmed = raw.trim_start();
+    let direct_text =
+        raw.chars().count() <= 600 && !trimmed.starts_with('{') && !trimmed.starts_with('[');
+    Some(FastToolSpeech {
+        turn_id,
+        label: label.clone(),
+        text: if direct_text {
+            raw
+        } else {
+            format!(
+                "{label} completed. Answer the user's request immediately and concisely using only this completed tool result. Do not mention internal tools:\n{raw}"
+            )
+        },
+    })
+}
+
+fn send_fast_tool_speech(
+    server: &mut CodexAppServer,
+    thread_id: &str,
+    turn_id: Option<&str>,
+    text: String,
+) -> Result<()> {
+    if let Some(turn_id) = turn_id {
+        let _ = server.send_request(
+            "turn/interrupt",
+            json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+            }),
+        );
+    }
+    server.send_request(
+        "thread/realtime/appendSpeech",
+        json!({
+            "threadId": thread_id,
+            "text": text,
+        }),
+    )?;
+    Ok(())
+}
+
 fn dynamic_tool_content_items(output: &str) -> (Value, bool) {
     let Ok(value) = serde_json::from_str::<Value>(output) else {
         return (json!([{"type": "inputText", "text": output}]), false);
@@ -3260,6 +4456,7 @@ fn dynamic_tool_request(message: &Value) -> Option<(Value, ToolCall)> {
             call_id,
             name,
             arguments,
+            requested_at: Instant::now(),
         },
     ))
 }
@@ -3795,7 +4992,27 @@ fn gpt_live_context_image_failed_params(thread_id: &str, upload_id: u64) -> Valu
 }
 
 fn gpt_live_system_prompt(shared_prompt: &str) -> String {
-    shared_prompt.to_owned()
+    format!(
+        "{shared_prompt}
+
+GPT-Live realtime tool rules:
+- When a request needs a connector, calendar, MCP, or local tool, start the required tool or delegation immediately as the first action. Do not speak an acknowledgement or plan first.
+- Consume streamed delegated results as they arrive. Reply as soon as the first reliable user-facing result is available; do not wait for optional analysis, extra searches, or a long summary.
+- Keep the spoken result concise and factual."
+    )
+}
+
+fn gpt_live_codex_system_prompt(shared_prompt: &str) -> String {
+    format!(
+        "{shared_prompt}
+
+GPT-Live delegated execution rules:
+- This is a latency-sensitive voice handoff. Use minimal reasoning for straightforward tool requests.
+- Call the required connector, calendar, MCP, or local tool immediately; do not narrate or plan before the call.
+- Avoid redundant discovery calls, repeated authentication checks, retries, and follow-up lookups unless the first call actually fails or lacks a required field.
+- Run independent read-only calls concurrently when more than one is truly necessary.
+- Emit the shortest useful final result immediately after the first successful tool response so app-server can stream it to GPT-Live."
+    )
 }
 
 fn image_metadata(image: &Attachment) -> Result<(String, u32, u32, usize)> {
@@ -3859,7 +5076,7 @@ where
 pub fn default_system_prompt(_screen: ScreenInfo) -> String {
     "- When this is a voice or realtime session and the user asks to click on the screen,call the tool at start of speak by yourself, do not ask text model
 
-- If the user asks to create an image, call create_image immediately. Use the configured image model and resolution unless the user explicitly specifies a supported model or resolution; after the tool result, describe the generated image briefly and accurately."
+- If the user asks to create an image, call create_image immediately. Use the configured image model and resolution unless the user explicitly specifies a supported model or resolution; after the tool result, describe the generated image briefly and accurately.\n\n- When a user message contains a note file change wrapped in a <note_FILENAME >...</note_FILENAME> block, reply exactly: note saved"
         .to_owned()
 }
 
@@ -4217,6 +5434,7 @@ fn extract_function_call_event(value: &Value) -> Option<ToolCall> {
         call_id,
         name,
         arguments,
+        requested_at: Instant::now(),
     })
 }
 
@@ -4235,6 +5453,7 @@ fn extract_function_calls(value: &Value) -> Vec<ToolCall> {
                 call_id,
                 name,
                 arguments,
+                requested_at: Instant::now(),
             })
         })
         .collect()
@@ -4262,12 +5481,13 @@ mod tests {
     };
 
     use super::{
-        CONNECT_AUDIO_BUFFER_MAX_SAMPLES, CONTEXT_IMAGE_UPLOAD_TIMEOUT, CodexContextImageResponse,
-        CodexHandoffAction, CodexHandoffState, CodexLiveState, CodexTextState, ConnectOptions,
-        Event, InFlightContextImage, OPENAI_VAD_SILENCE_MS, PendingAudioBuffer,
-        PendingOpenAiContextUpload, RealtimeBackend, ServerSignal, ToolCall,
+        CODEX_HANDOFF_FALLBACK_DELAY, CONNECT_AUDIO_BUFFER_MAX_SAMPLES,
+        CONTEXT_IMAGE_UPLOAD_TIMEOUT, CodexContextImageResponse, CodexHandoffAction,
+        CodexHandoffState, CodexLiveState, CodexTextState, ConnectOptions, Event,
+        InFlightContextImage, OPENAI_VAD_SILENCE_MS, PendingAudioBuffer,
+        PendingOpenAiContextUpload, RealtimeBackend, ServerSignal,
         codex_context_image_inject_params, codex_dynamic_tools, codex_live_initialize_capabilities,
-        codex_live_start_error, codex_live_thread_start_params,
+        codex_live_realtime_start_params, codex_live_start_error, codex_live_thread_start_params,
         codex_message_is_assistant_transcript, codex_message_starts_reply,
         codex_text_thread_start_params, codex_text_turn_start_params, codex_turn_input,
         context_image_item_event, context_image_item_id, context_image_upload_id,
@@ -4278,9 +5498,9 @@ mod tests {
         gpt_live_context_image_ready_params, handle_codex_context_image_response,
         handle_codex_handoff_message, handle_codex_live_message, handle_codex_text_message,
         handle_context_image_server_value, handle_server_event, input_image_content,
-        openai_context_response_blockers, openai_deferred_response_is_ready,
-        openai_function_output, response_total_tokens, shared_system_prompt,
-        take_latest_ready_codex_context_image, voice_tools,
+        local_tool_fast_speech, mcp_tool_fast_speech, openai_context_response_blockers,
+        openai_deferred_response_is_ready, openai_function_output, response_total_tokens,
+        shared_system_prompt, take_latest_ready_codex_context_image, voice_tools,
     };
     use crate::media::{Attachment, ScreenInfo, jpeg_upload_probe_attachment};
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -4359,21 +5579,14 @@ mod tests {
             }
         });
 
-        assert_eq!(
-            extract_function_calls(&event),
-            vec![
-                ToolCall {
-                    call_id: "call_1".to_owned(),
-                    name: "click_screen".to_owned(),
-                    arguments: "{\"x\":12,\"y\":34}".to_owned(),
-                },
-                ToolCall {
-                    call_id: "call_2".to_owned(),
-                    name: "insert_text".to_owned(),
-                    arguments: "{\"text\":\"hello\"}".to_owned(),
-                }
-            ]
-        );
+        let calls = extract_function_calls(&event);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].call_id, "call_1");
+        assert_eq!(calls[0].name, "click_screen");
+        assert_eq!(calls[0].arguments, "{\"x\":12,\"y\":34}");
+        assert_eq!(calls[1].call_id, "call_2");
+        assert_eq!(calls[1].name, "insert_text");
+        assert_eq!(calls[1].arguments, "{\"text\":\"hello\"}");
     }
 
     #[test]
@@ -4385,14 +5598,10 @@ mod tests {
             "arguments": "{\"x\":500,\"y\":300}"
         });
 
-        assert_eq!(
-            extract_function_call_event(&event),
-            Some(ToolCall {
-                call_id: "call_fast".to_owned(),
-                name: "click_screen".to_owned(),
-                arguments: "{\"x\":500,\"y\":300}".to_owned(),
-            })
-        );
+        let call = extract_function_call_event(&event).unwrap();
+        assert_eq!(call.call_id, "call_fast");
+        assert_eq!(call.name, "click_screen");
+        assert_eq!(call.arguments, "{\"x\":500,\"y\":300}");
     }
 
     #[test]
@@ -4414,6 +5623,7 @@ mod tests {
             "- When this is a voice or realtime session and the user asks to click on the screen,call the tool at start of speak by yourself, do not ask text model"
         ));
         assert!(prompt.contains("call create_image immediately"));
+        assert!(prompt.contains("reply exactly: note saved"));
         assert!(prompt.contains("configured image model and resolution"));
         assert!(!prompt.contains("Call ask_text_model as your first output"));
         assert!(!prompt.contains("GPT-Live visual-context rules"));
@@ -4515,13 +5725,21 @@ Call me Ecoo."
         let params =
             codex_live_thread_start_params(&options, "instructions".to_owned(), "/tmp".to_owned());
         let tools = params["dynamicTools"].as_array().unwrap();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 10);
         assert!(tools.iter().any(|tool| tool["name"] == "move_pointer"));
         assert!(tools.iter().any(|tool| tool["name"] == "click_screen"));
         assert!(tools.iter().any(|tool| tool["name"] == "run_bash"));
         assert!(tools.iter().any(|tool| tool["name"] == "insert_text"));
         assert!(tools.iter().any(|tool| tool["name"] == "ask_text_model"));
         assert!(tools.iter().any(|tool| tool["name"] == "create_image"));
+        for name in [
+            "replace_note_text",
+            "remove_note_text",
+            "rename_note",
+            "create_note",
+        ] {
+            assert!(tools.iter().any(|tool| tool["name"] == name));
+        }
         assert!(tools.iter().all(|tool| tool.get("inputSchema").is_some()));
     }
 
@@ -5422,11 +6640,19 @@ Call me Ecoo."
         assert_eq!(params["baseInstructions"], "instructions");
         assert_eq!(params["reasoningEffort"], "low");
         let tools = params["dynamicTools"].as_array().unwrap();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 9);
         assert!(tools.iter().any(|tool| tool["name"] == "click_screen"));
         assert!(tools.iter().any(|tool| tool["name"] == "run_bash"));
         assert!(!tools.iter().any(|tool| tool["name"] == "ask_text_model"));
         assert!(tools.iter().any(|tool| tool["name"] == "create_image"));
+        for name in [
+            "replace_note_text",
+            "remove_note_text",
+            "rename_note",
+            "create_note",
+        ] {
+            assert!(tools.iter().any(|tool| tool["name"] == name));
+        }
     }
 
     #[test]
@@ -5438,7 +6664,142 @@ Call me Ecoo."
     }
 
     #[test]
-    fn completed_client_managed_handoff_returns_exact_speakable_result() {
+    fn completed_calendar_mcp_result_uses_fast_speech_lane() {
+        let fast = mcp_tool_fast_speech(&json!({
+            "method": "item/completed",
+            "params": {
+                "turnId": "turn-calendar",
+                "item": {
+                    "type": "mcpToolCall",
+                    "status": "completed",
+                    "server": "codex_apps",
+                    "tool": "calendar_search",
+                    "appContext": {"appName": "Google Calendar"},
+                    "result": {
+                        "content": [{
+                            "type": "text",
+                            "text": "Team sync is at 3 PM."
+                        }],
+                        "structuredContent": null
+                    },
+                    "error": null
+                }
+            }
+        }))
+        .expect("fast Calendar result");
+        assert_eq!(fast.turn_id, "turn-calendar");
+        assert_eq!(fast.label, "Google Calendar");
+        assert!(fast.text.contains("Team sync is at 3 PM."));
+        assert_eq!(fast.text, "Team sync is at 3 PM.");
+    }
+
+    #[test]
+    fn failed_or_large_mcp_result_does_not_use_fast_speech_lane() {
+        assert!(
+            mcp_tool_fast_speech(&json!({
+                "method": "item/completed",
+                "params": {
+                    "turnId": "turn-failed",
+                    "item": {
+                        "type": "mcpToolCall",
+                        "status": "failed",
+                        "server": "codex_apps",
+                        "tool": "calendar_search",
+                        "result": null,
+                        "error": {"message": "auth failed"}
+                    }
+                }
+            }))
+            .is_none()
+        );
+        let huge = "x".repeat(2_001);
+        assert!(
+            mcp_tool_fast_speech(&json!({
+                "method": "item/completed",
+                "params": {
+                    "turnId": "turn-large",
+                    "item": {
+                        "type": "mcpToolCall",
+                        "status": "completed",
+                        "server": "codex_apps",
+                        "tool": "calendar_search",
+                        "result": {"content": [{"type": "text", "text": huge}]},
+                        "error": null
+                    }
+                }
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn pointer_and_insert_results_use_exact_fast_speech() {
+        assert_eq!(
+            local_tool_fast_speech(
+                "click_screen",
+                r#"{"ok":true,"assistant_reply":"Done","assistant_reply_exact":true}"#,
+                true,
+            ),
+            Some("Done".to_owned())
+        );
+        assert_eq!(
+            local_tool_fast_speech("insert_text", r#"{"ok":true}"#, true),
+            Some("Done.".to_owned())
+        );
+        assert!(local_tool_fast_speech("insert_text", r#"{"ok":false}"#, false).is_none());
+    }
+
+    #[test]
+    fn gpt_live_uses_streaming_handoffs_and_no_reasoning() {
+        let params = codex_live_realtime_start_params(
+            "thread-1",
+            "v=0\r\n".to_owned(),
+            "ember",
+            "prompt".to_owned(),
+        );
+        assert_eq!(params["clientManagedHandoffs"], false);
+        assert_eq!(params["codexResponsesAsItems"], false);
+        assert_eq!(params["delegationAckFiller"], false);
+        assert_eq!(params["codexResponseHandoffMode"], "thinking");
+
+        let options = ConnectOptions {
+            backend: RealtimeBackend::CodexGptLive,
+            api_key: "secret".to_owned(),
+            chatgpt_account_id: Some("account".to_owned()),
+            model: "unused".to_owned(),
+            voice: "ember".to_owned(),
+            thinking_level: "high".to_owned(),
+            system_prompt: "prompt".to_owned(),
+            screen_info: ScreenInfo {
+                origin_x: 0,
+                origin_y: 0,
+                logical_width: 1408,
+                logical_height: 881,
+                backing_width: 2816,
+                backing_height: 1762,
+                scale_factor: 2.0,
+            },
+        };
+        let thread =
+            codex_live_thread_start_params(&options, "prompt".to_owned(), "/tmp".to_owned());
+        assert_eq!(thread["reasoningEffort"], "none");
+    }
+
+    #[test]
+    fn spoken_output_cancels_completed_handoff_fallback() {
+        let mut state = CodexHandoffState::default();
+        state.schedule_fallback("result".to_owned());
+        state.note_spoken_output();
+        assert_eq!(
+            state.take_fallback_if_due(
+                Instant::now() + CODEX_HANDOFF_FALLBACK_DELAY + Duration::from_secs(1)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn completed_handoff_schedules_exact_fallback_result() {
         let (events, _received) = std::sync::mpsc::channel();
         let mut state = CodexHandoffState::default();
 
@@ -5476,10 +6837,16 @@ Call me Ecoo."
                 &mut state,
             )
             .unwrap(),
-            CodexHandoffAction::Speak("dog".to_owned())
+            CodexHandoffAction::Handled
         );
         assert!(state.active_turn_id.is_none());
         assert!(state.response_text.is_empty());
+        assert_eq!(
+            state.take_fallback_if_due(
+                Instant::now() + CODEX_HANDOFF_FALLBACK_DELAY + Duration::from_millis(1)
+            ),
+            Some("dog".to_owned())
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use bytes::Bytes;
 use opus::{Application, Channels, Decoder, Encoder, Signal};
 use std::{collections::VecDeque, sync::Arc, time::Duration};
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use webrtc::{
     api::{
         APIBuilder,
@@ -153,6 +153,22 @@ fn send_gated_remote_audio(
 ///
 /// Codex app-server owns authentication, call creation and the sideband event
 /// stream. This object owns only the peer connection's audio media path.
+#[derive(Clone)]
+pub(crate) struct GptLiveAudioSender {
+    tx: UnboundedSender<Vec<i16>>,
+}
+
+impl GptLiveAudioSender {
+    pub(crate) fn send_pcm24k(&self, samples: &[i16]) -> Result<()> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        self.tx
+            .send(samples.to_vec())
+            .map_err(|_| anyhow::anyhow!("GPT-Live microphone sender stopped"))
+    }
+}
+
 pub struct GptLivePeer {
     peer: Arc<RTCPeerConnection>,
     _local_audio: Arc<TrackLocalStaticSample>,
@@ -439,6 +455,12 @@ impl GptLivePeer {
             .set_remote_description(answer)
             .await
             .context("Could not apply the GPT-Live SDP answer")
+    }
+
+    pub(crate) fn audio_sender(&self) -> GptLiveAudioSender {
+        GptLiveAudioSender {
+            tx: self.local_audio_tx.clone(),
+        }
     }
 
     /// Enqueues 24 kHz mono PCM for the dedicated RTP sender task. Keeping

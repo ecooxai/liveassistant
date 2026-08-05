@@ -1,3 +1,4 @@
+use crate::notes;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -71,6 +72,7 @@ fn execute_inner(name: &str, arguments: &str, screen_context: ScreenContext) -> 
         "click_screen" => click_screen(arguments, screen_context),
         "run_bash" => run_bash(arguments),
         "insert_text" => insert_text(arguments),
+        name if notes::is_note_tool(name) => notes::execute_tool(name, arguments),
         _ => bail!("Unknown tool: {name}"),
     }
 }

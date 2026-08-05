@@ -7,6 +7,7 @@ mod gpt_live_webrtc;
 mod image_generation;
 mod live_pointer;
 mod media;
+mod notes;
 mod realtime;
 mod resample;
 mod tools;
@@ -68,6 +69,18 @@ impl Drop for SingleInstanceGuard {
 fn main() -> eframe::Result<()> {
     if std::env::args().any(|argument| argument == "--test-click") {
         return click_test::run();
+    }
+    if std::env::args().any(|argument| argument == "--test-gpt-live-tool-latency") {
+        match realtime::probe_codex_gpt_live_tool_latency() {
+            Ok(()) => {
+                println!("GPT-Live tool latency probe succeeded under the realtime target.");
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("GPT-Live tool latency probe failed: {error:#}");
+                std::process::exit(1);
+            }
+        }
     }
     if std::env::args().any(|argument| argument == "--test-gpt-live-native") {
         match realtime::probe_codex_gpt_live_native() {

@@ -4,6 +4,7 @@ use crate::{
     codex_account::{self, CodexAccountInfo, CodexUsageInfo, RateLimitWindow},
     image_generation, live_pointer,
     media::{self, Attachment, ScreenInfo},
+    notes,
     realtime::{
         CONTEXT_IMAGE_UPLOAD_TIMEOUT, Command, ConnectOptions, Event, RealtimeBackend,
         RealtimeClient, ToolOutput, available_tool_descriptions, default_system_prompt,
@@ -18,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     mem,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         mpsc::{self, Receiver, Sender},
@@ -218,9 +219,10 @@ const OPENAI_REALTIME_TOOL_GUIDANCE: &str = "- OpenAI Realtime fast tool behavio
   - When a user request requires a tool, call the required tool as the first response output, before speaking or emitting assistant text. Do not acknowledge, explain, or promise before the tool call.
   - After the tool result arrives, reply to the user briefly and accurately with the real result. This tool-first order is required for faster actions.
   - For screen click requests, call ask_text_model first with include_screenshot=true and instruct it to inspect the fresh screenshot and perform the click with click_screen. Do not estimate coordinates or call click_screen directly in the OpenAI Realtime layer.";
+const NOTE_CHANGE_SYSTEM_GUIDANCE: &str = "- When a user message contains a note file change wrapped in a <note_FILENAME >...</note_FILENAME> block, reply exactly: note saved";
 
 fn configured_system_prompt(settings: &Settings, screen: ScreenInfo) -> String {
-    if !settings.system_prompt.trim().is_empty() {
+    let mut prompt = if !settings.system_prompt.trim().is_empty() {
         settings.system_prompt.clone()
     } else if !settings.instructions.trim().is_empty() {
         // Compatibility for settings created before the full prompt became
@@ -228,7 +230,12 @@ fn configured_system_prompt(settings: &Settings, screen: ScreenInfo) -> String {
         shared_system_prompt(&settings.instructions, screen)
     } else {
         default_system_prompt(screen)
+    };
+    if !prompt.contains("reply exactly: note saved") {
+        prompt.push_str("\n\n");
+        prompt.push_str(NOTE_CHANGE_SYSTEM_GUIDANCE);
     }
+    prompt
 }
 
 fn connection_system_prompt(settings: &Settings, screen: ScreenInfo) -> String {
@@ -1007,6 +1014,13 @@ impl TabSession {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum BottomWorkspace {
+    #[default]
+    Chat,
+    Note,
+}
+
 struct AssistantTab {
     session: TabSession,
 }
@@ -1030,6 +1044,15 @@ pub struct LiveAssistantApp {
     status: String,
     error: Option<String>,
     composer: String,
+    bottom_workspace: BottomWorkspace,
+    note_files: Vec<PathBuf>,
+    active_note: Option<PathBuf>,
+    note_content: String,
+    note_saved_content: String,
+    note_dirty_since: Option<Instant>,
+    renaming_note: Option<PathBuf>,
+    rename_buffer: String,
+    rename_needs_focus: bool,
     pending: Vec<Attachment>,
     messages: Vec<ChatMessage>,
     active_assistant_message: Option<usize>,
@@ -1152,6 +1175,180 @@ fn remap_message_index(index: usize, placement: UserMessagePlacement) -> usize {
     }
 }
 
+fn centered_icon_button(
+    ui: &mut egui::Ui,
+    _id_source: impl std::hash::Hash,
+    size: f32,
+    paint_icon: impl FnOnce(&egui::Painter, egui::Rect, Stroke),
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
+    let stroke = if response.hovered() || response.has_focus() {
+        ui.visuals().widgets.hovered.fg_stroke
+    } else {
+        ui.visuals().widgets.inactive.fg_stroke
+    };
+    paint_icon(ui.painter(), rect, stroke);
+    response
+}
+
+fn centered_plus_button(
+    ui: &mut egui::Ui,
+    id_source: impl std::hash::Hash,
+    size: f32,
+) -> egui::Response {
+    centered_icon_button(ui, id_source, size, |painter, rect, mut stroke| {
+        stroke.width = stroke.width.max(1.5);
+        let center = rect.center();
+        let arm = (size * 0.20).clamp(4.0, 5.0);
+        painter.line_segment(
+            [
+                egui::pos2(center.x - arm, center.y),
+                egui::pos2(center.x + arm, center.y),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(center.x, center.y - arm),
+                egui::pos2(center.x, center.y + arm),
+            ],
+            stroke,
+        );
+    })
+}
+
+fn centered_down_button(
+    ui: &mut egui::Ui,
+    id_source: impl std::hash::Hash,
+    size: f32,
+) -> egui::Response {
+    centered_icon_button(ui, id_source, size, |painter, rect, mut stroke| {
+        stroke.width = stroke.width.max(1.5);
+        let center = rect.center();
+        let shaft_top = center.y - 5.0;
+        let tip_y = center.y + 5.0;
+        painter.line_segment(
+            [egui::pos2(center.x, shaft_top), egui::pos2(center.x, tip_y)],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(center.x - 4.0, tip_y - 4.0),
+                egui::pos2(center.x, tip_y),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(center.x + 4.0, tip_y - 4.0),
+                egui::pos2(center.x, tip_y),
+            ],
+            stroke,
+        );
+    })
+}
+
+fn centered_open_button(
+    ui: &mut egui::Ui,
+    id_source: impl std::hash::Hash,
+    size: f32,
+) -> egui::Response {
+    centered_icon_button(ui, id_source, size, |painter, rect, mut stroke| {
+        stroke.width = stroke.width.max(1.5);
+        let center = rect.center();
+        let start = center + egui::vec2(-4.0, 4.0);
+        let end = center + egui::vec2(4.0, -4.0);
+        painter.line_segment([start, end], stroke);
+        painter.line_segment([end, end + egui::vec2(-4.5, 0.0)], stroke);
+        painter.line_segment([end, end + egui::vec2(0.0, 4.5)], stroke);
+    })
+}
+
+fn centered_attach_button(
+    ui: &mut egui::Ui,
+    id_source: impl std::hash::Hash,
+    size: f32,
+) -> egui::Response {
+    centered_icon_button(ui, id_source, size, |painter, rect, mut stroke| {
+        stroke.width = stroke.width.max(1.45);
+        let c = rect.center();
+        painter.add(egui::Shape::line(
+            vec![
+                c + egui::vec2(-4.5, 1.5),
+                c + egui::vec2(-4.5, -3.0),
+                c + egui::vec2(-2.0, -5.5),
+                c + egui::vec2(1.5, -5.5),
+                c + egui::vec2(4.5, -2.5),
+                c + egui::vec2(4.5, 3.0),
+                c + egui::vec2(2.0, 5.5),
+                c + egui::vec2(-1.0, 5.5),
+                c + egui::vec2(-3.0, 3.5),
+                c + egui::vec2(-3.0, -1.5),
+                c + egui::vec2(-1.5, -3.0),
+                c + egui::vec2(1.0, -3.0),
+                c + egui::vec2(2.5, -1.5),
+                c + egui::vec2(2.5, 2.0),
+            ],
+            stroke,
+        ));
+    })
+}
+
+fn centered_paste_button(
+    ui: &mut egui::Ui,
+    id_source: impl std::hash::Hash,
+    size: f32,
+) -> egui::Response {
+    let panel_fill = ui.visuals().panel_fill;
+    centered_icon_button(ui, id_source, size, |painter, rect, mut stroke| {
+        stroke.width = stroke.width.max(1.4);
+        let body = egui::Rect::from_center_size(
+            rect.center() + egui::vec2(0.0, 1.0),
+            egui::vec2(10.0, 12.0),
+        );
+        painter.rect_stroke(body, 1.5, stroke, egui::StrokeKind::Inside);
+        let clip = egui::Rect::from_center_size(
+            egui::pos2(rect.center().x, body.top()),
+            egui::vec2(5.5, 3.0),
+        );
+        painter.rect_filled(clip, 1.0, panel_fill);
+        painter.rect_stroke(clip, 1.0, stroke, egui::StrokeKind::Inside);
+    })
+}
+
+fn sidebar_text_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
+    let height = 24.0;
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), height),
+        egui::Sense::click(),
+    );
+    let color = if selected {
+        Color32::from_rgb(32, 112, 177)
+    } else if response.hovered() {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().text_color()
+    };
+    let font_id = egui::TextStyle::Body.resolve(ui.style());
+    ui.painter().text(
+        egui::pos2(rect.left() + 4.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        text,
+        font_id,
+        color,
+    );
+    if selected {
+        ui.painter().line_segment(
+            [
+                egui::pos2(rect.left(), rect.top() + 3.0),
+                egui::pos2(rect.left(), rect.bottom() - 3.0),
+            ],
+            Stroke::new(2.0, color),
+        );
+    }
+    response
+}
+
 impl LiveAssistantApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure_style(&cc.egui_ctx);
@@ -1194,6 +1391,7 @@ impl LiveAssistantApp {
         let (screenshot_result_tx, screenshot_result_rx) = mpsc::channel();
         let [gpt_live_tab_settings, realtime_tab_settings] = default_voice_tab_settings(&settings);
         settings = gpt_live_tab_settings.clone();
+        let note_files = notes::list_notes().unwrap_or_default();
         let mut app = Self {
             realtime: RealtimeClient::spawn(),
             microphone: None,
@@ -1205,6 +1403,15 @@ impl LiveAssistantApp {
             status: "Ready".to_owned(),
             error: None,
             composer: String::new(),
+            bottom_workspace: BottomWorkspace::Chat,
+            note_files,
+            active_note: None,
+            note_content: String::new(),
+            note_saved_content: String::new(),
+            note_dirty_since: None,
+            renaming_note: None,
+            rename_buffer: String::new(),
+            rename_needs_focus: false,
             pending: Vec::new(),
             messages: Vec::new(),
             active_assistant_message: None,
@@ -1771,6 +1978,7 @@ impl LiveAssistantApp {
         }
 
         while let Ok((tab_index, call_id, output)) = self.tool_result_rx.try_recv() {
+            self.apply_note_tool_result(&output);
             if tab_index == self.active_tab {
                 apply_tool_result_to_messages(&mut self.messages, &call_id, &output);
             } else if let Some(tab) = self.tabs.get_mut(tab_index) {
@@ -2286,40 +2494,48 @@ impl LiveAssistantApp {
                     let local_calls = calls
                         .into_iter()
                         .filter(|call| voice_tool_route(&call.name) == VoiceToolRoute::Local)
+                        .map(|call| self.prepare_note_tool_call(call))
                         .collect::<Vec<_>>();
                     if local_calls.is_empty() {
                         continue;
                     }
-                    let commands = self.realtime.commands.clone();
                     let tab_index = self.active_tab;
                     let screenshot_width = self.settings.screenshot_width;
                     let screenshot_height = self.settings.screenshot_height;
-                    let tool_result_tx = self.tool_result_tx.clone();
-                    thread::spawn(move || {
-                        let screen_context = tools::ScreenContext {
-                            screenshot_width,
-                            screenshot_height,
-                        };
-                        let outputs: Vec<_> = local_calls
-                            .into_iter()
-                            .map(|call| ToolOutput {
-                                call_id: call.call_id,
-                                output: tools::execute_with_context(
-                                    &call.name,
-                                    &call.arguments,
-                                    screen_context,
-                                ),
-                            })
-                            .collect();
-                        for output in &outputs {
+                    for call in local_calls {
+                        let commands = self.realtime.commands.clone();
+                        let tool_result_tx = self.tool_result_tx.clone();
+                        thread::spawn(move || {
+                            let screen_context = tools::ScreenContext {
+                                screenshot_width,
+                                screenshot_height,
+                            };
+                            let call_id = call.call_id;
+                            let name = call.name;
+                            let arguments = call.arguments;
+                            let queue_ms = call.requested_at.elapsed().as_millis();
+                            let execute_started = Instant::now();
+                            let output =
+                                tools::execute_with_context(&name, &arguments, screen_context);
+                            eprintln!(
+                                "[live-assistant latency] call_id={} name={} stage=local.execute_complete queue_ms={} execute_ms={} total_ms={}",
+                                call_id,
+                                name,
+                                queue_ms,
+                                execute_started.elapsed().as_millis(),
+                                call.requested_at.elapsed().as_millis(),
+                            );
+                            let tool_output = ToolOutput { call_id, output };
                             let _ = tool_result_tx.send((
                                 tab_index,
-                                output.call_id.clone(),
-                                output.output.clone(),
+                                tool_output.call_id.clone(),
+                                tool_output.output.clone(),
                             ));
-                        }
-                        let _ = commands.send(Command::ToolOutputs(outputs));
-                    });
+                            // Submit each result as soon as it is available instead
+                            // of waiting for unrelated parallel calls to finish.
+                            let _ = commands.send(Command::ToolOutputs(vec![tool_output]));
+                        });
+                    }
                 }
                 Event::ToolOutputsSubmitted { count } => {
                     self.tool_calls_running = self.tool_calls_running.saturating_sub(count);
@@ -3496,6 +3712,7 @@ impl LiveAssistantApp {
         let calls = calls
             .into_iter()
             .filter(|call| call.name != "create_image")
+            .map(|call| self.prepare_note_tool_call(call))
             .collect::<Vec<_>>();
         if calls.is_empty() {
             return;
@@ -3510,29 +3727,37 @@ impl LiveAssistantApp {
                 )
             })
             .unwrap_or((1440, 900));
-        let tool_result_tx = self.tool_result_tx.clone();
-        thread::spawn(move || {
-            let screen_context = tools::ScreenContext {
-                screenshot_width,
-                screenshot_height,
-            };
-            let outputs: Vec<_> = calls
-                .into_iter()
-                .map(|call| ToolOutput {
-                    call_id: call.call_id,
-                    output: tools::execute_with_context(
-                        &call.name,
-                        &call.arguments,
-                        screen_context,
-                    ),
-                })
-                .collect();
-            for output in &outputs {
-                let _ =
-                    tool_result_tx.send((tab_index, output.call_id.clone(), output.output.clone()));
-            }
-            let _ = commands.send(Command::ToolOutputs(outputs));
-        });
+        for call in calls {
+            let commands = commands.clone();
+            let tool_result_tx = self.tool_result_tx.clone();
+            thread::spawn(move || {
+                let screen_context = tools::ScreenContext {
+                    screenshot_width,
+                    screenshot_height,
+                };
+                let call_id = call.call_id;
+                let name = call.name;
+                let arguments = call.arguments;
+                let queue_ms = call.requested_at.elapsed().as_millis();
+                let execute_started = Instant::now();
+                let output = tools::execute_with_context(&name, &arguments, screen_context);
+                eprintln!(
+                    "[live-assistant latency] call_id={} name={} stage=background.execute_complete queue_ms={} execute_ms={} total_ms={}",
+                    call_id,
+                    name,
+                    queue_ms,
+                    execute_started.elapsed().as_millis(),
+                    call.requested_at.elapsed().as_millis(),
+                );
+                let tool_output = ToolOutput { call_id, output };
+                let _ = tool_result_tx.send((
+                    tab_index,
+                    tool_output.call_id.clone(),
+                    tool_output.output.clone(),
+                ));
+                let _ = commands.send(Command::ToolOutputs(vec![tool_output]));
+            });
+        }
     }
 
     fn resolve_image_credentials(
@@ -3766,8 +3991,7 @@ impl LiveAssistantApp {
                     requested_switch = Some(index);
                 }
             }
-            if ui
-                .button("＋")
+            if centered_plus_button(ui, "new-model-tab", 22.0)
                 .on_hover_text("Open a new model tab")
                 .clicked()
             {
@@ -4186,6 +4410,340 @@ impl LiveAssistantApp {
         }
     }
 
+    fn refresh_note_files(&mut self) {
+        match notes::list_notes() {
+            Ok(files) => self.note_files = files,
+            Err(error) => self.error = Some(format!("{error:#}")),
+        }
+    }
+
+    fn active_note_name(&self) -> Option<String> {
+        self.active_note.as_deref().map(notes::display_name)
+    }
+
+    fn queue_note_changed(&mut self, note_name: &str, content: &str) {
+        let text = note_change_message(note_name, content);
+        self.append_user_message(ChatMessage::user_text(text.clone(), &[]));
+        self.pending_turns.push_back(PendingTurn {
+            text,
+            attachments: Vec::new(),
+            thinking_level: self.settings.thinking_level.wire_value().to_owned(),
+        });
+        if self.state == ConnectionState::Offline {
+            self.start();
+        } else if self.state == ConnectionState::Live {
+            self.flush_pending_turn();
+        } else {
+            self.status = "Connecting… will send note when ready".to_owned();
+        }
+    }
+
+    fn flush_dirty_note(&mut self, notify_ai: bool) -> bool {
+        if self.note_content == self.note_saved_content {
+            self.note_dirty_since = None;
+            return true;
+        }
+        let Some(path) = self.active_note.clone() else {
+            return false;
+        };
+        if let Err(error) = notes::save_note(&path, &self.note_content) {
+            self.error = Some(format!("{error:#}"));
+            return false;
+        }
+        self.note_saved_content = self.note_content.clone();
+        self.note_dirty_since = None;
+        if notify_ai {
+            let name = notes::display_name(&path);
+            let content = self.note_content.clone();
+            self.queue_note_changed(&name, &content);
+        }
+        true
+    }
+
+    fn maybe_autosave_note(&mut self) {
+        let ready = self
+            .note_dirty_since
+            .is_some_and(|changed_at| changed_at.elapsed() >= Duration::from_secs(3));
+        if ready {
+            self.flush_dirty_note(true);
+        }
+    }
+
+    fn select_note(&mut self, path: PathBuf) {
+        if self.active_note.as_ref() == Some(&path)
+            && self.bottom_workspace == BottomWorkspace::Note
+        {
+            return;
+        }
+        if !self.flush_dirty_note(true) {
+            return;
+        }
+        match notes::read_note(&path) {
+            Ok(content) => {
+                self.active_note = Some(path);
+                self.note_content = content.clone();
+                self.note_saved_content = content;
+                self.note_dirty_since = None;
+                self.renaming_note = None;
+                self.rename_buffer.clear();
+                self.bottom_workspace = BottomWorkspace::Note;
+            }
+            Err(error) => self.error = Some(format!("{error:#}")),
+        }
+    }
+
+    fn create_note_from_ui(&mut self) {
+        if !self.flush_dirty_note(true) {
+            return;
+        }
+        match notes::create_unique_note("Untitled.md", "") {
+            Ok(path) => {
+                self.refresh_note_files();
+                self.select_note(path.clone());
+                self.rename_buffer = notes::display_name(&path);
+                self.renaming_note = Some(path);
+                self.rename_needs_focus = true;
+            }
+            Err(error) => self.error = Some(format!("{error:#}")),
+        }
+    }
+
+    fn import_note_from_ui(&mut self) {
+        let Some(source) = rfd::FileDialog::new()
+            .add_filter("Markdown or text", &["md", "markdown", "txt", "text"])
+            .pick_file()
+        else {
+            return;
+        };
+        if !self.flush_dirty_note(true) {
+            return;
+        }
+        match notes::import_text_file(&source) {
+            Ok(path) => {
+                self.refresh_note_files();
+                self.select_note(path);
+            }
+            Err(error) => self.error = Some(format!("{error:#}")),
+        }
+    }
+
+    fn start_note_rename(&mut self, path: PathBuf) {
+        self.rename_buffer = notes::display_name(&path);
+        self.renaming_note = Some(path);
+        self.rename_needs_focus = true;
+    }
+
+    fn commit_note_rename(&mut self) {
+        let Some(path) = self.renaming_note.take() else {
+            return;
+        };
+        let new_name = self.rename_buffer.trim().to_owned();
+        self.rename_buffer.clear();
+        if new_name.is_empty() {
+            return;
+        }
+        if !self.flush_dirty_note(true) {
+            self.renaming_note = Some(path);
+            self.rename_buffer = new_name;
+            return;
+        }
+        match notes::rename_note(&path, &new_name) {
+            Ok(new_path) => {
+                if self.active_note.as_ref() == Some(&path) {
+                    self.active_note = Some(new_path.clone());
+                }
+                self.refresh_note_files();
+            }
+            Err(error) => {
+                self.error = Some(format!("{error:#}"));
+                self.renaming_note = Some(path);
+                self.rename_buffer = new_name;
+            }
+        }
+    }
+
+    fn draw_note_sidebar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if centered_plus_button(ui, "new-note", 24.0)
+                .on_hover_text("New note")
+                .clicked()
+            {
+                self.create_note_from_ui();
+            }
+            if centered_open_button(ui, "open-note", 24.0)
+                .on_hover_text("Open text file")
+                .clicked()
+            {
+                self.import_note_from_ui();
+            }
+        });
+        ui.add_space(3.0);
+        let chat_selected = self.bottom_workspace == BottomWorkspace::Chat;
+        if sidebar_text_button(ui, "Chat", chat_selected).clicked() {
+            if self.flush_dirty_note(true) {
+                self.bottom_workspace = BottomWorkspace::Chat;
+                self.renaming_note = None;
+            }
+        }
+        ui.separator();
+
+        let files = self.note_files.clone();
+        egui::ScrollArea::vertical()
+            .id_salt("note-file-list")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for path in files {
+                    let selected = self.active_note.as_ref() == Some(&path)
+                        && self.bottom_workspace == BottomWorkspace::Note;
+                    if self.renaming_note.as_ref() == Some(&path) {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut self.rename_buffer)
+                                .desired_width(ui.available_width()),
+                        );
+                        if self.rename_needs_focus {
+                            response.request_focus();
+                            self.rename_needs_focus = false;
+                        }
+                        let commit = response.lost_focus()
+                            || ui.input(|input| input.key_pressed(egui::Key::Enter));
+                        let cancel = ui.input(|input| input.key_pressed(egui::Key::Escape));
+                        if cancel {
+                            self.renaming_note = None;
+                            self.rename_buffer.clear();
+                            self.rename_needs_focus = false;
+                        } else if commit {
+                            self.commit_note_rename();
+                        }
+                        continue;
+                    }
+                    let name = notes::display_name(&path);
+                    let response = sidebar_text_button(ui, &name, selected);
+                    if response.clicked() {
+                        if selected {
+                            self.start_note_rename(path);
+                        } else {
+                            self.select_note(path);
+                        }
+                    }
+                }
+            });
+    }
+
+    fn draw_note_editor(&mut self, ui: &mut egui::Ui) {
+        if self.active_note.is_none() {
+            ui.centered_and_justified(|ui| {
+                ui.label("Create or open a Markdown/text note from the file list.");
+            });
+            return;
+        }
+        let response = ui.add_sized(
+            ui.available_size(),
+            egui::TextEdit::multiline(&mut self.note_content)
+                .code_editor()
+                .desired_width(f32::INFINITY)
+                .lock_focus(true)
+                .hint_text("Write Markdown…"),
+        );
+        if response.changed() {
+            self.note_dirty_since = Some(Instant::now());
+        }
+    }
+
+    fn draw_bottom_workspace(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        egui::SidePanel::left("bottom-note-files")
+            .resizable(true)
+            .default_width(100.0)
+            .width_range(75.0..=320.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(241, 245, 250))
+                    .inner_margin(egui::Margin::symmetric(6, 6)),
+            )
+            .show_inside(ui, |ui| self.draw_note_sidebar(ui));
+
+        ui.vertical(|ui| {
+            if let Some(error) = self.error.clone() {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(255, 235, 237))
+                    .stroke(Stroke::new(1.0, Color32::from_rgb(239, 188, 195)))
+                    .corner_radius(7.0)
+                    .inner_margin(egui::Margin::symmetric(9, 6))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(Color32::from_rgb(166, 34, 48), error);
+                            if ui.small_button("×").clicked() {
+                                self.error = None;
+                            }
+                        });
+                    });
+                ui.add_space(7.0);
+            }
+            match self.bottom_workspace {
+                BottomWorkspace::Chat => self.draw_composer(ui, ctx),
+                BottomWorkspace::Note => self.draw_note_editor(ui),
+            }
+        });
+    }
+
+    fn prepare_note_tool_call(
+        &self,
+        mut call: crate::realtime::ToolCall,
+    ) -> crate::realtime::ToolCall {
+        if !notes::uses_current_note(&call.name) {
+            return call;
+        }
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&call.arguments) else {
+            return call;
+        };
+        let Some(object) = value.as_object_mut() else {
+            return call;
+        };
+        let needs_name = object
+            .get("note_name")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|name| name.trim().is_empty());
+        if needs_name && let Some(name) = self.active_note_name() {
+            object.insert("note_name".to_owned(), serde_json::Value::String(name));
+            call.arguments = value.to_string();
+        }
+        call
+    }
+
+    fn apply_note_tool_result(&mut self, output: &str) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(output) else {
+            return;
+        };
+        if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+            || value
+                .get("note_changed")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            return;
+        }
+        let Some(name) = value.get("note_name").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let Ok(path) = notes::path_for_name(name) else {
+            return;
+        };
+        let content = value
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| notes::read_note(&path).ok())
+            .unwrap_or_default();
+        self.refresh_note_files();
+        self.active_note = Some(path);
+        self.note_content = content.clone();
+        self.note_saved_content = content;
+        self.note_dirty_since = None;
+        self.renaming_note = None;
+        self.rename_buffer.clear();
+        self.rename_needs_focus = false;
+        self.bottom_workspace = BottomWorkspace::Note;
+    }
+
     fn draw_composer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let pasted_image = ctx.input(|input| {
             input.key_pressed(egui::Key::V) && (input.modifiers.command || input.modifiers.ctrl)
@@ -4249,8 +4807,9 @@ impl LiveAssistantApp {
             .corner_radius(12.0)
             .inner_margin(egui::Margin::same(8))
             .show(ui, |ui| {
+                let editor_height = (ui.available_height() - 44.0).max(120.0);
                 let response = ui.add_sized(
-                    [ui.available_width(), 56.0],
+                    [ui.available_width(), editor_height],
                     egui::TextEdit::multiline(&mut self.composer)
                         .hint_text(
                             "Message the assistant…  (Enter to send, Shift+Enter for a new line)",
@@ -4262,7 +4821,9 @@ impl LiveAssistantApp {
                         input.key_pressed(egui::Key::Enter) && !input.modifiers.shift
                     });
                 ui.horizontal(|ui| {
-                    if ui.button("＋ Attach").clicked()
+                    if centered_attach_button(ui, "attach-file", 24.0)
+                        .on_hover_text("Attach image or audio")
+                        .clicked()
                         && let Some(path) = rfd::FileDialog::new()
                             .add_filter(
                                 "Image or audio",
@@ -4275,7 +4836,10 @@ impl LiveAssistantApp {
                     {
                         self.attach_path(&path);
                     }
-                    if ui.button("▣ Paste image").clicked() {
+                    if centered_paste_button(ui, "paste-image", 24.0)
+                        .on_hover_text("Paste image")
+                        .clicked()
+                    {
                         match media::image_from_clipboard() {
                             Ok(image) => self.pending.push(image),
                             Err(error) => self.error = Some(error.to_string()),
@@ -5096,6 +5660,7 @@ impl eframe::App for LiveAssistantApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.flush_dirty_note(false);
         eframe::set_value(storage, SETTINGS_KEY, &self.settings);
     }
 
@@ -5104,6 +5669,7 @@ impl eframe::App for LiveAssistantApp {
             self.pointer_overlay.poll();
         }
         self.process_events(ctx);
+        self.maybe_autosave_note();
         self.maybe_refresh_codex_usage();
         self.maybe_send_speech_screenshot(ctx);
         ctx.request_repaint_after(Duration::from_millis(40));
@@ -5121,32 +5687,17 @@ impl eframe::App for LiveAssistantApp {
             self.draw_model_picker(ctx);
         }
 
-        egui::TopBottomPanel::bottom("composer")
-            .resizable(false)
+        egui::TopBottomPanel::bottom("composer-workspace-v2")
+            .resizable(true)
+            .default_height((ctx.screen_rect().height() * 0.48).max(240.0))
+            .min_height(200.0)
+            .max_height((ctx.screen_rect().height() * 0.82).max(320.0))
             .frame(
                 egui::Frame::new()
                     .fill(Color32::from_rgb(247, 249, 252))
-                    .inner_margin(egui::Margin::symmetric(18, 12)),
+                    .inner_margin(egui::Margin::symmetric(6, 6)),
             )
-            .show(ctx, |ui| {
-                if let Some(error) = self.error.clone() {
-                    egui::Frame::new()
-                        .fill(Color32::from_rgb(255, 235, 237))
-                        .stroke(Stroke::new(1.0, Color32::from_rgb(239, 188, 195)))
-                        .corner_radius(7.0)
-                        .inner_margin(egui::Margin::symmetric(9, 6))
-                        .show(ui, |ui| {
-                            ui.horizontal(|ui| {
-                                ui.colored_label(Color32::from_rgb(166, 34, 48), error);
-                                if ui.small_button("×").clicked() {
-                                    self.error = None;
-                                }
-                            });
-                        });
-                    ui.add_space(7.0);
-                }
-                self.draw_composer(ui, ctx);
-            });
+            .show(ctx, |ui| self.draw_bottom_workspace(ui, ctx));
 
         egui::CentralPanel::default()
             .frame(
@@ -5158,42 +5709,47 @@ impl eframe::App for LiveAssistantApp {
                 if self.messages.is_empty() {
                     self.draw_empty(ui);
                 } else {
-                    let button_height = 30.0;
-                    let button_gap = 8.0;
-                    let scroll_height =
-                        (ui.available_height() - button_height - button_gap).max(0.0);
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), scroll_height),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            egui::ScrollArea::vertical()
-                                .id_salt(("messages", self.active_tab))
-                                .auto_shrink([false, false])
-                                .max_height(scroll_height)
-                                .stick_to_bottom(false)
-                                .show(ui, |ui| {
-                                    self.draw_messages(ui);
-                                    if self.should_scroll {
-                                        ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
-                                        self.should_scroll = false;
-                                    }
-                                });
-                        },
-                    );
-                    ui.add_space(button_gap);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(RichText::new("↓").size(18.0))
-                                    .min_size(egui::vec2(38.0, button_height)),
-                            )
-                            .on_hover_text("Scroll to latest message")
-                            .clicked()
-                        {
-                            self.should_scroll = true;
-                            ctx.request_repaint();
-                        }
-                    });
+                    let scroll_height = ui.available_height().max(0.0);
+                    let scroll_output = egui::ScrollArea::vertical()
+                        .id_salt(("messages", self.active_tab))
+                        .auto_shrink([false, false])
+                        .max_height(scroll_height)
+                        .stick_to_bottom(false)
+                        .show(ui, |ui| {
+                            self.draw_messages(ui);
+                            if self.should_scroll {
+                                ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                                self.should_scroll = false;
+                            }
+                        });
+
+                    let max_offset =
+                        (scroll_output.content_size.y - scroll_output.inner_rect.height()).max(0.0);
+                    let at_latest =
+                        max_offset <= 1.0 || scroll_output.state.offset.y >= max_offset - 2.0;
+                    if !at_latest {
+                        let button_size = 24.0;
+                        let button_position = egui::pos2(
+                            scroll_output.inner_rect.center().x - button_size * 0.5,
+                            scroll_output.inner_rect.bottom() - button_size - 8.0,
+                        );
+                        egui::Area::new(egui::Id::new(("scroll-to-latest", self.active_tab)))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(button_position)
+                            .show(ctx, |ui| {
+                                if centered_down_button(
+                                    ui,
+                                    ("scroll-to-latest-button", self.active_tab),
+                                    button_size,
+                                )
+                                .on_hover_text("Scroll to latest message")
+                                .clicked()
+                                {
+                                    self.should_scroll = true;
+                                    ctx.request_repaint();
+                                }
+                            });
+                    }
                 }
             });
 
@@ -5338,6 +5894,10 @@ fn format_token_count(value: u64) -> String {
     } else {
         value.to_string()
     }
+}
+
+fn note_change_message(note_name: &str, content: &str) -> String {
+    format!("<note_{note_name} >\n{content}\n</note_{note_name}>")
 }
 
 fn format_message_metadata(message: &ChatMessage, is_assistant: bool) -> String {
@@ -5692,6 +6252,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn note_change_message_uses_filename_tag() {
+        assert_eq!(
+            note_change_message("ideas.md", "hello"),
+            "<note_ideas.md >\nhello\n</note_ideas.md>"
+        );
+    }
+
+    #[test]
     fn default_voice_tabs_put_gpt_live_first() {
         let base = Settings::default();
         let [live, realtime] = default_voice_tab_settings(&base);
@@ -5728,12 +6296,15 @@ mod tests {
         );
 
         realtime.append_realtime_tool_prompt = false;
-        assert_eq!(connection_system_prompt(&realtime, screen), "base prompt");
+        let realtime_prompt = connection_system_prompt(&realtime, screen);
+        assert!(realtime_prompt.starts_with("base prompt"));
+        assert!(realtime_prompt.contains("reply exactly: note saved"));
 
         let mut live = realtime.clone();
         live.backend = RealtimeBackend::CodexGptLive;
         let live_prompt = connection_system_prompt(&live, screen);
-        assert_eq!(live_prompt, "base prompt");
+        assert!(live_prompt.starts_with("base prompt"));
+        assert!(live_prompt.contains("reply exactly: note saved"));
     }
 
     #[test]

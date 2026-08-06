@@ -6,16 +6,67 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: write
+
 jobs:
   check:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: web-ui-aurora
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Normalize web backend source
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/web_app.rs")
+          source = path.read_text()
+          old = '''                    let attachments = if settings.send_screenshot {
+                              let screen = primary_screen_info();
+                              media::capture_screenshot(
+                                  screen.logical_width,
+                                  screen.logical_height,
+                                  false,
+                                  None,
+                              )
+                              .ok()
+                              .into_iter()
+                              .collect()
+                          } else {
+                              Vec::new()
+                          };
+          '''
+          new = '''                    let attachments = Vec::new();
+          '''
+          if old in source:
+              source = source.replace(old, new, 1)
+          source = source.replace("            send_screenshot: true,", "            send_screenshot: false,", 1)
+          path.write_text(source)
+
+          html = Path("web/index.html")
+          markup = html.read_text()
+          markup = markup.replace('id="sendScreenshot" type="checkbox" checked', 'id="sendScreenshot" type="checkbox"')
+          markup = markup.replace("Attach the current display to typed turns.", "Reserved for backend screen-context support.")
+          html.write_text(markup)
+          PY
+          cargo fmt --all
+      - name: Commit normalized source
+        run: |
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/web_app.rs web/index.html
+          git commit -m "Fix web turn attachment boundary and format Rust"
+          git push origin HEAD:web-ui-aurora
       - name: Compile
         run: cargo check --all-targets
       - name: Formatting

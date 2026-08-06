@@ -329,20 +329,7 @@ fn worker_loop(
                         app.status = "Thinking".to_owned();
                         app.error = None;
                     });
-                    let attachments = if settings.send_screenshot {
-                        let screen = primary_screen_info();
-                        media::capture_screenshot(
-                            screen.logical_width,
-                            screen.logical_height,
-                            false,
-                            None,
-                        )
-                        .ok()
-                        .into_iter()
-                        .collect()
-                    } else {
-                        Vec::new()
-                    };
+                    let attachments = Vec::new();
                     if realtime
                         .commands
                         .send(Command::SendTurn {

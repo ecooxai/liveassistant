@@ -28,25 +28,11 @@ jobs:
 
           path = Path("src/web_app.rs")
           source = path.read_text()
-          old = '''                    let attachments = if settings.send_screenshot {
-                              let screen = primary_screen_info();
-                              media::capture_screenshot(
-                                  screen.logical_width,
-                                  screen.logical_height,
-                                  false,
-                                  None,
-                              )
-                              .ok()
-                              .into_iter()
-                              .collect()
-                          } else {
-                              Vec::new()
-                          };
-          '''
-          new = '''                    let attachments = Vec::new();
-          '''
-          if old in source:
-              source = source.replace(old, new, 1)
+          marker = "                    let attachments = if settings.send_screenshot {"
+          if marker in source:
+              start = source.index(marker)
+              end = source.index("                    if realtime", start)
+              source = source[:start] + "                    let attachments = Vec::new();\n" + source[end:]
           source = source.replace("            send_screenshot: true,", "            send_screenshot: false,", 1)
           path.write_text(source)
 

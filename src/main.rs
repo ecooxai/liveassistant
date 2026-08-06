@@ -1,18 +1,14 @@
-mod app;
-mod audio;
 mod auth;
 mod click_test;
-mod codex_account;
 mod gpt_live_webrtc;
 mod image_generation;
 mod live_pointer;
 mod media;
-mod notes;
 mod realtime;
 mod resample;
 mod tools;
+mod web_app;
 
-use app::LiveAssistantApp;
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -66,59 +62,50 @@ impl Drop for SingleInstanceGuard {
     }
 }
 
-fn main() -> eframe::Result<()> {
-    if std::env::args().any(|argument| argument == "--test-click") {
-        return click_test::run();
-    }
-    if std::env::args().any(|argument| argument == "--test-gpt-live-tool-latency") {
-        match realtime::probe_codex_gpt_live_tool_latency() {
-            Ok(()) => {
-                println!("GPT-Live tool latency probe succeeded under the realtime target.");
-                return Ok(());
-            }
-            Err(error) => {
-                eprintln!("GPT-Live tool latency probe failed: {error:#}");
-                std::process::exit(1);
-            }
+fn argument_value(name: &str) -> Option<String> {
+    let mut arguments = std::env::args();
+    while let Some(argument) = arguments.next() {
+        if argument == name {
+            return arguments.next();
+        }
+        if let Some(value) = argument.strip_prefix(&format!("{name}=")) {
+            return Some(value.to_owned());
         }
     }
-    if std::env::args().any(|argument| argument == "--test-gpt-live-native") {
-        match realtime::probe_codex_gpt_live_native() {
-            Ok(()) => {
-                println!("GPT-Live native platform-ADM probe succeeded.");
-                return Ok(());
-            }
-            Err(error) => {
-                eprintln!("GPT-Live native platform-ADM probe failed: {error:#}");
-                std::process::exit(1);
-            }
-        }
+    None
+}
+
+fn has_argument(name: &str) -> bool {
+    std::env::args().any(|argument| argument == name)
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    if has_argument("--test-click") {
+        click_test::run().map_err(|error| anyhow::anyhow!("{error}"))?;
+        return Ok(());
     }
-    if std::env::args().any(|argument| argument == "--test-gpt-live") {
-        match realtime::probe_codex_gpt_live() {
-            Ok(()) => {
-                println!("GPT-Live V3 WebRTC probe succeeded.");
-                return Ok(());
-            }
-            Err(error) => {
-                eprintln!("GPT-Live V3 WebRTC probe failed: {error:#}");
-                std::process::exit(1);
-            }
-        }
+    if has_argument("--test-gpt-live-tool-latency") {
+        realtime::probe_codex_gpt_live_tool_latency()?;
+        println!("GPT-Live tool latency probe succeeded under the realtime target.");
+        return Ok(());
     }
-    if std::env::args().any(|argument| argument == "--test-image-upload") {
-        match realtime::probe_context_image_uploads() {
-            Ok(()) => {
-                println!(
-                    "JPEG upload and latest-image ordering probe succeeded for OpenAI Realtime and GPT-Live."
-                );
-                return Ok(());
-            }
-            Err(error) => {
-                eprintln!("JPEG upload probe failed: {error:#}");
-                std::process::exit(1);
-            }
-        }
+    if has_argument("--test-gpt-live-native") {
+        realtime::probe_codex_gpt_live_native()?;
+        println!("GPT-Live native platform-ADM probe succeeded.");
+        return Ok(());
+    }
+    if has_argument("--test-gpt-live") {
+        realtime::probe_codex_gpt_live()?;
+        println!("GPT-Live V3 WebRTC probe succeeded.");
+        return Ok(());
+    }
+    if has_argument("--test-image-upload") {
+        realtime::probe_context_image_uploads()?;
+        println!(
+            "JPEG upload and latest-image ordering probe succeeded for OpenAI Realtime and GPT-Live."
+        );
+        return Ok(());
     }
 
     let _instance_guard = match SingleInstanceGuard::acquire() {
@@ -129,21 +116,10 @@ fn main() -> eframe::Result<()> {
         }
     };
 
-    let options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("")
-            .with_inner_size([1080.0, 760.0])
-            .with_min_inner_size([760.0, 560.0])
-            // glow shares one GL config across every viewport, and its alpha
-            // channel comes from the main viewport. Without this the pointer
-            // overlay window can never be transparent.
-            .with_transparent(true),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "",
-        options,
-        Box::new(|cc| Ok(Box::new(LiveAssistantApp::new(cc)))),
-    )
+    let port = argument_value("--port")
+        .or_else(|| std::env::var("LIVE_ASSISTANT_PORT").ok())
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(4317);
+    let open_browser = !has_argument("--no-open");
+    web_app::run(port, open_browser).await
 }

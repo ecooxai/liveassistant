@@ -1,28 +1,522 @@
-const $=selector=>document.querySelector(selector);const $$=selector=>[...document.querySelectorAll(selector)];
-const el={statusPill:$('#statusPill'),statusText:$('#statusText'),connectionBadge:$('#connectionBadge'),activeModel:$('#activeModel'),activeBackend:$('#activeBackend'),modelChip:$('#modelChip'),connectButton:$('#connectButton'),drawerConnect:$('#drawerConnect'),messages:$('#messages'),errorBanner:$('#errorBanner'),composerForm:$('#composerForm'),composerInput:$('#composerInput'),micButton:$('#micButton'),clearButton:$('#clearButton'),settingsToggle:$('#settingsToggle'),settingsClose:$('#settingsClose'),settingsDrawer:$('#settingsDrawer'),settingsScrim:$('#settingsScrim'),authMode:$('#authMode'),apiKeyGroup:$('#apiKeyGroup'),apiKey:$('#apiKey'),modelInput:$('#modelInput'),voiceInput:$('#voiceInput'),thinkingInput:$('#thinkingInput'),imageModelInput:$('#imageModelInput'),imageResolutionInput:$('#imageResolutionInput'),sendScreenshot:$('#sendScreenshot'),systemPrompt:$('#systemPrompt'),settingsSaved:$('#settingsSaved'),portValue:$('#portValue')};
-const app={state:null,ws:null,wsRetry:null,settingsTimer:null,lastRevision:-1,mic:null,audioContext:null,playbackTime:0};
-const backendLabels={codex_gpt_live:'Codex GPT Live',open_ai_realtime:'OpenAI Realtime',codex_text:'Codex Text'};
-function escapeHtml(value=''){return value.replace(/[&<>'"]/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#039;','"':'&quot;'}[char]))}
-function formatTime(seconds){return new Date(seconds*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}
-async function request(path,options={}){const hasBody=options.body!==undefined;const response=await fetch(path,{...options,headers:{...(hasBody?{'Content-Type':'application/json'}:{}),...(options.headers||{})}});const contentType=response.headers.get('content-type')||'';const payload=contentType.includes('application/json')?await response.json():await response.text();if(!response.ok)throw new Error(payload?.error||payload||`Request failed: ${response.status}`);return payload}
-function connectWebSocket(){clearTimeout(app.wsRetry);const protocol=location.protocol==='https:'?'wss:':'ws:';const ws=new WebSocket(`${protocol}//${location.host}/ws`);ws.binaryType='arraybuffer';app.ws=ws;ws.onmessage=event=>{if(typeof event.data==='string'){try{const payload=JSON.parse(event.data);if(payload.type==='state')applyState(payload.state)}catch(error){console.warn('Invalid backend event',error)}return}playPcm(event.data)};ws.onclose=()=>{if(app.ws===ws)app.ws=null;app.wsRetry=setTimeout(connectWebSocket,1200)}}
-function applyState(state){app.state=state;if(state.revision===app.lastRevision)return;app.lastRevision=state.revision;renderState(state)}
-function renderState(state){const settings=state.settings;el.statusText.textContent=state.status;el.statusPill.className=`status-pill ${state.error?'error':state.connection}`;el.connectionBadge.textContent=state.connection.replace('_',' ');el.connectionBadge.className=`tiny-badge ${state.connection}`;el.activeModel.textContent=settings.model;el.activeBackend.textContent=backendLabels[settings.backend]||settings.backend;el.modelChip.textContent=settings.backend==='codex_text'?'Text':settings.backend==='open_ai_realtime'?'Realtime':'GPT Live';el.portValue.textContent=location.port||(location.protocol==='https:'?'443':'80');const connected=['live','connecting','reconnecting'].includes(state.connection);for(const button of[el.connectButton,el.drawerConnect]){button.textContent=connected?'Disconnect':'Connect';button.classList.toggle('disconnect',connected)}el.errorBanner.classList.toggle('hidden',!state.error);el.errorBanner.textContent=state.error||'';syncSettingsForm(settings);renderMessages(state.messages);$$('#backendSegments button').forEach(button=>button.classList.toggle('active',button.dataset.backend===settings.backend))}
-function syncSettingsForm(settings){const focused=document.activeElement;const setUnlessFocused=(element,value)=>{if(focused!==element&&element.value!==String(value))element.value=value};setUnlessFocused(el.authMode,settings.auth_mode);setUnlessFocused(el.modelInput,settings.model);setUnlessFocused(el.voiceInput,settings.voice);setUnlessFocused(el.thinkingInput,settings.thinking_level);setUnlessFocused(el.imageModelInput,settings.image_model);setUnlessFocused(el.imageResolutionInput,settings.image_resolution);setUnlessFocused(el.systemPrompt,settings.system_prompt);el.sendScreenshot.checked=Boolean(settings.send_screenshot);el.apiKeyGroup.classList.toggle('hidden',settings.auth_mode!=='api_key')}
-function renderMessages(messages){if(!messages.length){el.messages.innerHTML='<div class="empty-state"><div class="empty-state-inner"><div class="empty-orb"></div><h3>Ready when you are</h3><p>Connect a model, type a message, or start the microphone. The browser only renders state from the Rust runtime.</p></div></div>';return}const nearBottom=el.messages.scrollHeight-el.messages.scrollTop-el.messages.clientHeight<100;el.messages.innerHTML=messages.map(message=>{const role=message.role;const avatar=role==='assistant'?'<div class="avatar">AI</div>':'';const tools=(message.tool_calls||[]).map(tool=>`<div class="tool-card"><div class="tool-top"><span>${escapeHtml(tool.name)}</span><span class="tool-status ${escapeHtml(tool.status)}">${escapeHtml(tool.status)}</span></div><pre>${escapeHtml(tool.output||tool.arguments)}</pre></div>`).join('');const image=message.image_url?`<img class="generated-image" src="${escapeHtml(message.image_url)}" alt="Generated image">`:'';const text=message.text||(message.streaming?'Thinking…':'');return `<article class="message-row ${role}">${avatar}<div class="message"><div class="message-bubble ${message.streaming?'typing':''}">${escapeHtml(text)}${tools}${image}</div><div class="message-meta">${formatTime(message.created_at)}</div></div></article>`}).join('');if(nearBottom||app.lastRevision<2)el.messages.scrollTop=el.messages.scrollHeight}
-function currentSettings(){const fallback=app.state?.settings||{};return{backend:$('#backendSegments button.active')?.dataset.backend||fallback.backend||'codex_gpt_live',auth_mode:el.authMode.value,model:el.modelInput.value.trim()||'gpt-realtime-2.1',voice:el.voiceInput.value,thinking_level:el.thinkingInput.value,system_prompt:el.systemPrompt.value,send_screenshot:el.sendScreenshot.checked,image_model:el.imageModelInput.value.trim()||'gpt-image-2',image_resolution:el.imageResolutionInput.value}}
-function queueSettingsSave(){el.settingsSaved.textContent='Saving…';clearTimeout(app.settingsTimer);app.settingsTimer=setTimeout(saveSettings,280)}
-async function saveSettings(){try{await request('/api/settings',{method:'POST',body:JSON.stringify(currentSettings())});el.settingsSaved.textContent='Synced with backend'}catch(error){el.settingsSaved.textContent=error.message}}
-async function toggleConnection(){const connected=['live','connecting','reconnecting'].includes(app.state?.connection);try{if(connected){if(app.mic)await stopMicrophone();await request('/api/disconnect',{method:'POST',body:'{}'});return}await saveSettings();await request('/api/connect',{method:'POST',body:JSON.stringify({api_key:el.apiKey.value.trim()||null})});el.apiKey.value=''}catch(error){showError(error.message)}}
-async function sendMessage(event){event.preventDefault();const text=el.composerInput.value.trim();if(!text)return;el.composerInput.value='';autoResizeComposer();try{await request('/api/message',{method:'POST',body:JSON.stringify({text})})}catch(error){showError(error.message)}}
-function showError(message){el.errorBanner.textContent=message;el.errorBanner.classList.remove('hidden')}
-function openSettings(open){el.settingsDrawer.classList.toggle('open',open);el.settingsDrawer.setAttribute('aria-hidden',String(!open));el.settingsScrim.classList.toggle('hidden',!open)}
-function autoResizeComposer(){el.composerInput.style.height='auto';el.composerInput.style.height=`${Math.min(el.composerInput.scrollHeight,150)}px`}
-async function toggleMicrophone(){if(app.mic)await stopMicrophone();else await startMicrophone()}
-async function startMicrophone(){if(app.state?.connection!=='live')throw new Error('Connect a voice model first.');const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});const context=new AudioContext({latencyHint:'interactive'});const source=context.createMediaStreamSource(stream);const processor=context.createScriptProcessor(2048,1,1);const mute=context.createGain();mute.gain.value=0;source.connect(processor);processor.connect(mute);mute.connect(context.destination);processor.onaudioprocess=event=>{if(!app.mic)return;const input=event.inputBuffer.getChannelData(0);const output=resampleFloat(input,context.sampleRate,24000);const pcm=new Int16Array(output.length);for(let i=0;i<output.length;i++){const sample=Math.max(-1,Math.min(1,output[i]));pcm[i]=sample<0?sample*0x8000:sample*0x7fff}if(app.ws?.readyState===WebSocket.OPEN)app.ws.send(pcm.buffer)};app.mic={stream,context,source,processor,mute};el.micButton.classList.add('active');el.micButton.title='Stop microphone'}
-async function stopMicrophone(){const mic=app.mic;if(!mic)return;app.mic=null;mic.processor.disconnect();mic.source.disconnect();mic.mute.disconnect();mic.stream.getTracks().forEach(track=>track.stop());await mic.context.close();el.micButton.classList.remove('active');el.micButton.title='Start microphone'}
-function resampleFloat(input,sourceRate,targetRate){if(sourceRate===targetRate)return input;const ratio=sourceRate/targetRate;const length=Math.max(1,Math.floor(input.length/ratio));const output=new Float32Array(length);for(let i=0;i<length;i++){const sourceIndex=i*ratio;const left=Math.floor(sourceIndex);const right=Math.min(left+1,input.length-1);const mix=sourceIndex-left;output[i]=input[left]*(1-mix)+input[right]*mix}return output}
-function playPcm(arrayBuffer){if(!arrayBuffer.byteLength)return;if(!app.audioContext)app.audioContext=new AudioContext({sampleRate:24000,latencyHint:'interactive'});const context=app.audioContext;if(context.state==='suspended')context.resume();const samples=new Int16Array(arrayBuffer);const buffer=context.createBuffer(1,samples.length,24000);const channel=buffer.getChannelData(0);for(let i=0;i<samples.length;i++)channel[i]=samples[i]/32768;const source=context.createBufferSource();source.buffer=buffer;source.connect(context.destination);const now=context.currentTime;app.playbackTime=Math.max(now+.03,app.playbackTime);source.start(app.playbackTime);app.playbackTime+=buffer.duration}
-function bindEvents(){el.composerForm.addEventListener('submit',sendMessage);el.composerInput.addEventListener('input',autoResizeComposer);el.composerInput.addEventListener('keydown',event=>{if(event.key==='Enter'&&!event.shiftKey)sendMessage(event)});el.connectButton.addEventListener('click',toggleConnection);el.drawerConnect.addEventListener('click',toggleConnection);el.clearButton.addEventListener('click',()=>request('/api/clear',{method:'POST',body:'{}'}));el.micButton.addEventListener('click',()=>toggleMicrophone().catch(error=>showError(error.message)));el.settingsToggle.addEventListener('click',()=>openSettings(true));el.settingsClose.addEventListener('click',()=>openSettings(false));el.settingsScrim.addEventListener('click',()=>openSettings(false));el.authMode.addEventListener('change',()=>{el.apiKeyGroup.classList.toggle('hidden',el.authMode.value!=='api_key');queueSettingsSave()});for(const input of[el.modelInput,el.voiceInput,el.thinkingInput,el.imageModelInput,el.imageResolutionInput,el.sendScreenshot,el.systemPrompt])input.addEventListener(input.tagName==='TEXTAREA'||input.type==='text'?'input':'change',queueSettingsSave);$$('#backendSegments button').forEach(button=>button.addEventListener('click',()=>{$$('#backendSegments button').forEach(other=>other.classList.remove('active'));button.classList.add('active');const defaults={codex_gpt_live:{voice:'ember',model:'gpt-realtime-2.1'},open_ai_realtime:{voice:'marin',model:'gpt-realtime-2.1'},codex_text:{voice:el.voiceInput.value,model:'gpt-5.6-luna'}}[button.dataset.backend];el.voiceInput.value=defaults.voice;el.modelInput.value=defaults.model;queueSettingsSave()}))}
-async function init(){bindEvents();connectWebSocket();try{applyState(await request('/api/state'))}catch(error){showError(`Backend unavailable: ${error.message}`)}setInterval(async()=>{if(app.ws?.readyState===WebSocket.OPEN)return;try{applyState(await request('/api/state'))}catch(_){}},2500)}
-init();
+(() => {
+  "use strict";
+
+  const $ = (selector) => document.querySelector(selector);
+  const elements = {
+    conversation: $("#conversation"),
+    emptyState: $("#empty-state"),
+    messageList: $("#message-list"),
+    template: $("#message-template"),
+    statusChip: $("#status-chip"),
+    statusText: $("#status-text"),
+    connectButton: $("#connect-button"),
+    connectLabel: $("#connect-button .connect-label"),
+    connectArrow: $("#connect-button .connect-arrow"),
+    clearButton: $("#clear-button"),
+    settingsButton: $("#settings-button"),
+    settingsModal: $("#settings-modal"),
+    closeSettings: $("#close-settings"),
+    settingsForm: $("#settings-form"),
+    backend: $("#backend-select"),
+    auth: $("#auth-select"),
+    apiKeyField: $("#api-key-field"),
+    apiKey: $("#api-key-input"),
+    model: $("#model-input"),
+    voice: $("#voice-input"),
+    thinking: $("#thinking-select"),
+    screenshot: $("#screenshot-toggle"),
+    imageModel: $("#image-model-input"),
+    imageResolution: $("#image-resolution-select"),
+    systemPrompt: $("#system-prompt-input"),
+    composerForm: $("#composer-form"),
+    composerInput: $("#composer-input"),
+    sendButton: $("#send-button"),
+    micButton: $("#mic-button"),
+    micLevel: $("#mic-level"),
+    modelPill: $("#model-pill"),
+    errorBanner: $("#error-banner"),
+    errorText: $("#error-text"),
+    dismissError: $("#dismiss-error"),
+  };
+
+  let appState = null;
+  let socket = null;
+  let reconnectTimer = null;
+  let lastRevision = -1;
+  let dismissedError = null;
+  let shouldStickToBottom = true;
+
+  let micStream = null;
+  let micContext = null;
+  let micSource = null;
+  let micProcessor = null;
+  let micActive = false;
+
+  let outputContext = null;
+  let outputCursor = 0;
+
+  const backendLabels = {
+    codex_gpt_live: "GPT Live",
+    open_ai_realtime: "Realtime",
+    codex_text: "Codex Text",
+  };
+
+  async function request(path, options = {}) {
+    const response = await fetch(path, {
+      ...options,
+      headers: {
+        ...(options.body instanceof ArrayBuffer ? {} : { "Content-Type": "application/json" }),
+        ...(options.headers || {}),
+      },
+    });
+    const contentType = response.headers.get("content-type") || "";
+    const body = contentType.includes("application/json") ? await response.json() : await response.text();
+    if (!response.ok) {
+      const message = typeof body === "object" && body?.error ? body.error : `Request failed (${response.status})`;
+      throw new Error(message);
+    }
+    return body;
+  }
+
+  function connectSocket() {
+    clearTimeout(reconnectTimer);
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    socket = new WebSocket(`${protocol}//${location.host}/ws`);
+    socket.binaryType = "arraybuffer";
+
+    socket.addEventListener("message", (event) => {
+      if (typeof event.data === "string") {
+        if (event.data === "pong") return;
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload.type === "state" && payload.state) applyState(payload.state);
+        } catch (error) {
+          console.warn("Ignoring malformed state update", error);
+        }
+      } else if (event.data instanceof ArrayBuffer) {
+        playPcm16(event.data);
+      }
+    });
+
+    socket.addEventListener("close", () => {
+      stopMicrophone();
+      reconnectTimer = setTimeout(connectSocket, 900);
+    });
+
+    socket.addEventListener("error", () => socket.close());
+  }
+
+  function applyState(nextState) {
+    if (!nextState || typeof nextState.revision !== "number") return;
+    appState = nextState;
+    renderHeader();
+    renderMessages();
+    renderError();
+    renderSettingsAvailability();
+  }
+
+  function renderHeader() {
+    if (!appState) return;
+    const state = appState.connection || "offline";
+    elements.statusChip.dataset.state = state;
+    elements.statusText.textContent = appState.status || "Ready";
+
+    const isLive = state === "live";
+    const isBusy = state === "connecting" || state === "reconnecting";
+    elements.connectButton.dataset.live = String(isLive);
+    elements.connectButton.disabled = isBusy;
+    elements.connectLabel.textContent = isLive ? "Disconnect" : isBusy ? "Connecting" : "Connect";
+    elements.connectArrow.textContent = isLive ? "×" : isBusy ? "···" : "↗";
+
+    const label = backendLabels[appState.settings.backend] || appState.settings.model || "Model";
+    elements.modelPill.textContent = label;
+    elements.micButton.disabled = !isLive || appState.settings.backend === "codex_text";
+    if (!isLive && micActive) stopMicrophone();
+  }
+
+  function visibleMessages() {
+    return (appState?.messages || []).filter((message) => message.role !== "system");
+  }
+
+  function renderMessages() {
+    if (!appState || appState.revision === lastRevision) return;
+    lastRevision = appState.revision;
+
+    const messages = visibleMessages();
+    elements.emptyState.hidden = messages.length > 0;
+    elements.messageList.hidden = messages.length === 0;
+
+    const oldDistance = elements.conversation.scrollHeight - elements.conversation.scrollTop - elements.conversation.clientHeight;
+    shouldStickToBottom = oldDistance < 90 || messages.some((message) => message.streaming);
+
+    const nodes = new Map(
+      [...elements.messageList.children].map((node) => [node.dataset.id, node]),
+    );
+    const fragment = document.createDocumentFragment();
+
+    for (const message of messages) {
+      const id = String(message.id);
+      let node = nodes.get(id);
+      if (!node) {
+        node = elements.template.content.firstElementChild.cloneNode(true);
+        node.dataset.id = id;
+      }
+      updateMessageNode(node, message);
+      fragment.appendChild(node);
+      nodes.delete(id);
+    }
+
+    for (const staleNode of nodes.values()) staleNode.remove();
+    elements.messageList.replaceChildren(fragment);
+
+    if (shouldStickToBottom) {
+      requestAnimationFrame(() => {
+        elements.conversation.scrollTop = elements.conversation.scrollHeight;
+      });
+    }
+  }
+
+  function updateMessageNode(node, message) {
+    node.dataset.role = message.role;
+    node.dataset.streaming = String(Boolean(message.streaming));
+    node.querySelector(".message-role").textContent = message.role === "user" ? "You" : "Assistant";
+    node.querySelector("time").textContent = formatTime(message.created_at);
+    node.querySelector(".message-text").textContent = message.text || (message.streaming ? "" : "No text response");
+
+    const toolsRoot = node.querySelector(".message-tools");
+    toolsRoot.replaceChildren(...(message.tool_calls || []).map(renderTool));
+    toolsRoot.hidden = !message.tool_calls?.length;
+
+    const image = node.querySelector(".message-image");
+    if (message.image_url) {
+      if (image.src !== message.image_url) image.src = message.image_url;
+      image.hidden = false;
+    } else {
+      image.removeAttribute("src");
+      image.hidden = true;
+    }
+  }
+
+  function renderTool(tool) {
+    const details = document.createElement("details");
+    details.className = "tool-call";
+    details.dataset.status = tool.status || "running";
+
+    const summary = document.createElement("summary");
+    summary.textContent = `${tool.name} · ${tool.status === "done" ? "Complete" : "Running"}`;
+    details.appendChild(summary);
+
+    const pre = document.createElement("pre");
+    const sections = [];
+    if (tool.arguments) sections.push(tool.arguments);
+    if (tool.output) sections.push(`Result\n${tool.output}`);
+    pre.textContent = sections.join("\n\n");
+    details.appendChild(pre);
+    return details;
+  }
+
+  function formatTime(seconds) {
+    if (!Number.isFinite(seconds)) return "";
+    return new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(new Date(seconds * 1000));
+  }
+
+  function renderError() {
+    const error = appState?.error || null;
+    const show = Boolean(error && error !== dismissedError);
+    elements.errorBanner.hidden = !show;
+    elements.errorText.textContent = show ? error : "";
+  }
+
+  function populateSettings() {
+    if (!appState) return;
+    const settings = appState.settings;
+    elements.backend.value = settings.backend;
+    elements.auth.value = settings.auth_mode;
+    elements.model.value = settings.model;
+    elements.voice.value = settings.voice;
+    elements.thinking.value = settings.thinking_level;
+    elements.screenshot.checked = Boolean(settings.send_screenshot);
+    elements.imageModel.value = settings.image_model;
+    elements.imageResolution.value = settings.image_resolution;
+    elements.systemPrompt.value = settings.system_prompt;
+    renderSettingsAvailability();
+  }
+
+  function renderSettingsAvailability() {
+    elements.apiKeyField.dataset.visible = String(elements.auth.value === "api_key");
+  }
+
+  function settingsPayload() {
+    return {
+      backend: elements.backend.value,
+      auth_mode: elements.auth.value,
+      model: elements.model.value.trim(),
+      voice: elements.voice.value.trim(),
+      thinking_level: elements.thinking.value,
+      system_prompt: elements.systemPrompt.value,
+      send_screenshot: elements.screenshot.checked,
+      image_model: elements.imageModel.value.trim(),
+      image_resolution: elements.imageResolution.value,
+    };
+  }
+
+  function openSettings() {
+    populateSettings();
+    elements.settingsModal.hidden = false;
+    document.body.style.overflow = "hidden";
+    requestAnimationFrame(() => elements.backend.focus());
+  }
+
+  function closeSettings() {
+    elements.settingsModal.hidden = true;
+    document.body.style.overflow = "";
+  }
+
+  async function toggleConnection() {
+    if (!appState) return;
+    dismissedError = null;
+    if (appState.connection === "live") {
+      stopMicrophone();
+      await request("/api/disconnect", { method: "POST", body: "{}" });
+      return;
+    }
+
+    if (appState.settings.auth_mode === "api_key" && !elements.apiKey.value.trim() && !(appState.has_credentials ?? appState.has_api_key)) {
+      openSettings();
+      elements.apiKey.focus();
+      return;
+    }
+
+    await ensureOutputContext();
+    await request("/api/connect", {
+      method: "POST",
+      body: JSON.stringify({ api_key: elements.apiKey.value.trim() || null }),
+    });
+    elements.apiKey.value = "";
+  }
+
+  async function sendComposer() {
+    const text = elements.composerInput.value.trim();
+    if (!text) return;
+    if (appState?.connection !== "live") {
+      await toggleConnection();
+      return;
+    }
+
+    elements.composerInput.value = "";
+    resizeComposer();
+    updateSendButton();
+    await request("/api/message", {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    });
+  }
+
+  function resizeComposer() {
+    const input = elements.composerInput;
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 170)}px`;
+  }
+
+  function updateSendButton() {
+    elements.sendButton.disabled = elements.composerInput.value.trim().length === 0;
+  }
+
+  async function startMicrophone() {
+    if (micActive || appState?.connection !== "live") return;
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone capture is unavailable in this browser");
+
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+    micContext = new AudioContext({ latencyHint: "interactive" });
+    micSource = micContext.createMediaStreamSource(micStream);
+    micProcessor = micContext.createScriptProcessor(2048, 1, 1);
+    micProcessor.onaudioprocess = (event) => {
+      if (!micActive || socket?.readyState !== WebSocket.OPEN) return;
+      const samples = event.inputBuffer.getChannelData(0);
+      const downsampled = downsample(samples, micContext.sampleRate, 24000);
+      const pcm = floatToPcm16(downsampled);
+      socket.send(pcm.buffer);
+      updateMicMeter(samples);
+    };
+    micSource.connect(micProcessor);
+    micProcessor.connect(micContext.destination);
+    micActive = true;
+    elements.micButton.dataset.active = "true";
+    elements.micButton.setAttribute("aria-label", "Stop microphone");
+    elements.micButton.title = "Stop microphone";
+  }
+
+  function stopMicrophone() {
+    micActive = false;
+    elements.micButton.dataset.active = "false";
+    elements.micButton.setAttribute("aria-label", "Start microphone");
+    elements.micButton.title = "Start microphone";
+    elements.micLevel.style.transform = "scaleX(0)";
+
+    if (micProcessor) {
+      micProcessor.disconnect();
+      micProcessor.onaudioprocess = null;
+      micProcessor = null;
+    }
+    if (micSource) {
+      micSource.disconnect();
+      micSource = null;
+    }
+    if (micStream) {
+      micStream.getTracks().forEach((track) => track.stop());
+      micStream = null;
+    }
+    if (micContext) {
+      micContext.close().catch(() => {});
+      micContext = null;
+    }
+  }
+
+  function downsample(input, sourceRate, targetRate) {
+    if (targetRate >= sourceRate) return input;
+    const ratio = sourceRate / targetRate;
+    const length = Math.max(1, Math.round(input.length / ratio));
+    const output = new Float32Array(length);
+    let sourceOffset = 0;
+    for (let index = 0; index < length; index += 1) {
+      const nextOffset = Math.min(input.length, Math.round((index + 1) * ratio));
+      let sum = 0;
+      let count = 0;
+      for (; sourceOffset < nextOffset; sourceOffset += 1) {
+        sum += input[sourceOffset];
+        count += 1;
+      }
+      output[index] = count ? sum / count : 0;
+    }
+    return output;
+  }
+
+  function floatToPcm16(input) {
+    const output = new Int16Array(input.length);
+    for (let index = 0; index < input.length; index += 1) {
+      const sample = Math.max(-1, Math.min(1, input[index]));
+      output[index] = sample < 0 ? sample * 32768 : sample * 32767;
+    }
+    return output;
+  }
+
+  function updateMicMeter(samples) {
+    let power = 0;
+    for (let index = 0; index < samples.length; index += 1) power += samples[index] * samples[index];
+    const rms = Math.sqrt(power / samples.length);
+    const level = Math.min(1, rms * 9);
+    elements.micLevel.style.transform = `scaleX(${level})`;
+  }
+
+  async function ensureOutputContext() {
+    if (!outputContext) outputContext = new AudioContext({ latencyHint: "interactive" });
+    if (outputContext.state === "suspended") await outputContext.resume();
+    outputCursor = Math.max(outputCursor, outputContext.currentTime);
+  }
+
+  async function playPcm16(buffer) {
+    try {
+      await ensureOutputContext();
+      const input = new Int16Array(buffer);
+      if (!input.length) return;
+      const audioBuffer = outputContext.createBuffer(1, input.length, 24000);
+      const channel = audioBuffer.getChannelData(0);
+      for (let index = 0; index < input.length; index += 1) channel[index] = input[index] / 32768;
+      const source = outputContext.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(outputContext.destination);
+      const startAt = Math.max(outputCursor, outputContext.currentTime + 0.015);
+      source.start(startAt);
+      outputCursor = startAt + audioBuffer.duration;
+    } catch (error) {
+      console.warn("Assistant audio playback failed", error);
+    }
+  }
+
+  elements.connectButton.addEventListener("click", () => toggleConnection().catch(showLocalError));
+  elements.clearButton.addEventListener("click", () => {
+    request("/api/clear", { method: "POST", body: "{}" }).catch(showLocalError);
+  });
+  elements.settingsButton.addEventListener("click", openSettings);
+  elements.closeSettings.addEventListener("click", closeSettings);
+  elements.settingsModal.addEventListener("click", (event) => {
+    if (event.target === elements.settingsModal) closeSettings();
+  });
+  elements.auth.addEventListener("change", renderSettingsAvailability);
+  elements.settingsForm.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    try {
+      await request("/api/settings", { method: "POST", body: JSON.stringify(settingsPayload()) });
+      closeSettings();
+    } catch (error) {
+      showLocalError(error);
+    }
+  });
+
+  elements.composerForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    sendComposer().catch(showLocalError);
+  });
+  elements.composerInput.addEventListener("input", () => {
+    resizeComposer();
+    updateSendButton();
+  });
+  elements.composerInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      sendComposer().catch(showLocalError);
+    }
+  });
+  elements.micButton.addEventListener("click", () => {
+    const action = micActive ? Promise.resolve(stopMicrophone()) : startMicrophone();
+    Promise.resolve(action).catch(showLocalError);
+  });
+  elements.dismissError.addEventListener("click", () => {
+    dismissedError = appState?.error || null;
+    renderError();
+  });
+
+  for (const suggestion of document.querySelectorAll("[data-prompt]")) {
+    suggestion.addEventListener("click", () => {
+      elements.composerInput.value = suggestion.dataset.prompt;
+      resizeComposer();
+      updateSendButton();
+      elements.composerInput.focus();
+    });
+  }
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !elements.settingsModal.hidden) closeSettings();
+    if ((event.metaKey || event.ctrlKey) && event.key === ",") {
+      event.preventDefault();
+      openSettings();
+    }
+  });
+
+  function showLocalError(error) {
+    console.error(error);
+    elements.errorText.textContent = error?.message || String(error);
+    elements.errorBanner.hidden = false;
+  }
+
+  async function boot() {
+    connectSocket();
+    try {
+      applyState(await request("/api/state"));
+    } catch (error) {
+      showLocalError(error);
+    }
+    resizeComposer();
+    updateSendButton();
+  }
+
+  window.addEventListener("beforeunload", stopMicrophone);
+  boot();
+})();

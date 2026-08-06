@@ -832,6 +832,21 @@ fn apply_assistant_usage(
         .unwrap_or(false)
 }
 
+fn voice_message_is_open_turn(
+    messages: &[ChatMessage],
+    active_voice_message: Option<usize>,
+    speech_active: bool,
+) -> Option<usize> {
+    if !speech_active {
+        return None;
+    }
+    active_voice_message.filter(|index| {
+        messages
+            .get(*index)
+            .is_some_and(|message| message.role == Role::User && message.voice_turn)
+    })
+}
+
 fn recent_voice_continuation_index(messages: &[ChatMessage], now: Instant) -> Option<usize> {
     // Only the newest user message can be continued. Assistant replies may sit
     // below it, but a newer typed/user message must start a separate group.
@@ -842,6 +857,9 @@ fn recent_voice_continuation_index(messages: &[ChatMessage], now: Instant) -> Op
         if !message.voice_turn {
             return None;
         }
+        // This timestamp is updated only by real speech boundaries, never by
+        // late transcript/commit notifications. Otherwise a delayed transcript
+        // can reopen a card long after the user's five-second continuation window.
         let last_activity = message.voice_last_activity_at?;
         let elapsed = now.checked_duration_since(last_activity)?;
         return (elapsed <= MESSAGE_CONTINUATION_WINDOW).then_some(index);
@@ -923,7 +941,7 @@ fn message_owns_voice_item(message: &ChatMessage, item_id: &str) -> bool {
             .any(|segment| segment.item_id == item_id)
 }
 
-fn register_voice_item(message: &mut ChatMessage, item_id: String, now: Instant) {
+fn register_voice_item(message: &mut ChatMessage, item_id: String) {
     seed_existing_voice_transcript(message);
     if !message_owns_voice_item(message, &item_id) {
         message
@@ -934,11 +952,10 @@ fn register_voice_item(message: &mut ChatMessage, item_id: String, now: Instant)
             });
     }
     message.server_item_id = Some(item_id);
-    message.voice_last_activity_at = Some(now);
 }
 
-fn update_voice_transcript(message: &mut ChatMessage, item_id: String, text: String, now: Instant) {
-    register_voice_item(message, item_id.clone(), now);
+fn update_voice_transcript(message: &mut ChatMessage, item_id: String, text: String) {
+    register_voice_item(message, item_id.clone());
     if let Some(segment) = message
         .voice_transcript_segments
         .iter_mut()
@@ -953,7 +970,6 @@ fn update_voice_transcript(message: &mut ChatMessage, item_id: String, text: Str
         .fold(String::new(), |combined, segment| {
             merge_voice_transcript(&combined, &segment.text)
         });
-    message.voice_last_activity_at = Some(now);
     message.refresh_token_estimate();
 }
 
@@ -2400,7 +2416,7 @@ impl LiveAssistantApp {
                         self.captured_transcript_items.insert(item_id.clone());
                     }
                     if let Some(index) = index {
-                        register_voice_item(&mut self.messages[index], item_id, now);
+                        register_voice_item(&mut self.messages[index], item_id);
                     }
                 }
                 Event::InputTranscript { item_id, text } => {
@@ -2436,8 +2452,14 @@ impl LiveAssistantApp {
                     } else {
                         item_id.clone()
                     };
-                    update_voice_transcript(&mut self.messages[index], item_id, text, now);
+                    update_voice_transcript(&mut self.messages[index], item_id, text);
+                    let transcript_is_active_turn = self.active_voice_message == Some(index)
+                        && self.speech_screenshot_gate.speech_active;
+                    // A late transcript may update its historical message, but it
+                    // must not reopen that turn's screenshot gate. Only the message
+                    // currently owned by an active speech turn can trigger capture.
                     if transcript_has_text
+                        && transcript_is_active_turn
                         && !self.captured_transcript_items.contains(&transcript_key)
                     {
                         let already_captured = self.speech_screenshot_gate.sent;
@@ -2903,23 +2925,32 @@ impl LiveAssistantApp {
     }
 
     fn ensure_active_voice_message(&mut self) -> usize {
-        if let Some(index) = self.active_voice_message
-            && self
-                .messages
-                .get(index)
-                .is_some_and(|message| message.role == Role::User && message.voice_turn)
-        {
+        if let Some(index) = voice_message_is_open_turn(
+            &self.messages,
+            self.active_voice_message,
+            self.speech_screenshot_gate.speech_active,
+        ) {
             return index;
         }
+
+        // A stale active index must never bypass the five-second grouping check
+        // or keep the previous turn's screenshot gate in the sent state.
+        self.active_voice_message = None;
         if let Some(microphone) = &self.microphone
             && !microphone.in_speech()
         {
             microphone.begin_turn();
         }
+        let now = Instant::now();
+        let continuation = recent_voice_continuation_index(&self.messages, now);
+        if continuation.is_none() && self.screenshot_capture_in_flight.is_some() {
+            // A capture belonging to an expired turn must not block the new turn's
+            // screenshot. Its eventual result is ignored by the incremented turn id.
+            self.cancel_speech_screenshot();
+        }
         self.speech_turn_id = self.speech_turn_id.wrapping_add(1);
         self.speech_screenshot_gate.begin();
-        let now = Instant::now();
-        let index = if let Some(index) = recent_voice_continuation_index(&self.messages, now) {
+        let index = if let Some(index) = continuation {
             prepare_voice_continuation(&mut self.messages[index], now);
             eprintln!(
                 "[live-assistant user-group] continuing message={} window_seconds={} assistant_active={}",
@@ -2931,6 +2962,11 @@ impl LiveAssistantApp {
         } else {
             let index = self.append_user_message(ChatMessage::user_voice(Vec::new(), None));
             self.messages[index].voice_last_activity_at = Some(now);
+            eprintln!(
+                "[live-assistant user-group] started new message={} reason=window_expired window_seconds={}",
+                index,
+                MESSAGE_CONTINUATION_WINDOW.as_secs()
+            );
             index
         };
         self.active_voice_message = Some(index);
@@ -6843,28 +6879,52 @@ mod tests {
     }
 
     #[test]
+    fn late_transcript_does_not_extend_five_second_voice_window() {
+        let now = Instant::now();
+        let speech_ended = now - Duration::from_secs(10);
+        let mut user = ChatMessage::user_voice(vec![1, 2], None);
+        user.voice_last_activity_at = Some(speech_ended);
+        user.finish();
+
+        update_voice_transcript(
+            &mut user,
+            "late-item".to_owned(),
+            "late transcript".to_owned(),
+        );
+
+        assert_eq!(user.voice_last_activity_at, Some(speech_ended));
+        assert_eq!(recent_voice_continuation_index(&[user], now), None);
+    }
+
+    #[test]
+    fn ended_active_pointer_cannot_bypass_new_turn_setup() {
+        let user = ChatMessage::user_voice(vec![1], None);
+        let messages = vec![user];
+
+        assert_eq!(voice_message_is_open_turn(&messages, Some(0), false), None);
+        assert_eq!(
+            voice_message_is_open_turn(&messages, Some(0), true),
+            Some(0)
+        );
+    }
+
+    #[test]
     fn continued_voice_transcript_and_audio_append_to_one_card() {
         let now = Instant::now();
         let mut message = ChatMessage::user_voice(vec![1, 2], None);
         message.text = "I wish we have good".to_owned();
         message.server_item_id = Some("first".to_owned());
         prepare_voice_continuation(&mut message, now);
-        update_voice_transcript(&mut message, "second".to_owned(), "luck".to_owned(), now);
+        update_voice_transcript(&mut message, "second".to_owned(), "luck".to_owned());
         append_voice_audio_fragment(&mut message, &[3, 4], now);
         prepare_voice_continuation(&mut message, now);
         update_voice_transcript(
             &mut message,
             "third".to_owned(),
             "and do you think".to_owned(),
-            now,
         );
         append_voice_audio_fragment(&mut message, &[5, 6], now);
-        update_voice_transcript(
-            &mut message,
-            "second".to_owned(),
-            "luck indeed".to_owned(),
-            now,
-        );
+        update_voice_transcript(&mut message, "second".to_owned(), "luck indeed".to_owned());
 
         assert_eq!(
             message.text,

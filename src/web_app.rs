@@ -81,7 +81,7 @@ impl Default for PublicSettings {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum MessageRole {
     User,
@@ -639,7 +639,7 @@ fn ensure_assistant_message(
 
 fn take_message_id(next_message_id: &mut u64) -> u64 {
     let id = *next_message_id;
-    *next_message_id = next_message_id.saturating_add(1);
+    *next_message_id = (*next_message_id).saturating_add(1);
     id
 }
 

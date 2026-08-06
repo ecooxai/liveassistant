@@ -16,7 +16,7 @@ jobs:
           toolchain: stable
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
-      - name: Formatting
-        run: cargo fmt --all -- --check
       - name: Compile
         run: cargo check --all-targets
+      - name: Formatting
+        run: cargo fmt --all -- --check

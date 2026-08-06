@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Live Assistant</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="aurora aurora-a"></div>
+  <div class="aurora aurora-b"></div>
+  <div class="aurora aurora-c"></div>
+
+  <main class="shell">
+    <header class="topbar glass">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><span></span></div>
+        <div><h1>Live Assistant</h1><p>Local Rust runtime</p></div>
+      </div>
+      <div class="top-actions">
+        <button class="icon-button" id="settingsToggle" aria-label="Open settings" title="Settings">
+          <svg viewBox="0 0 24 24"><path d="M12 15.4a3.4 3.4 0 1 0 0-6.8 3.4 3.4 0 0 0 0 6.8Zm7.2-3.4c0-.5 0-1-.2-1.5l2-1.6-2-3.5-2.5 1a8 8 0 0 0-2.6-1.5L13.5 2h-4l-.4 2.9a8 8 0 0 0-2.6 1.5l-2.5-1-2 3.5 2 1.6a7 7 0 0 0 0 3L2 15.1l2 3.5 2.5-1a8 8 0 0 0 2.6 1.5l.4 2.9h4l.4-2.9a8 8 0 0 0 2.6-1.5l2.5 1 2-3.5-2-1.6c.2-.5.2-1 .2-1.5Z"/></svg>
+        </button>
+        <div class="status-pill" id="statusPill"><span class="status-dot"></span><span id="statusText">Ready</span></div>
+      </div>
+    </header>
+
+    <section class="workspace">
+      <aside class="rail glass">
+        <div class="rail-head"><span>Session</span><button class="text-button" id="clearButton">Clear</button></div>
+        <div class="connection-card">
+          <div class="connection-top"><span class="eyebrow">Connection</span><span class="tiny-badge" id="connectionBadge">Offline</span></div>
+          <strong id="activeModel">gpt-realtime-2.1</strong>
+          <p id="activeBackend">Codex GPT Live</p>
+          <button class="primary-button" id="connectButton">Connect</button>
+        </div>
+        <div class="rail-section">
+          <span class="eyebrow">Mode</span>
+          <div class="segmented" id="backendSegments">
+            <button data-backend="codex_gpt_live" class="active">Voice</button>
+            <button data-backend="open_ai_realtime">Realtime</button>
+            <button data-backend="codex_text">Text</button>
+          </div>
+        </div>
+        <div class="rail-section compact-stats">
+          <div><span>Transport</span><strong>Backend only</strong></div>
+          <div><span>State</span><strong>In memory</strong></div>
+          <div><span>Port</span><strong id="portValue">—</strong></div>
+        </div>
+      </aside>
+
+      <section class="chat-panel glass">
+        <div class="chat-head">
+          <div><span class="eyebrow">Conversation</span><h2>A lighter way to work</h2></div>
+          <div class="model-chip" id="modelChip">GPT Live</div>
+        </div>
+        <div class="error-banner hidden" id="errorBanner"></div>
+        <div class="messages" id="messages" aria-live="polite"></div>
+        <div class="composer-wrap">
+          <form class="composer" id="composerForm">
+            <textarea id="composerInput" rows="1" placeholder="Ask anything…" aria-label="Message"></textarea>
+            <div class="composer-actions">
+              <button type="button" class="round-button mic-button" id="micButton" title="Start microphone" aria-label="Start microphone">
+                <svg viewBox="0 0 24 24"><path d="M12 15.5a3.5 3.5 0 0 0 3.5-3.5V6a3.5 3.5 0 1 0-7 0v6a3.5 3.5 0 0 0 3.5 3.5Zm-6-4a6 6 0 0 0 12 0M12 18v4m-4 0h8"/></svg>
+              </button>
+              <button type="submit" class="round-button send-button" aria-label="Send">
+                <svg viewBox="0 0 24 24"><path d="m5 12 14-7-4 14-3-6-7-1Z"/><path d="m12 13 7-8"/></svg>
+              </button>
+            </div>
+          </form>
+          <p class="composer-hint">All model requests and tools run through the local Rust backend.</p>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <div class="scrim hidden" id="settingsScrim"></div>
+  <aside class="settings-drawer" id="settingsDrawer" aria-hidden="true">
+    <div class="drawer-head">
+      <div><span class="eyebrow">Runtime</span><h2>Settings</h2></div>
+      <button class="icon-button" id="settingsClose" aria-label="Close settings"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+    </div>
+    <div class="drawer-body">
+      <label><span>Authentication</span><select id="authMode"><option value="codex">Codex login</option><option value="api_key">OpenAI API key</option></select></label>
+      <label id="apiKeyGroup" class="hidden"><span>API key</span><input id="apiKey" type="password" autocomplete="off" placeholder="sk-…"><small>Sent once to the local backend and kept only in memory.</small></label>
+      <label><span>Model</span><input id="modelInput" type="text" value="gpt-realtime-2.1"></label>
+      <div class="two-column">
+        <label><span>Voice</span><select id="voiceInput"><option value="ember">Ember</option><option value="juniper">Juniper</option><option value="maple">Maple</option><option value="marin">Marin</option><option value="cedar">Cedar</option></select></label>
+        <label><span>Thinking</span><select id="thinkingInput"><option value="low">Light</option><option value="medium">Medium</option><option value="high">High</option></select></label>
+      </div>
+      <div class="two-column">
+        <label><span>Image model</span><input id="imageModelInput" type="text" value="gpt-image-2"></label>
+        <label><span>Image size</span><select id="imageResolutionInput"><option value="1024x1024">1024 × 1024</option><option value="1024x1536">1024 × 1536</option><option value="1536x1024">1536 × 1024</option><option value="2560x1440">2560 × 1440</option><option value="3840x2160">3840 × 2160</option></select></label>
+      </div>
+      <label class="toggle-row"><div><span>Screen context</span><small>Attach the current display to typed turns.</small></div><input id="sendScreenshot" type="checkbox" checked></label>
+      <label><span>System prompt</span><textarea id="systemPrompt" rows="8"></textarea></label>
+    </div>
+    <div class="drawer-foot"><span id="settingsSaved">Synced with backend</span><button class="primary-button" id="drawerConnect">Connect</button></div>
+  </aside>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

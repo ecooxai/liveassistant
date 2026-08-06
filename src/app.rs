@@ -847,6 +847,16 @@ fn voice_message_is_open_turn(
     })
 }
 
+fn message_ended_within_continuation_window(
+    message: &ChatMessage,
+    new_message_started_at: Instant,
+) -> bool {
+    message
+        .finished_instant
+        .and_then(|ended_at| new_message_started_at.checked_duration_since(ended_at))
+        .is_some_and(|gap| gap < MESSAGE_CONTINUATION_WINDOW)
+}
+
 fn recent_voice_continuation_index(messages: &[ChatMessage], now: Instant) -> Option<usize> {
     // Only the newest user message can be continued. Assistant replies may sit
     // below it, but a newer typed/user message must start a separate group.
@@ -857,12 +867,9 @@ fn recent_voice_continuation_index(messages: &[ChatMessage], now: Instant) -> Op
         if !message.voice_turn {
             return None;
         }
-        // This timestamp is updated only by real speech boundaries, never by
-        // late transcript/commit notifications. Otherwise a delayed transcript
-        // can reopen a card long after the user's five-second continuation window.
-        let last_activity = message.voice_last_activity_at?;
-        let elapsed = now.checked_duration_since(last_activity)?;
-        return (elapsed <= MESSAGE_CONTINUATION_WINDOW).then_some(index);
+        // The new speech start is compared with the previous card's actual end.
+        // Transcript arrival time and fragment length must never slide this window.
+        return message_ended_within_continuation_window(message, now).then_some(index);
     }
     None
 }
@@ -2336,10 +2343,16 @@ impl LiveAssistantApp {
                             audio_end_ms,
                         });
                     }
-                    // Ignore any already-in-flight deltas from the interrupted response,
-                    // but keep the assistant transcript/WAV group open for five seconds.
+                    // The interruption is the previous assistant message's end. A later
+                    // assistant response may reuse that card only when it starts less than
+                    // five seconds after this exact timestamp.
+                    if let Some(index) = self.active_assistant_message
+                        && let Some(message) = self.messages.get_mut(index)
+                    {
+                        message.finish();
+                    }
                     self.active_response_id = None;
-                    self.touch_assistant_group(Instant::now());
+                    self.refresh_assistant_group_deadline();
                     self.ensure_active_voice_message();
                 }
                 Event::SpeechStopped => {
@@ -2532,6 +2545,12 @@ impl LiveAssistantApp {
                     self.finalize_expired_assistant_group(now);
                     let continue_group = self.assistant_group_is_open(now);
                     if !continue_group {
+                        if let Some(index) = self.active_assistant_message
+                            && let Some(message) = self.messages.get_mut(index)
+                            && message.finished_instant.is_none()
+                        {
+                            message.finish();
+                        }
                         self.active_assistant_message = None;
                         self.assistant_group_deadline = None;
                     }
@@ -2556,7 +2575,7 @@ impl LiveAssistantApp {
                     self.messages[assistant_index].begin_response(response_id);
                     self.last_assistant_item_id = None;
                     self.pending_tool_reply = false;
-                    self.touch_assistant_group(now);
+                    self.refresh_assistant_group_deadline();
                     if continue_group {
                         eprintln!(
                             "[live-assistant assistant-group] continuing message={:?} window_seconds={}",
@@ -2592,7 +2611,6 @@ impl LiveAssistantApp {
                     }
                     self.current_assistant().refresh_token_estimate();
                     self.assistant_text_needs_separator = false;
-                    self.touch_assistant_group(Instant::now());
                     if self.settings.backend == RealtimeBackend::CodexGptLive
                         && crate::gpt_live_webrtc::uses_platform_audio()
                     {
@@ -2612,14 +2630,12 @@ impl LiveAssistantApp {
                         speaker.append_assistant(samples.clone());
                     }
                     self.current_assistant().audio.extend_from_slice(&samples);
-                    self.touch_assistant_group(Instant::now());
                     self.status = "Speaking…".to_owned();
                 }
                 Event::AssistantSegmentDone { response_id } => {
                     if self.response_is_active(&response_id) {
-                        // Keep the complete GPT-Live reply in one message WAV. The
-                        // transcript boundary only extends the continuation window.
-                        self.touch_assistant_group(Instant::now());
+                        // This is still the same backend response. Grouping begins only
+                        // when the full assistant message receives its end timestamp.
                     }
                 }
                 Event::AssistantDone { response_id } => {
@@ -2639,7 +2655,7 @@ impl LiveAssistantApp {
                             speaker.finish_assistant_response();
                         }
                         self.active_response_id = None;
-                        self.touch_assistant_group(Instant::now());
+                        self.refresh_assistant_group_deadline();
                         if self.tool_calls_running > 0 {
                             self.status = format!(
                                 "Running {} tool{}…",
@@ -2676,7 +2692,6 @@ impl LiveAssistantApp {
                     let count = calls.len();
                     self.tool_calls_running = self.tool_calls_running.saturating_add(count);
                     self.pending_tool_reply = true;
-                    self.touch_assistant_group(Instant::now());
                     {
                         let message = self.current_assistant();
                         message
@@ -2818,29 +2833,27 @@ impl LiveAssistantApp {
 
     fn assistant_group_is_open(&self, now: Instant) -> bool {
         self.active_assistant_message.is_some_and(|index| {
-            self.messages
-                .get(index)
-                .is_some_and(|message| message.role == Role::Assistant)
-        }) && (self.pending_tool_reply
-            || self
-                .assistant_group_deadline
-                .is_none_or(|deadline| now <= deadline))
+            self.messages.get(index).is_some_and(|message| {
+                message.role == Role::Assistant
+                    && (self.pending_tool_reply
+                        || message_ended_within_continuation_window(message, now))
+            })
+        })
     }
 
-    fn touch_assistant_group(&mut self, now: Instant) {
-        if self.active_assistant_message.is_some_and(|index| {
-            self.messages
-                .get(index)
-                .is_some_and(|message| message.role == Role::Assistant)
-        }) {
-            self.assistant_group_deadline = Some(now + MESSAGE_CONTINUATION_WINDOW);
-        }
+    fn refresh_assistant_group_deadline(&mut self) {
+        self.assistant_group_deadline = self
+            .active_assistant_message
+            .and_then(|index| self.messages.get(index))
+            .filter(|message| message.role == Role::Assistant)
+            .and_then(|message| message.finished_instant)
+            .map(|ended_at| ended_at + MESSAGE_CONTINUATION_WINDOW);
     }
 
     fn finalize_expired_assistant_group(&mut self, now: Instant) {
         let expired = self
             .assistant_group_deadline
-            .is_some_and(|deadline| now > deadline);
+            .is_some_and(|deadline| now >= deadline);
         if !expired
             || self.active_response_id.is_some()
             || self.pending_tool_reply
@@ -6820,18 +6833,23 @@ mod tests {
     }
 
     #[test]
-    fn assistant_text_and_audio_can_append_across_a_user_card() {
+    fn assistant_reuse_uses_new_start_minus_previous_end() {
         let now = Instant::now();
         let mut assistant = ChatMessage::assistant();
         assistant.text = "first AI part".to_owned();
         assistant.audio.extend_from_slice(&[1, 2]);
-        let messages = [ChatMessage::user_voice(vec![9], None), assistant];
-        let deadline = now + MESSAGE_CONTINUATION_WINDOW;
+        assistant.finished_instant = Some(now);
 
-        assert!(now + Duration::from_secs(4) <= deadline);
-        assert!(now + Duration::from_secs(6) > deadline);
-        assert_eq!(messages[1].text, "first AI part");
-        assert_eq!(messages[1].audio, vec![1, 2]);
+        assert!(message_ended_within_continuation_window(
+            &assistant,
+            now + Duration::from_secs(4)
+        ));
+        assert!(!message_ended_within_continuation_window(
+            &assistant,
+            now + MESSAGE_CONTINUATION_WINDOW
+        ));
+        assert_eq!(assistant.text, "first AI part");
+        assert_eq!(assistant.audio, vec![1, 2]);
     }
 
     #[test]
@@ -6847,7 +6865,7 @@ mod tests {
         let now = Instant::now();
         let mut user = ChatMessage::user_voice(vec![1, 2], None);
         user.text = "I wish we have good".to_owned();
-        user.voice_last_activity_at = Some(now - Duration::from_secs(4));
+        user.finished_instant = Some(now - Duration::from_secs(4));
         let messages = vec![user, ChatMessage::assistant()];
 
         assert_eq!(recent_voice_continuation_index(&messages, now), Some(0));
@@ -6857,10 +6875,10 @@ mod tests {
     fn user_voice_fragment_after_five_seconds_starts_new_message() {
         let now = Instant::now();
         let mut user = ChatMessage::user_voice(vec![1, 2], None);
-        user.voice_last_activity_at =
-            Some(now - MESSAGE_CONTINUATION_WINDOW - Duration::from_millis(1));
+        user.finished_instant = Some(now - MESSAGE_CONTINUATION_WINDOW);
         let messages = vec![user, ChatMessage::assistant()];
 
+        // Exactly five seconds is already a new message; reuse is strictly less.
         assert_eq!(recent_voice_continuation_index(&messages, now), None);
     }
 
@@ -6883,8 +6901,8 @@ mod tests {
         let now = Instant::now();
         let speech_ended = now - Duration::from_secs(10);
         let mut user = ChatMessage::user_voice(vec![1, 2], None);
-        user.voice_last_activity_at = Some(speech_ended);
-        user.finish();
+        user.finished_instant = Some(speech_ended);
+        user.finished_at = Some(SystemTime::now() - Duration::from_secs(10));
 
         update_voice_transcript(
             &mut user,
@@ -6892,7 +6910,7 @@ mod tests {
             "late transcript".to_owned(),
         );
 
-        assert_eq!(user.voice_last_activity_at, Some(speech_ended));
+        assert_eq!(user.finished_instant, Some(speech_ended));
         assert_eq!(recent_voice_continuation_index(&[user], now), None);
     }
 

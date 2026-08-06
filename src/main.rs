@@ -1,5 +1,6 @@
 mod auth;
 mod click_test;
+mod codex_account;
 mod gpt_live_webrtc;
 mod image_generation;
 mod live_pointer;

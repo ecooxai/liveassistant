@@ -2,6 +2,7 @@ use crate::{
     auth::{self, CodexCredentials},
     codex_account, image_generation,
     media::{self, Attachment, ScreenInfo},
+    notes,
     realtime::{self, Command, ConnectOptions, Event, RealtimeBackend, RealtimeClient, ToolOutput},
     tools,
 };
@@ -22,7 +23,7 @@ use futures_util::{Sink, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, RwLock, mpsc},
     thread,
@@ -35,6 +36,11 @@ const APP_CSS: &str = include_str!("../web/app.css");
 const APP_JS: &str = include_str!("../web/app.js");
 const CONTEXT_UPLOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
+const FALLBACK_GPT_LIVE_MODELS: &[(&str, &str, &str)] = &[(
+    "gpt-live-1-boulder-alpha",
+    "GPT Live 1 Boulder alpha",
+    "Codex-managed GPT Live V3 speech-to-speech model.",
+)];
 const FALLBACK_REALTIME_MODELS: &[(&str, &str, &str)] = &[
     (
         "gpt-realtime-2.1",
@@ -105,8 +111,8 @@ enum ConnectionState {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum AuthMode {
-    #[default]
     ApiKey,
+    #[default]
     Codex,
 }
 
@@ -129,7 +135,7 @@ impl Default for PublicSettings {
         Self {
             backend: RealtimeBackend::CodexGptLive,
             auth_mode: AuthMode::Codex,
-            model: "gpt-realtime-2.1".to_owned(),
+            model: "gpt-live-1-boulder-alpha".to_owned(),
             voice: "ember".to_owned(),
             thinking_level: "low".to_owned(),
             system_prompt: realtime::default_system_prompt(primary_screen_info()),
@@ -147,11 +153,11 @@ impl PublicSettings {
         match backend {
             RealtimeBackend::CodexGptLive => {
                 settings.auth_mode = AuthMode::Codex;
-                settings.model = model.unwrap_or_else(|| "gpt-realtime-2.1".to_owned());
+                settings.model = model.unwrap_or_else(|| "gpt-live-1-boulder-alpha".to_owned());
                 settings.voice = "ember".to_owned();
             }
             RealtimeBackend::OpenAiRealtime => {
-                settings.auth_mode = AuthMode::ApiKey;
+                settings.auth_mode = AuthMode::Codex;
                 settings.model = model.unwrap_or_else(|| "gpt-realtime-2.1".to_owned());
                 settings.voice = "marin".to_owned();
             }
@@ -338,7 +344,7 @@ impl Default for ModelCatalog {
             loading: true,
             error: None,
             refreshed_at: None,
-            gpt_live_models: fallback_realtime_models("official"),
+            gpt_live_models: fallback_gpt_live_models("official"),
             realtime_models: fallback_realtime_models("official"),
             text_models: fallback_text_models("official"),
             realtime_voices: FALLBACK_REALTIME_VOICES
@@ -456,6 +462,7 @@ struct RuntimeTab {
     microphone_preroll: Vec<i16>,
     voice_audio: Vec<i16>,
     assistant_audio: Vec<i16>,
+    queued_text_turns: VecDeque<String>,
     next_upload_id: u64,
 }
 
@@ -471,6 +478,7 @@ impl RuntimeTab {
             microphone_preroll: Vec::new(),
             voice_audio: Vec::new(),
             assistant_audio: Vec::new(),
+            queued_text_turns: VecDeque::new(),
             next_upload_id: 0,
         }
     }
@@ -672,6 +680,23 @@ struct RefreshCatalogRequest {
     api_key: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct NoteNameRequest {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct NoteSaveRequest {
+    name: String,
+    content: String,
+}
+
+#[derive(Serialize)]
+struct NoteDocumentResponse {
+    name: String,
+    content: String,
+}
+
 pub async fn run(port: u16, open_browser: bool) -> anyhow::Result<()> {
     let backend = Backend::spawn();
     let app = Router::new()
@@ -693,6 +718,11 @@ pub async fn run(port: u16, open_browser: bool) -> anyhow::Result<()> {
         .route("/api/capture-screen", post(api_capture_screen))
         .route("/api/attachments/remove", post(api_remove_attachment))
         .route("/api/catalog/refresh", post(api_refresh_catalog))
+        .route("/api/notes", get(api_notes_list))
+        .route("/api/notes/open", post(api_note_open))
+        .route("/api/notes/create", post(api_note_create))
+        .route("/api/notes/import", post(api_note_import))
+        .route("/api/notes/save", post(api_note_save))
         .route("/ws", get(ws_handler))
         .with_state(backend.clone());
 
@@ -1100,9 +1130,15 @@ fn handle_action(
 }
 
 fn connect_tab(worker: &mut WorkerState, tab_id: u64, api_key: Option<String>) {
-    let Some(settings) = worker.tab(tab_id).map(|tab| tab.settings.clone()) else {
+    let Some((settings, connection)) = worker
+        .tab(tab_id)
+        .map(|tab| (tab.settings.clone(), tab.connection))
+    else {
         return;
     };
+    if connection != ConnectionState::Offline {
+        return;
+    }
     let key = api_key.or_else(|| worker.platform_api_key.clone());
     match resolve_credentials(settings.auth_mode, key) {
         Ok(credentials) => {
@@ -1165,12 +1201,11 @@ fn send_text(worker: &mut WorkerState, tab_id: u64, text: String) {
         .tab(tab_id)
         .is_none_or(|tab| tab.connection != ConnectionState::Live)
     {
-        set_tab_status(
-            worker,
-            tab_id,
-            "Needs attention",
-            Some("Connect this tab before sending a message".to_owned()),
-        );
+        if let Some(runtime) = worker.runtimes.get_mut(&tab_id) {
+            runtime.queued_text_turns.push_back(text);
+        }
+        set_tab_status(worker, tab_id, "Connecting · message queued", None);
+        connect_tab(worker, tab_id, None);
         return;
     }
 
@@ -1256,6 +1291,17 @@ fn handle_realtime_event(
                     "Listening".to_owned()
                 };
                 tab.error = None;
+            }
+            let queued = worker
+                .runtimes
+                .get_mut(&tab_id)
+                .map(|runtime| runtime.queued_text_turns.drain(..).collect::<Vec<_>>())
+                .unwrap_or_default();
+            for text in queued {
+                let _ = action_tx.send(Action::SendText {
+                    tab_id: Some(tab_id),
+                    text,
+                });
             }
         }
         Event::Disconnected => {
@@ -1804,8 +1850,22 @@ fn load_model_catalog(api_key: Option<&str>) -> anyhow::Result<ModelCatalog> {
                     })
                     .collect::<Vec<_>>();
                 merge_models(&mut realtime, fallback_realtime_models("official"));
-                catalog.realtime_models = realtime.clone();
-                catalog.gpt_live_models = realtime;
+                catalog.realtime_models = realtime;
+
+                let mut gpt_live = models
+                    .iter()
+                    .filter(|id| is_gpt_live_model(id))
+                    .map(|id| {
+                        model_option(
+                            id,
+                            &model_label(id),
+                            "Available to this API key.",
+                            "openai_api",
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                merge_models(&mut gpt_live, fallback_gpt_live_models("official"));
+                catalog.gpt_live_models = gpt_live;
 
                 let mut text = models
                     .iter()
@@ -1892,6 +1952,10 @@ fn list_platform_models(api_key: &str) -> anyhow::Result<Vec<String>> {
     Ok(models)
 }
 
+fn is_gpt_live_model(id: &str) -> bool {
+    id.starts_with("gpt-live")
+}
+
 fn is_realtime_model(id: &str) -> bool {
     id.starts_with("gpt-realtime")
         && !id.contains("whisper")
@@ -1903,6 +1967,7 @@ fn is_text_model(id: &str) -> bool {
     let general_prefix = id.starts_with("gpt-") || id.starts_with('o') || id.starts_with("chat-");
     general_prefix
         && !id.contains("realtime")
+        && !id.contains("live")
         && !id.contains("audio")
         && !id.contains("transcribe")
         && !id.contains("tts")
@@ -1911,6 +1976,13 @@ fn is_text_model(id: &str) -> bool {
         && !id.contains("moderation")
         && !id.contains("search")
         && !id.contains("sora")
+}
+
+fn fallback_gpt_live_models(source: &str) -> Vec<ModelOption> {
+    FALLBACK_GPT_LIVE_MODELS
+        .iter()
+        .map(|(id, label, description)| model_option(id, label, description, source))
+        .collect()
 }
 
 fn fallback_realtime_models(source: &str) -> Vec<ModelOption> {
@@ -2245,6 +2317,84 @@ async fn api_refresh_catalog(
     )
 }
 
+async fn api_notes_list() -> impl IntoResponse {
+    match notes::list_notes() {
+        Ok(paths) => (
+            StatusCode::OK,
+            Json(json!({
+                "files": paths
+                    .iter()
+                    .map(|path| notes::display_name(path))
+                    .collect::<Vec<_>>()
+            })),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("{error:#}")})),
+        ),
+    }
+}
+
+async fn api_note_open(Json(request): Json<NoteNameRequest>) -> impl IntoResponse {
+    let result = notes::workspace_note_path(&request.name).and_then(|path| {
+        notes::read_note(&path).map(|content| NoteDocumentResponse {
+            name: notes::display_name(&path),
+            content,
+        })
+    });
+    note_document_response(result)
+}
+
+async fn api_note_create(Json(request): Json<NoteNameRequest>) -> impl IntoResponse {
+    let name = if request.name.trim().is_empty() {
+        "Untitled.md"
+    } else {
+        request.name.trim()
+    };
+    let result = notes::create_unique_note(name, "").map(|path| NoteDocumentResponse {
+        name: notes::display_name(&path),
+        content: String::new(),
+    });
+    note_document_response(result)
+}
+
+async fn api_note_import(Json(request): Json<NoteSaveRequest>) -> impl IntoResponse {
+    let result =
+        notes::import_text(&request.name, &request.content).map(|path| NoteDocumentResponse {
+            name: notes::display_name(&path),
+            content: request.content,
+        });
+    note_document_response(result)
+}
+
+async fn api_note_save(Json(request): Json<NoteSaveRequest>) -> impl IntoResponse {
+    let result = notes::workspace_note_path(&request.name).and_then(|path| {
+        notes::save_note(&path, &request.content).map(|_| NoteDocumentResponse {
+            name: notes::display_name(&path),
+            content: request.content,
+        })
+    });
+    note_document_response(result)
+}
+
+fn note_document_response(
+    result: anyhow::Result<NoteDocumentResponse>,
+) -> (StatusCode, Json<Value>) {
+    match result {
+        Ok(document) => (
+            StatusCode::OK,
+            Json(
+                serde_json::to_value(document)
+                    .unwrap_or_else(|_| json!({"error": "Could not encode note"})),
+            ),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("{error:#}")})),
+        ),
+    }
+}
+
 fn send_action(backend: &Backend, action: Action) -> (StatusCode, Json<Value>) {
     match backend.actions.send(action) {
         Ok(()) => (StatusCode::ACCEPTED, Json(json!({"ok": true}))),
@@ -2351,6 +2501,9 @@ mod tests {
             state.tabs[1].settings.backend,
             RealtimeBackend::OpenAiRealtime
         );
+        assert_eq!(state.tabs[0].settings.model, "gpt-live-1-boulder-alpha");
+        assert_eq!(state.tabs[0].settings.auth_mode, AuthMode::Codex);
+        assert_eq!(state.tabs[1].settings.auth_mode, AuthMode::Codex);
         assert_ne!(state.tabs[0].id, state.tabs[1].id);
     }
 
@@ -2394,11 +2547,15 @@ mod tests {
     }
 
     #[test]
-    fn platform_model_filters_keep_realtime_and_text_separate() {
+    fn platform_model_filters_keep_live_realtime_and_text_separate() {
+        assert!(is_gpt_live_model("gpt-live-1-boulder-alpha"));
+        assert!(!is_gpt_live_model("gpt-realtime-2.1"));
         assert!(is_realtime_model("gpt-realtime-2.1"));
+        assert!(!is_realtime_model("gpt-live-1-boulder-alpha"));
         assert!(!is_realtime_model("gpt-5.6-sol"));
         assert!(is_text_model("gpt-5.6-sol"));
         assert!(is_text_model("o4-mini"));
+        assert!(!is_text_model("gpt-live-1-boulder-alpha"));
         assert!(!is_text_model("gpt-realtime-2.1"));
         assert!(!is_text_model("gpt-image-2"));
     }

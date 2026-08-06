@@ -1432,6 +1432,7 @@ enum CodexHandoffAction {
 fn codex_live_realtime_start_params(
     thread_id: &str,
     offer_sdp: String,
+    model: &str,
     voice: &str,
     prompt: String,
 ) -> Value {
@@ -1439,7 +1440,7 @@ fn codex_live_realtime_start_params(
         "threadId": thread_id,
         "outputModality": "audio",
         "version": "v3",
-        "model": "gpt-live-1-boulder-alpha",
+        "model": model,
         "voice": voice,
         "transport": {"type": "webrtc", "sdp": offer_sdp},
         // Automatic Frameless Bidi handoffs stream delegated text in roughly
@@ -1535,6 +1536,7 @@ async fn run_codex_live_connection(
             codex_live_realtime_start_params(
                 &thread_id,
                 offer_sdp,
+                &options.model,
                 &options.voice,
                 realtime_prompt,
             ),
@@ -6831,9 +6833,11 @@ Call me Ecoo."
         let params = codex_live_realtime_start_params(
             "thread-1",
             "v=0\r\n".to_owned(),
+            "gpt-live-1-boulder-alpha",
             "ember",
             "prompt".to_owned(),
         );
+        assert_eq!(params["model"], "gpt-live-1-boulder-alpha");
         assert_eq!(params["clientManagedHandoffs"], false);
         assert_eq!(params["codexResponsesAsItems"], false);
         assert_eq!(params["delegationAckFiller"], false);

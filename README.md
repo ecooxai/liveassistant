@@ -7,16 +7,19 @@ The browser is an interaction and rendering surface. Rust owns credentials, inde
 ## Restored web features
 
 - Independent top tabs, each with its own Rust transport, settings, messages, uploads, and connection state.
-- GPT Live, OpenAI Realtime API, and Codex text tabs.
+- GPT Live (`gpt-live-*`), OpenAI Realtime API (`gpt-realtime-*`), and Codex text tabs with separate model catalogs.
 - Dynamic model discovery from the connected Codex account and, when an API key is supplied, the OpenAI Models API.
 - Radio-card model and transport selection in Settings and in the Add model tab dialog.
 - Dynamic voice persona lists for GPT Live and OpenAI Realtime.
+- Automatic active-tab connection when the page opens, with the browser microphone enabled by default after a voice transport connects.
 - Typed messages and browser microphone input with assistant audio playback.
 - Image and audio upload, manual screen capture, and removable pending attachment previews.
 - Optional automatic current-screen context for typed and voice turns.
 - Screenshot upload lifecycle states: preparing, uploading, uploaded, and failed.
+- Incremental keyed message rendering: streaming snapshots update only the affected card and preserve audio controls, selection, scroll context, and microphone state.
 - Message start and end clocks, elapsed time, token totals, estimated-token marking, and completed assistant tokens per second.
 - Replayable and downloadable WAV cards for uploaded audio and recorded user/assistant PCM when the transport exposes it.
+- A resizable bottom workspace matching the native layout, with Chat, workspace Markdown/text files, local file import, editing, and autosave.
 - Codex account rate limits, reset times, credit state, and token-usage snapshots in Settings.
 - Generated-image previews and local computer-tool progress/results.
 - In-memory API keys; credentials are never returned in browser state snapshots or persisted by the web UI.
@@ -25,7 +28,7 @@ The browser is an interaction and rendering surface. Rust owns credentials, inde
 
 - **Axum server:** binds only to `127.0.0.1`, serves the embedded interface, and accepts explicit action requests.
 - **Rust state worker:** owns every tab and polls each tab's independent Realtime client.
-- **WebSocket:** sends full state snapshots and assistant PCM to the active browser session; microphone PCM travels back to the active Rust tab.
+- **WebSocket:** sends Rust state snapshots and assistant PCM to the browser; a keyed DOM reconciler applies only changed tabs/cards, while microphone PCM travels back to the active Rust tab.
 - **Model catalog:** merges account/API discoveries with built-in official fallbacks while preserving the source of each model option.
 - **Attachments:** browser images are decoded and normalized in Rust before entering a turn. Screenshots are captured by Rust.
 
@@ -65,7 +68,7 @@ For automatic rebuilds while editing Rust or browser assets:
 
 Use either:
 
-1. **Reuse Codex login** — reads existing Codex credentials from `~/.codex/auth.json` or `$CODEX_HOME/auth.json` and discovers the account's text models and voice personas.
+1. **Reuse Codex login** — the default for GPT Live, Realtime, and text tabs. It reads existing Codex credentials from `~/.codex/auth.json` or `$CODEX_HOME/auth.json` and discovers the account's models and voice personas.
 2. **OpenAI API key** — enter a key in Settings or set `OPENAI_API_KEY`. The **Find available** action asks the Rust backend to refresh the model catalog from the OpenAI Models API.
 
 A key entered in the browser is sent only to the localhost Rust process and retained in memory.

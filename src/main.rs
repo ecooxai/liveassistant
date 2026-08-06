@@ -5,6 +5,7 @@ mod gpt_live_webrtc;
 mod image_generation;
 mod live_pointer;
 mod media;
+mod notes;
 mod realtime;
 mod resample;
 mod tools;

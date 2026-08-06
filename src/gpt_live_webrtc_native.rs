@@ -219,7 +219,10 @@ async fn create_peer_connection_and_offer(
         },
         AUDIO_SAMPLE_RATE,
         1,
-        1_000,
+        // VoiceProcessingIO already delivers clocked 10 ms-equivalent audio.
+        // A buffered source paces historical frames in real time and lets the
+        // unbounded input channel grow into multi-second recognition latency.
+        0,
     );
     let local_audio_track = factory.create_audio_track("realtime-mic", local_audio_source.clone());
     audio_transceiver

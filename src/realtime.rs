@@ -28,6 +28,10 @@ use tokio_tungstenite::{
 
 const AUDIO_SAMPLE_RATE: usize = 24_000;
 const CONNECT_AUDIO_BUFFER_MAX_SAMPLES: usize = AUDIO_SAMPLE_RATE * 60;
+/// Native external-audio WebRTC must never replay the full connection-time mic
+/// history. Old silence/speech would sit ahead of the current utterance and make
+/// server VAD appear 10–20 seconds late.
+const GPT_LIVE_STARTUP_AUDIO_MAX_SAMPLES: usize = AUDIO_SAMPLE_RATE;
 const OPENAI_VAD_SILENCE_MS: u64 = 300;
 pub(crate) const CONTEXT_IMAGE_UPLOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -83,6 +87,27 @@ impl PendingAudioBuffer {
     fn clear(&mut self) {
         self.chunks.clear();
         self.sample_count = 0;
+    }
+
+    fn retain_latest_samples(&mut self, max_samples: usize) {
+        if max_samples == 0 {
+            self.clear();
+            return;
+        }
+        while self.sample_count > max_samples {
+            let overflow = self.sample_count - max_samples;
+            let Some(front) = self.chunks.front_mut() else {
+                self.sample_count = 0;
+                break;
+            };
+            if front.len() <= overflow {
+                self.sample_count -= front.len();
+                self.chunks.pop_front();
+            } else {
+                front.drain(..overflow);
+                self.sample_count -= overflow;
+            }
+        }
     }
 
     fn sample_count(&self) -> usize {
@@ -1566,24 +1591,23 @@ async fn run_codex_live_connection(
         }
     }
 
-    match server
-        .refresh_mcp_and_wait_for_server("codex_apps", Duration::from_secs(15))
-        .await
-    {
-        Ok(mcp_refresh_duration) => eprintln!(
-            "[live-assistant latency] stage=connection.codex_apps_ready elapsed_ms={} total_ms={}",
-            mcp_refresh_duration.as_millis(),
+    // Do not hold microphone audio behind connector startup. This refresh used
+    // to wait up to 15 seconds before entering the realtime command loop; every
+    // captured frame accumulated ahead of the user's current utterance.
+    match server.send_request("config/mcpServer/reload", Value::Null) {
+        Ok(request_id) => eprintln!(
+            "[live-assistant latency] stage=connection.mcp_refresh_queued request_id={} total_ms={}",
+            request_id,
             connection_started.elapsed().as_millis(),
         ),
         Err(error) => eprintln!(
-            "[live-assistant latency] stage=connection.codex_apps_warmup_failed total_ms={} error={error:#}",
+            "[live-assistant latency] stage=connection.mcp_refresh_queue_failed total_ms={} error={error:#}",
             connection_started.elapsed().as_millis(),
         ),
     }
 
-    // Do not block the live connection on metadata/plugin discovery. Warm the
-    // app-server request path opportunistically; its response is queued while
-    // the realtime session can already accept speech and tool delegations.
+    // Warm the app-server request path opportunistically; its response is queued
+    // while the realtime session already accepts speech and tool delegations.
     let _ = server.send_request(
         "thread/read",
         json!({
@@ -1597,11 +1621,32 @@ async fn run_codex_live_connection(
     );
 
     let mut remote_audio = peer.take_remote_audio();
-    let _ = events.send(Event::Connected);
-    if pending_audio.sample_count() > 0 {
+
+    // `run_codex_live_connection` owns the receiver while the app-server and
+    // WebRTC are starting, so live mic commands have accumulated in the channel.
+    // Fold them into the startup buffer, preserve non-audio user commands, then
+    // retain only one second. Replaying the full startup history is what made a
+    // fresh session answer 10+ seconds after the user stopped speaking.
+    let mut startup_commands = VecDeque::new();
+    while let Ok(command) = commands.try_recv() {
+        match command {
+            Command::AudioChunk(samples) => pending_audio.push(samples),
+            command => startup_commands.push_back(command),
+        }
+    }
+    let captured_startup_samples = pending_audio.sample_count();
+    pending_audio.retain_latest_samples(GPT_LIVE_STARTUP_AUDIO_MAX_SAMPLES);
+    let retained_startup_samples = pending_audio.sample_count();
+    if captured_startup_samples > retained_startup_samples {
+        eprintln!(
+            "[live-assistant mic] discarded_stale_startup_seconds={:.2} retained_seconds={:.2} backend=gpt-live",
+            (captured_startup_samples - retained_startup_samples) as f64 / AUDIO_SAMPLE_RATE as f64,
+            retained_startup_samples as f64 / AUDIO_SAMPLE_RATE as f64,
+        );
+    } else if retained_startup_samples > 0 {
         eprintln!(
             "[live-assistant mic] flushing_preconnect_seconds={:.2} backend=gpt-live",
-            pending_audio.sample_count() as f64 / AUDIO_SAMPLE_RATE as f64
+            retained_startup_samples as f64 / AUDIO_SAMPLE_RATE as f64
         );
     }
     while let Some(samples) = pending_audio.pop_front() {
@@ -1610,6 +1655,8 @@ async fn run_codex_live_connection(
             return Err(error);
         }
     }
+
+    let _ = events.send(Event::Connected);
     let mut state = CodexLiveState::default();
     let mut native_remote_audio =
         crate::gpt_live_webrtc::uses_native_remote_audio().then(NativeRemoteAudioGate::default);
@@ -1628,7 +1675,13 @@ async fn run_codex_live_connection(
 
     loop {
         tokio::select! {
-            command = commands.recv() => {
+            command = async {
+                if let Some(command) = startup_commands.pop_front() {
+                    Some(command)
+                } else {
+                    commands.recv().await
+                }
+            } => {
                 match command {
                     Some(Command::AudioChunk(samples)) => {
                         if !samples.is_empty() {
@@ -5545,6 +5598,19 @@ mod tests {
             })),
             Some(17)
         );
+    }
+
+    #[test]
+    fn preconnect_audio_buffer_can_retain_only_the_latest_samples() {
+        let mut pending = PendingAudioBuffer::default();
+        pending.push(vec![1, 2, 3]);
+        pending.push(vec![4, 5, 6]);
+
+        pending.retain_latest_samples(4);
+
+        assert_eq!(pending.sample_count(), 4);
+        assert_eq!(pending.pop_front(), Some(vec![3]));
+        assert_eq!(pending.pop_front(), Some(vec![4, 5, 6]));
     }
 
     #[test]

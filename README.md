@@ -119,8 +119,9 @@ transport reports it and a visibly marked local estimate otherwise.
 ## Privacy and behavior
 
 For OpenAI Realtime and GPT-Live, microphone capture starts as soon as **Start
-voice** is clicked. Audio recorded while the transport connects is kept in order
-(up to the latest 60 seconds), then flushed when the session is ready. A screen
+voice** is clicked. OpenAI Realtime keeps up to the latest 60 seconds while it
+connects. GPT-Live retains only the latest second so stale startup silence cannot
+sit ahead of the current utterance and delay server VAD. A screen
 capture is taken after the first live transcript token (or the local clear-speech
 fallback where available), not continuously. Disable per-turn screenshots in
 Settings. Press **Stop** to close the transport and audio devices.

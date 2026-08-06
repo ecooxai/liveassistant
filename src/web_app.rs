@@ -17,6 +17,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use base64::Engine;
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -283,6 +284,40 @@ struct ModelOption {
 }
 
 #[derive(Clone, Debug, Serialize)]
+struct RateLimitWindowView {
+    used_percent: i64,
+    window_duration_minutes: Option<i64>,
+    resets_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct RateLimitView {
+    name: String,
+    plan: Option<String>,
+    primary: Option<RateLimitWindowView>,
+    secondary: Option<RateLimitWindowView>,
+    credit_balance: Option<String>,
+    unlimited_credits: bool,
+    reached_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TokenUsageView {
+    lifetime_tokens: Option<i64>,
+    peak_daily_tokens: Option<i64>,
+    latest_day: Option<String>,
+    latest_day_tokens: Option<i64>,
+    recent_reported_tokens: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AccountUsageView {
+    rate_limits: Vec<RateLimitView>,
+    token_usage: TokenUsageView,
+    reset_credits: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 struct ModelCatalog {
     loading: bool,
     error: Option<String>,
@@ -293,6 +328,7 @@ struct ModelCatalog {
     realtime_voices: Vec<String>,
     gpt_live_voices: Vec<String>,
     image_models: Vec<ModelOption>,
+    account_usage: Option<AccountUsageView>,
     warnings: Vec<String>,
 }
 
@@ -339,6 +375,7 @@ impl Default for ModelCatalog {
                     "official",
                 ),
             ],
+            account_usage: None,
             warnings: Vec::new(),
         }
     }
@@ -416,6 +453,9 @@ struct RuntimeTab {
     input_messages: HashMap<String, usize>,
     pending: Vec<PendingAttachment>,
     active_voice_message: Option<usize>,
+    microphone_preroll: Vec<i16>,
+    voice_audio: Vec<i16>,
+    assistant_audio: Vec<i16>,
     next_upload_id: u64,
 }
 
@@ -428,6 +468,9 @@ impl RuntimeTab {
             input_messages: HashMap::new(),
             pending: Vec::new(),
             active_voice_message: None,
+            microphone_preroll: Vec::new(),
+            voice_audio: Vec::new(),
+            assistant_audio: Vec::new(),
             next_upload_id: 0,
         }
     }
@@ -540,7 +583,7 @@ enum Action {
     CloseTab {
         tab_id: u64,
     },
-    AddImage {
+    AddAttachment {
         tab_id: Option<u64>,
         name: String,
         data_url: String,
@@ -786,8 +829,17 @@ fn handle_action(
         Action::Audio { tab_id, samples } => {
             let tab_id = tab_id.unwrap_or_else(|| worker.active_tab_id());
             if !samples.is_empty()
-                && let Some(runtime) = worker.runtimes.get(&tab_id)
+                && let Some(runtime) = worker.runtimes.get_mut(&tab_id)
             {
+                if runtime.active_voice_message.is_some() {
+                    runtime.voice_audio.extend_from_slice(&samples);
+                }
+                runtime.microphone_preroll.extend_from_slice(&samples);
+                let max_preroll = 24_000 / 2;
+                if runtime.microphone_preroll.len() > max_preroll {
+                    let excess = runtime.microphone_preroll.len() - max_preroll;
+                    runtime.microphone_preroll.drain(..excess);
+                }
                 let _ = runtime.client.commands.send(Command::AudioChunk(samples));
             }
         }
@@ -869,7 +921,7 @@ fn handle_action(
                 }
             }
         }
-        Action::AddImage {
+        Action::AddAttachment {
             tab_id,
             name,
             data_url,
@@ -877,15 +929,19 @@ fn handle_action(
             let tab_id = tab_id.unwrap_or_else(|| worker.active_tab_id());
             let sender = action_tx.clone();
             thread::spawn(move || {
-                let result = media::image_from_data_url(name, &data_url)
-                    .map_err(|error| format!("{error:#}"));
+                let result = if data_url.trim().starts_with("data:audio/") {
+                    media::audio_from_data_url(name, &data_url)
+                } else {
+                    media::image_from_data_url(name, &data_url)
+                }
+                .map_err(|error| format!("{error:#}"));
                 let _ = sender.send(Action::AttachmentReady {
                     tab_id,
                     result,
                     included_screen: false,
                 });
             });
-            set_tab_status(worker, tab_id, "Preparing image", None);
+            set_tab_status(worker, tab_id, "Preparing attachment", None);
         }
         Action::CaptureScreen { tab_id } => {
             let tab_id = tab_id.unwrap_or_else(|| worker.active_tab_id());
@@ -912,9 +968,27 @@ fn handle_action(
             attachment_id,
         } => {
             let tab_id = tab_id.unwrap_or_else(|| worker.active_tab_id());
-            if let Some(runtime) = worker.runtimes.get_mut(&tab_id) {
+            let pending_is_empty = if let Some(runtime) = worker.runtimes.get_mut(&tab_id) {
                 runtime.pending.retain(|item| item.view.id != attachment_id);
-                sync_pending_views(worker, tab_id);
+                runtime.pending.is_empty()
+            } else {
+                false
+            };
+            sync_pending_views(worker, tab_id);
+            if pending_is_empty {
+                let next_status = worker
+                    .tab(tab_id)
+                    .map(|tab| {
+                        if tab.connection == ConnectionState::Live
+                            && tab.settings.backend != RealtimeBackend::CodexText
+                        {
+                            "Listening"
+                        } else {
+                            "Ready"
+                        }
+                    })
+                    .unwrap_or("Ready");
+                set_tab_status(worker, tab_id, next_status, None);
             }
         }
         Action::AttachmentReady {
@@ -1207,6 +1281,7 @@ fn handle_realtime_event(
                 .and_then(|tab| tab.messages.len().checked_sub(1));
             if let Some(runtime) = worker.runtimes.get_mut(&tab_id) {
                 runtime.active_voice_message = voice_message_index;
+                runtime.voice_audio = runtime.microphone_preroll.clone();
                 if settings.is_some_and(|settings| settings.send_screenshot) {
                     let upload_id = runtime.allocate_upload_id();
                     let sender = action_tx.clone();
@@ -1224,13 +1299,20 @@ fn handle_realtime_event(
             }
         }
         Event::SpeechStopped => {
-            if let Some(runtime) = worker.runtimes.get(&tab_id)
-                && let Some(index) = runtime.active_voice_message
-                && let Some(tab) = worker.tab_mut(tab_id)
-                && let Some(message) = tab.messages.get_mut(index)
-            {
-                message.finish();
-                tab.status = "Thinking".to_owned();
+            let captured = worker.runtimes.get_mut(&tab_id).and_then(|runtime| {
+                let index = runtime.active_voice_message.take()?;
+                Some((index, std::mem::take(&mut runtime.voice_audio)))
+            });
+            if let Some((index, audio)) = captured {
+                if audio.len() >= 2_400 {
+                    attach_recorded_audio(worker, tab_id, index, "Voice message.wav", audio);
+                }
+                if let Some(tab) = worker.tab_mut(tab_id)
+                    && let Some(message) = tab.messages.get_mut(index)
+                {
+                    message.finish();
+                    tab.status = "Thinking".to_owned();
+                }
             }
         }
         Event::InputCommitted { item_id } => {
@@ -1292,6 +1374,7 @@ fn handle_realtime_event(
             };
             if let Some(runtime) = worker.runtimes.get_mut(&tab_id) {
                 runtime.active_assistant = assistant_index;
+                runtime.assistant_audio.clear();
             }
         }
         Event::AssistantTranscriptDelta { response_id, delta } => {
@@ -1304,15 +1387,23 @@ fn handle_realtime_event(
             }
         }
         Event::AssistantAudio { samples, .. } => {
+            if let Some(runtime) = worker.runtimes.get_mut(&tab_id) {
+                runtime.assistant_audio.extend_from_slice(&samples);
+            }
             if worker.active_tab_id() == tab_id {
                 let _ = push.send(PushEvent::Audio(samples));
             }
         }
         Event::AssistantDone { response_id } => {
-            let index = worker
-                .runtimes
-                .get(&tab_id)
-                .and_then(|runtime| runtime.active_assistant)
+            let runtime_result = worker.runtimes.get_mut(&tab_id).map(|runtime| {
+                (
+                    runtime.active_assistant.take(),
+                    std::mem::take(&mut runtime.assistant_audio),
+                )
+            });
+            let index = runtime_result
+                .as_ref()
+                .and_then(|(index, _)| *index)
                 .or_else(|| {
                     worker.tab(tab_id).and_then(|tab| {
                         tab.messages.iter().rposition(|message| {
@@ -1321,19 +1412,22 @@ fn handle_realtime_event(
                         })
                     })
                 });
-            if let Some(index) = index
-                && let Some(tab) = worker.tab_mut(tab_id)
-                && let Some(message) = tab.messages.get_mut(index)
-            {
-                message.finish();
-                tab.status = if tab.settings.backend == RealtimeBackend::CodexText {
-                    "Ready".to_owned()
-                } else {
-                    "Listening".to_owned()
-                };
-            }
-            if let Some(runtime) = worker.runtimes.get_mut(&tab_id) {
-                runtime.active_assistant = None;
+            if let Some(index) = index {
+                if let Some((_, audio)) = runtime_result
+                    && audio.len() >= 2_400
+                {
+                    attach_recorded_audio(worker, tab_id, index, "Assistant reply.wav", audio);
+                }
+                if let Some(tab) = worker.tab_mut(tab_id)
+                    && let Some(message) = tab.messages.get_mut(index)
+                {
+                    message.finish();
+                    tab.status = if tab.settings.backend == RealtimeBackend::CodexText {
+                        "Ready".to_owned()
+                    } else {
+                        "Listening".to_owned()
+                    };
+                }
             }
         }
         Event::AssistantUsage {
@@ -1566,7 +1660,7 @@ fn attachment_view(
             id,
             name: name.clone(),
             kind: "audio".to_owned(),
-            data_url: None,
+            data_url: Some(wav_data_url(pcm24k)),
             width: None,
             height: None,
             byte_size: pcm24k.len() * 2,
@@ -1576,6 +1670,53 @@ fn attachment_view(
             upload_id,
         },
     }
+}
+
+fn attach_recorded_audio(
+    worker: &mut WorkerState,
+    tab_id: u64,
+    message_index: usize,
+    name: &str,
+    pcm24k: Vec<i16>,
+) {
+    let id = worker.take_attachment_id();
+    let attachment = Attachment::Audio {
+        name: name.to_owned(),
+        seconds: pcm24k.len() as f32 / 24_000.0,
+        pcm24k,
+    };
+    let view = attachment_view(id, &attachment, false, "recorded", None);
+    if let Some(tab) = worker.tab_mut(tab_id)
+        && let Some(message) = tab.messages.get_mut(message_index)
+    {
+        message.attachments.push(view);
+        message.refresh_token_estimate();
+    }
+}
+
+fn wav_data_url(samples: &[i16]) -> String {
+    let data_bytes = samples.len().saturating_mul(2);
+    let riff_size = 36_u32.saturating_add(data_bytes.min(u32::MAX as usize) as u32);
+    let mut bytes = Vec::with_capacity(44 + data_bytes);
+    bytes.extend_from_slice(b"RIFF");
+    bytes.extend_from_slice(&riff_size.to_le_bytes());
+    bytes.extend_from_slice(b"WAVEfmt ");
+    bytes.extend_from_slice(&16_u32.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&1_u16.to_le_bytes());
+    bytes.extend_from_slice(&24_000_u32.to_le_bytes());
+    bytes.extend_from_slice(&(24_000_u32 * 2).to_le_bytes());
+    bytes.extend_from_slice(&2_u16.to_le_bytes());
+    bytes.extend_from_slice(&16_u16.to_le_bytes());
+    bytes.extend_from_slice(b"data");
+    bytes.extend_from_slice(&(data_bytes.min(u32::MAX as usize) as u32).to_le_bytes());
+    for sample in samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    format!(
+        "data:audio/wav;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
 }
 
 fn estimated_text_tokens(text: &str) -> u64 {
@@ -1621,6 +1762,7 @@ fn load_model_catalog(api_key: Option<&str>) -> anyhow::Result<ModelCatalog> {
 
     match codex_account::load() {
         Ok(info) => {
+            catalog.account_usage = Some(account_usage_view(&info));
             let mut text = Vec::new();
             let mut seen = HashSet::new();
             for model in info.models {
@@ -1635,11 +1777,11 @@ fn load_model_catalog(api_key: Option<&str>) -> anyhow::Result<ModelCatalog> {
             }
             merge_models(&mut text, fallback_text_models("official"));
             catalog.text_models = text;
-            if !info.realtime_voices.v1.is_empty() {
-                catalog.realtime_voices = info.realtime_voices.v1;
-            }
             if !info.realtime_voices.v2.is_empty() {
-                catalog.gpt_live_voices = info.realtime_voices.v2;
+                catalog.realtime_voices = info.realtime_voices.v2;
+            }
+            if !info.realtime_voices.v1.is_empty() {
+                catalog.gpt_live_voices = info.realtime_voices.v1;
             }
             warnings.extend(info.warnings);
         }
@@ -1686,6 +1828,40 @@ fn load_model_catalog(api_key: Option<&str>) -> anyhow::Result<ModelCatalog> {
 
     catalog.warnings = warnings;
     Ok(catalog)
+}
+
+fn account_usage_view(info: &codex_account::CodexAccountInfo) -> AccountUsageView {
+    AccountUsageView {
+        rate_limits: info
+            .rate_limits
+            .iter()
+            .map(|limit| RateLimitView {
+                name: limit.name.clone(),
+                plan: limit.plan.clone(),
+                primary: limit.primary.as_ref().map(rate_limit_window_view),
+                secondary: limit.secondary.as_ref().map(rate_limit_window_view),
+                credit_balance: limit.credit_balance.clone(),
+                unlimited_credits: limit.unlimited_credits,
+                reached_reason: limit.reached_reason.clone(),
+            })
+            .collect(),
+        token_usage: TokenUsageView {
+            lifetime_tokens: info.token_usage.lifetime_tokens,
+            peak_daily_tokens: info.token_usage.peak_daily_tokens,
+            latest_day: info.token_usage.latest_day.clone(),
+            latest_day_tokens: info.token_usage.latest_day_tokens,
+            recent_reported_tokens: info.token_usage.recent_reported_tokens,
+        },
+        reset_credits: info.reset_credits,
+    }
+}
+
+fn rate_limit_window_view(window: &codex_account::RateLimitWindow) -> RateLimitWindowView {
+    RateLimitWindowView {
+        used_percent: window.used_percent,
+        window_duration_minutes: window.window_duration_minutes,
+        resets_at: window.resets_at,
+    }
 }
 
 fn list_platform_models(api_key: &str) -> anyhow::Result<Vec<String>> {
@@ -2024,7 +2200,7 @@ async fn api_upload(
 ) -> impl IntoResponse {
     send_action(
         &backend,
-        Action::AddImage {
+        Action::AddAttachment {
             tab_id: request.tab_id,
             name: request.name,
             data_url: request.data_url,
@@ -2225,6 +2401,43 @@ mod tests {
         assert!(is_text_model("o4-mini"));
         assert!(!is_text_model("gpt-realtime-2.1"));
         assert!(!is_text_model("gpt-image-2"));
+    }
+
+    #[test]
+    fn wav_data_url_has_a_valid_pcm_header() {
+        let data_url = wav_data_url(&[1_i16, -2_i16, 3_i16]);
+        let encoded = data_url
+            .strip_prefix("data:audio/wav;base64,")
+            .expect("WAV data URL");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        assert_eq!(&bytes[0..4], b"RIFF");
+        assert_eq!(&bytes[8..12], b"WAVE");
+        assert_eq!(
+            u32::from_le_bytes(bytes[24..28].try_into().unwrap()),
+            24_000
+        );
+        assert_eq!(u16::from_le_bytes(bytes[34..36].try_into().unwrap()), 16);
+        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 6);
+        assert_eq!(bytes.len(), 50);
+    }
+
+    #[test]
+    fn recorded_audio_attachment_is_replayable() {
+        let attachment = Attachment::Audio {
+            name: "voice.wav".to_owned(),
+            pcm24k: vec![100_i16; 2_400],
+            seconds: 0.1,
+        };
+        let view = attachment_view(1, &attachment, false, "recorded", None);
+        assert_eq!(view.kind, "audio");
+        assert_eq!(view.seconds, Some(0.1));
+        assert!(
+            view.data_url
+                .as_deref()
+                .is_some_and(|url| url.starts_with("data:audio/wav;base64,"))
+        );
     }
 
     #[test]

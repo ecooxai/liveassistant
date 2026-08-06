@@ -408,3 +408,27 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 }
 .composer[data-dragging="true"] { border-color: rgba(46,126,231,.68); box-shadow: 0 24px 65px rgba(55,87,122,.18), 0 0 0 5px rgba(49,129,235,.1), inset 0 1px white; }
 .attachment-card img { cursor: zoom-in; }
+.attachment-audio { display: grid; gap: 7px; padding: 12px; background: linear-gradient(145deg, rgba(237,247,255,.95), rgba(244,240,255,.9)); }
+.attachment-audio audio { width: 100%; height: 34px; }
+.attachment-audio a { justify-self: end; color: #4776aa; font-size: 8px; font-weight: 700; text-decoration: none; }
+.attachment-audio a:hover { text-decoration: underline; }
+.pending-audio-icon { width: 32px; height: 32px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 8px; color: #4d82c2; background: linear-gradient(145deg, #e8f5ff, #eeeaff); font-size: 15px; font-style: normal; }
+.account-usage { display: grid; gap: 11px; padding: 14px; border: 1px solid var(--line); border-radius: 16px; background: rgba(243,249,254,.68); }
+.usage-heading { display: flex; align-items: end; justify-content: space-between; gap: 12px; }
+.usage-heading > div { display: grid; gap: 2px; }
+.usage-heading span, .usage-heading small { color: #8a9aaa; font-size: 8px; }
+.usage-heading strong { color: #38516a; font-size: 11px; }
+.usage-limits { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px; }
+.usage-limit-card { display: grid; gap: 9px; padding: 11px; border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.72); }
+.usage-limit-card > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.usage-limit-card strong { color: #405972; font-size: 9px; }
+.usage-limit-card > div:first-child span { color: #8999a9; font-size: 7px; }
+.usage-window { display: grid; gap: 4px; }
+.usage-window span, .usage-window small, .usage-limit-card p { margin: 0; color: #75889a; font-size: 7px; line-height: 1.4; }
+.usage-window i { position: relative; height: 4px; overflow: hidden; border-radius: 999px; background: #e5edf4; }
+.usage-window i::after { content: ""; position: absolute; inset: 0 auto 0 0; width: var(--used); border-radius: inherit; background: linear-gradient(90deg, #46b6e9, #6b7af0); }
+.usage-tokens { display: flex; flex-wrap: wrap; gap: 7px; }
+.usage-tokens > div { min-width: 92px; padding: 8px 9px; display: grid; gap: 2px; border-radius: 10px; background: rgba(255,255,255,.68); border: 1px solid rgba(100,128,156,.1); }
+.usage-tokens strong { color: #3e5d78; font-size: 10px; }
+.usage-tokens span { color: #8a9aaa; font-size: 7px; }
+@media (max-width: 720px) { .usage-limits { grid-template-columns: 1fr; } }

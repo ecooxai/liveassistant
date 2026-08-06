@@ -12,10 +12,12 @@ The browser is an interaction and rendering surface. Rust owns credentials, inde
 - Radio-card model and transport selection in Settings and in the Add model tab dialog.
 - Dynamic voice persona lists for GPT Live and OpenAI Realtime.
 - Typed messages and browser microphone input with assistant audio playback.
-- Image upload, manual screen capture, and removable pending attachment previews.
+- Image and audio upload, manual screen capture, and removable pending attachment previews.
 - Optional automatic current-screen context for typed and voice turns.
 - Screenshot upload lifecycle states: preparing, uploading, uploaded, and failed.
 - Message start and end clocks, elapsed time, token totals, estimated-token marking, and completed assistant tokens per second.
+- Replayable and downloadable WAV cards for uploaded audio and recorded user/assistant PCM when the transport exposes it.
+- Codex account rate limits, reset times, credit state, and token-usage snapshots in Settings.
 - Generated-image previews and local computer-tool progress/results.
 - In-memory API keys; credentials are never returned in browser state snapshots or persisted by the web UI.
 

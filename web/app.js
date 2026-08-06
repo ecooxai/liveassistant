@@ -13,6 +13,7 @@
     voiceField: $("#voice-field"), voice: $("#voice-select"), modelList: $("#model-radio-list"), catalogStatus: $("#catalog-status"),
     thinking: $("#thinking-select"), screenshot: $("#screenshot-toggle"), imageModel: $("#image-model-select"),
     imageResolution: $("#image-resolution-select"), systemPrompt: $("#system-prompt-input"), catalogWarnings: $("#catalog-warnings"),
+    accountUsage: $("#account-usage"), usageLimits: $("#usage-limits"), usageTokens: $("#usage-tokens"),
     modelModal: $("#model-modal"), closeModelPicker: $("#close-model-picker"), modelPickerForm: $("#model-picker-form"),
     newBackendList: $("#new-backend-radio-list"), newModelList: $("#new-model-radio-list"), newVoiceField: $("#new-voice-field"), newVoice: $("#new-voice-select"),
     composerForm: $("#composer-form"), composerInput: $("#composer-input"), sendButton: $("#send-button"),
@@ -198,6 +199,19 @@
       image.title = "Open exact image payload";
       image.addEventListener("click", () => window.open(attachment.data_url, "_blank", "noopener"));
       card.appendChild(image);
+    } else if (attachment.kind === "audio" && attachment.data_url) {
+      const audioWrap = document.createElement("div");
+      audioWrap.className = "attachment-audio";
+      const audio = document.createElement("audio");
+      audio.controls = true;
+      audio.preload = "metadata";
+      audio.src = attachment.data_url;
+      const download = document.createElement("a");
+      download.href = attachment.data_url;
+      download.download = attachment.name || "audio.wav";
+      download.textContent = "Save WAV";
+      audioWrap.append(audio, download);
+      card.appendChild(audioWrap);
     }
     const caption = document.createElement("figcaption");
     const size = attachment.byte_size ? ` · ${formatBytes(attachment.byte_size)}` : "";
@@ -220,7 +234,11 @@
     elements.pending.hidden = pending.length === 0;
     elements.pending.replaceChildren(...pending.map((attachment) => {
       const item = document.createElement("div"); item.className = "pending-item";
-      if (attachment.data_url) { const image = document.createElement("img"); image.src = attachment.data_url; image.alt = ""; item.appendChild(image); }
+      if (attachment.kind === "image" && attachment.data_url) {
+        const image = document.createElement("img"); image.src = attachment.data_url; image.alt = ""; item.appendChild(image);
+      } else if (attachment.kind === "audio") {
+        const icon = document.createElement("i"); icon.className = "pending-audio-icon"; icon.textContent = "♫"; item.appendChild(icon);
+      }
       const label = document.createElement("span"); label.textContent = attachment.included_screen ? "Current screen" : attachment.name;
       const remove = document.createElement("button"); remove.type = "button"; remove.textContent = "×"; remove.ariaLabel = "Remove attachment";
       remove.addEventListener("click", () => request("/api/attachments/remove", { tab_id: tab.id, attachment_id: attachment.id }).catch(showLocalError));
@@ -308,6 +326,52 @@
     const warnings = appState.catalog.warnings || [];
     elements.catalogWarnings.hidden = warnings.length === 0;
     elements.catalogWarnings.textContent = warnings.join("\n");
+    renderAccountUsage();
+  }
+
+  function renderAccountUsage() {
+    const usage = appState?.catalog?.account_usage;
+    elements.accountUsage.hidden = !usage;
+    if (!usage) {
+      elements.usageLimits.replaceChildren();
+      elements.usageTokens.replaceChildren();
+      return;
+    }
+    elements.usageLimits.replaceChildren(...(usage.rate_limits || []).map((limit) => {
+      const card = document.createElement("article"); card.className = "usage-limit-card";
+      const title = document.createElement("div");
+      const label = document.createElement("strong"); label.textContent = limit.name;
+      const plan = document.createElement("span"); plan.textContent = limit.plan || "";
+      title.append(label, plan); card.appendChild(title);
+      for (const [windowName, window] of [["Primary", limit.primary], ["Secondary", limit.secondary]]) {
+        if (!window) continue;
+        const row = document.createElement("div"); row.className = "usage-window";
+        const copy = document.createElement("span");
+        copy.textContent = `${windowName} · ${Math.max(0, 100 - window.used_percent)}% left${window.window_duration_minutes ? ` · ${window.window_duration_minutes}m` : ""}`;
+        const meter = document.createElement("i"); meter.style.setProperty("--used", `${Math.min(100, Math.max(0, window.used_percent))}%`);
+        row.append(copy, meter);
+        if (window.resets_at) { const reset = document.createElement("small"); reset.textContent = `Resets ${new Date(window.resets_at * 1000).toLocaleString()}`; row.append(reset); }
+        card.appendChild(row);
+      }
+      const credits = document.createElement("p");
+      credits.textContent = limit.unlimited_credits ? "Credits · unlimited" : limit.credit_balance ? `Credits · ${limit.credit_balance}` : limit.reached_reason ? limit.reached_reason : "";
+      if (credits.textContent) card.appendChild(credits);
+      return card;
+    }));
+    const tokenUsage = usage.token_usage || {};
+    const stats = [
+      ["Lifetime", tokenUsage.lifetime_tokens],
+      [tokenUsage.latest_day || "Latest day", tokenUsage.latest_day_tokens],
+      ["Recent reported", tokenUsage.recent_reported_tokens],
+      ["Peak day", tokenUsage.peak_daily_tokens],
+      ["Reset credits", usage.reset_credits],
+    ].filter(([, value]) => Number.isFinite(value));
+    elements.usageTokens.replaceChildren(...stats.map(([label, value]) => {
+      const item = document.createElement("div");
+      const strong = document.createElement("strong"); strong.textContent = Number(value).toLocaleString();
+      const span = document.createElement("span"); span.textContent = label;
+      item.append(strong, span); return item;
+    }));
   }
 
   function renderSettingsChoices(selectedModel, selectedVoice) {
@@ -379,7 +443,7 @@
   async function uploadFiles(files) {
     const tab = activeTab(); if (!tab) return;
     for (const file of files) {
-      if (!file.type.startsWith("image/")) continue;
+      if (!file.type.startsWith("image/") && !file.type.startsWith("audio/")) continue;
       const data_url = await readDataUrl(file);
       await request("/api/upload", { tab_id: tab.id, name: file.name, data_url });
     }
@@ -470,11 +534,11 @@
       if (!dropTarget.contains(event.relatedTarget)) elements.composerForm.dataset.dragging = "false";
     });
     dropTarget.addEventListener("drop", (event) => {
-      const images = [...(event.dataTransfer?.files || [])].filter((file) => file.type.startsWith("image/"));
+      const attachments = [...(event.dataTransfer?.files || [])].filter((file) => file.type.startsWith("image/") || file.type.startsWith("audio/"));
       elements.composerForm.dataset.dragging = "false";
-      if (!images.length) return;
+      if (!attachments.length) return;
       event.preventDefault();
-      uploadFiles(images).catch(showLocalError);
+      uploadFiles(attachments).catch(showLocalError);
     });
   }
   elements.captureButton.addEventListener("click", () => request("/api/capture-screen", { tab_id: activeTab()?.id }).catch(showLocalError));

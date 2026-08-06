@@ -74,7 +74,7 @@ impl Default for PublicSettings {
             voice: "ember".to_owned(),
             thinking_level: "low".to_owned(),
             system_prompt: realtime::default_system_prompt(primary_screen_info()),
-            send_screenshot: true,
+            send_screenshot: false,
             image_model: "gpt-image-2".to_owned(),
             image_resolution: "1024x1024".to_owned(),
         }
@@ -160,7 +160,9 @@ enum PushEvent {
 }
 
 enum Action {
-    Connect { api_key: Option<String> },
+    Connect {
+        api_key: Option<String>,
+    },
     Disconnect,
     SendText(String),
     Audio(Vec<i16>),
@@ -305,10 +307,7 @@ fn worker_loop(
                     if text.is_empty() {
                         continue;
                     }
-                    let is_live = state
-                        .read()
-                        .expect("app state read lock")
-                        .connection
+                    let is_live = state.read().expect("app state read lock").connection
                         == ConnectionState::Live;
                     if !is_live {
                         set_error(&state, &push, "Connect a model before sending a message");
@@ -400,10 +399,9 @@ fn worker_loop(
                         }
                         app.status = "Thinking".to_owned();
                     });
-                    let _ = realtime.commands.send(Command::ToolOutputs(vec![ToolOutput {
-                        call_id,
-                        output,
-                    }]));
+                    let _ = realtime
+                        .commands
+                        .send(Command::ToolOutputs(vec![ToolOutput { call_id, output }]));
                 }
                 Action::Shutdown => {
                     let _ = realtime.commands.send(Command::Shutdown);
@@ -643,7 +641,10 @@ fn take_message_id(next_message_id: &mut u64) -> u64 {
     id
 }
 
-fn resolve_credentials(auth_mode: AuthMode, api_key: Option<String>) -> anyhow::Result<CodexCredentials> {
+fn resolve_credentials(
+    auth_mode: AuthMode,
+    api_key: Option<String>,
+) -> anyhow::Result<CodexCredentials> {
     if auth_mode == AuthMode::Codex {
         return auth::codex_credentials();
     }
@@ -765,7 +766,11 @@ async fn css() -> Response {
 }
 
 async fn js() -> Response {
-    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], APP_JS).into_response()
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        APP_JS,
+    )
+        .into_response()
 }
 
 async fn health() -> Json<Value> {
@@ -780,7 +785,12 @@ async fn api_connect(
     State(backend): State<Backend>,
     Json(request): Json<ConnectRequest>,
 ) -> impl IntoResponse {
-    send_action(&backend, Action::Connect { api_key: request.api_key })
+    send_action(
+        &backend,
+        Action::Connect {
+            api_key: request.api_key,
+        },
+    )
 }
 
 async fn api_disconnect(State(backend): State<Backend>) -> impl IntoResponse {
@@ -825,7 +835,10 @@ async fn ws_handler(ws: WebSocketUpgrade, State(backend): State<Backend>) -> Res
 
 async fn ws_session(socket: WebSocket, backend: Backend) {
     let (mut sender, mut receiver) = socket.split();
-    if send_state_ws(&mut sender, &backend.snapshot()).await.is_err() {
+    if send_state_ws(&mut sender, &backend.snapshot())
+        .await
+        .is_err()
+    {
         return;
     }
     let mut push = backend.push.subscribe();

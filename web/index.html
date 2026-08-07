@@ -20,6 +20,15 @@
         <div><h1>Live Assistant</h1><p>Local Rust workspace</p></div>
       </div>
 
+      <div class="topbar-tabs" aria-label="Recent model sessions">
+        <div class="tabs-scroll" id="tabs-list"></div>
+        <button class="tabs-menu-button" id="tabs-menu-button" type="button" aria-label="Show opened tabs" title="Opened tabs" aria-expanded="false">•••</button>
+        <div class="tabs-popover" id="tabs-popover" hidden>
+          <div class="tabs-menu-list" id="tabs-menu-list"></div>
+          <button class="tabs-menu-add" id="add-tab-button" type="button">+ New tab</button>
+        </div>
+      </div>
+
       <div class="topbar-actions">
         <div class="status-chip" id="status-chip" data-state="offline">
           <span class="status-dot"></span><span id="status-text">Ready</span>
@@ -35,11 +44,6 @@
         </button>
       </div>
     </header>
-
-    <nav class="tabs-bar" aria-label="Model sessions">
-      <div class="tabs-scroll" id="tabs-list"></div>
-      <button class="add-tab-button" id="add-tab-button" type="button" title="Add model tab" aria-label="Add model tab">+</button>
-    </nav>
 
     <section class="workspace" id="workspace">
       <div class="conversation" id="conversation" aria-live="polite">
@@ -74,45 +78,42 @@
           <button class="sidebar-resize-handle" id="sidebar-resize-handle" type="button" aria-label="Resize note sidebar" title="Drag to resize"></button>
 
           <div class="dock-content">
-            <div class="chat-workspace" id="chat-workspace">
+            <div class="editor-shell" id="editor-shell">
               <div class="error-banner" id="error-banner" hidden>
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8v5m0 3.5v.1M10.2 3.7 2.8 17a2 2 0 0 0 1.8 3h14.8a2 2 0 0 0 1.8-3L13.8 3.7a2 2 0 0 0-3.6 0Z"/></svg>
                 <span id="error-text"></span><button type="button" id="dismiss-error" aria-label="Dismiss error">×</button>
               </div>
 
-              <form class="composer" id="composer-form">
-                <div class="pending-attachments" id="pending-attachments" hidden></div>
-                <textarea id="composer-input" rows="1" placeholder="Message Live Assistant" aria-label="Message Live Assistant"></textarea>
-                <div class="composer-footer">
-                  <div class="composer-tools">
-                    <input id="file-input" type="file" accept="image/*,audio/*" multiple hidden>
-                    <button class="tool-button" id="upload-button" type="button" aria-label="Upload image or audio" title="Upload image or audio">
-                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7 9m5-5 5 5M5 15v4h14v-4"/></svg>
-                    </button>
-                    <button class="tool-button" id="capture-button" type="button" aria-label="Capture screen" title="Capture screen">
-                      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="13" rx="2"/><path d="M8 21h8M12 18v3M8 10h8"/></svg>
-                    </button>
-                    <button class="tool-button mic-button" id="mic-button" type="button" aria-label="Stop microphone" title="Stop microphone">
-                      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a4 4 0 0 0 4-4V6a4 4 0 1 0-8 0v5a4 4 0 0 0 4 4Z"/><path d="M5 10v1a7 7 0 0 0 14 0v-1M12 18v4m-4 0h8"/></svg>
-                      <span class="mic-level" id="mic-level"></span>
-                    </button>
-                    <button class="model-pill" id="model-pill" type="button">GPT Live</button>
-                  </div>
-                  <button class="send-button" id="send-button" type="submit" aria-label="Send message" disabled>
-                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 7-7 7 7M12 5v14"/></svg>
-                  </button>
-                </div>
-              </form>
-              <p class="footer-note">Local UI · credentials, models, screenshots, tools, files, and state remain in Rust</p>
-            </div>
+              <section class="editor-workspace chat-workspace" id="chat-workspace">
+                <textarea class="workspace-editor" id="composer-input" spellcheck="true" placeholder="Message Live Assistant…" aria-label="Message Live Assistant"></textarea>
+              </section>
 
-            <section class="note-editor-workspace" id="note-editor-workspace" hidden>
-              <header class="note-editor-header">
-                <div><span>Workspace note</span><strong id="active-note-name">No note selected</strong></div>
-                <small id="note-save-status">Select or open a file</small>
-              </header>
-              <textarea id="note-editor" spellcheck="true" placeholder="Write Markdown…" disabled></textarea>
-            </section>
+              <section class="editor-workspace note-editor-workspace" id="note-editor-workspace" hidden>
+                <textarea class="workspace-editor" id="note-editor" spellcheck="true" placeholder="Write Markdown…" disabled></textarea>
+                <small class="editor-save-status" id="note-save-status">Select or open a file</small>
+              </section>
+
+              <form class="editor-toolbar" id="composer-form">
+                <div class="pending-attachments" id="pending-attachments" hidden></div>
+                <div class="composer-tools">
+                  <input id="file-input" type="file" accept="image/*,audio/*" multiple hidden>
+                  <button class="tool-button" id="upload-button" type="button" aria-label="Upload image or audio" title="Upload image or audio">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7 9m5-5 5 5M5 15v4h14v-4"/></svg>
+                  </button>
+                  <button class="tool-button" id="capture-button" type="button" aria-label="Capture screen" title="Capture screen">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="13" rx="2"/><path d="M8 21h8M12 18v3M8 10h8"/></svg>
+                  </button>
+                  <button class="tool-button mic-button" id="mic-button" type="button" aria-label="Stop microphone" title="Stop microphone">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a4 4 0 0 0 4-4V6a4 4 0 1 0-8 0v5a4 4 0 0 0 4 4Z"/><path d="M5 10v1a7 7 0 0 0 14 0v-1M12 18v4m-4 0h8"/></svg>
+                    <span class="mic-level" id="mic-level"></span>
+                  </button>
+                  <button class="model-pill" id="model-pill" type="button">GPT Live</button>
+                </div>
+                <button class="send-button" id="send-button" type="submit" aria-label="Send message" disabled>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 7-7 7 7M12 5v14"/></svg>
+                </button>
+              </form>
+            </div>
           </div>
         </div>
       </section>

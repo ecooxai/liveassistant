@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    hash::{DefaultHasher, Hash, Hasher},
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, Command as ProcessCommand, Stdio},
     thread,
@@ -619,6 +620,7 @@ async fn run_openai_connection(
     // response.create was requested; later screenshots belong to later turns.
     let mut deferred_response_context_items: Option<HashSet<String>> = None;
     let mut input_transcripts = HashMap::<String, String>::new();
+    let mut audio_delta_deduper = OpenAiAudioDeltaDeduper::default();
     let mut context_upload_tick = tokio::time::interval(Duration::from_millis(50));
     context_upload_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -733,12 +735,13 @@ async fn run_openai_connection(
             message = reader.next() => {
                 match message {
                     Some(Ok(Message::Text(text))) => {
-                        match handle_server_event(
+                        match handle_server_event_with_audio_dedupe(
                             text.as_ref(),
                             events,
                             &mut handled_call_ids,
                             &mut pending_context_uploads,
                             &mut input_transcripts,
+                            &mut audio_delta_deduper,
                         )? {
                             ServerSignal::ResponseStarted => response_active = true,
                             ServerSignal::ResponseDone => {
@@ -1201,62 +1204,57 @@ fn codex_live_initialize_capabilities() -> Value {
     })
 }
 
-const NATIVE_REMOTE_PRE_ROLL_SAMPLES: usize = AUDIO_SAMPLE_RATE * 150 / 1_000;
-const NATIVE_REMOTE_TAIL_SAMPLES: usize = AUDIO_SAMPLE_RATE * 600 / 1_000;
-const NATIVE_REMOTE_VOICE_RMS: f64 = 12.0;
+const NATIVE_REMOTE_PRE_ROLL_SAMPLES: usize = AUDIO_SAMPLE_RATE * 300 / 1_000;
+const NATIVE_REMOTE_START_RMS: f64 = 24.0;
 
+/// NetEQ already performs jitter buffering, packet-loss concealment, and clock
+/// correction. This gate is only a start detector so idle comfort-noise frames
+/// do not create assistant messages. Once a response starts, every decoded PCM
+/// frame is forwarded unchanged until the response boundary arrives from the
+/// realtime sideband.
 #[derive(Default)]
 struct NativeRemoteAudioGate {
     pre_roll: VecDeque<Vec<i16>>,
     pre_roll_samples: usize,
-    active: bool,
-    quiet_samples: usize,
 }
 
 impl NativeRemoteAudioGate {
-    fn push(&mut self, samples: Vec<i16>) -> Vec<Vec<i16>> {
+    fn push(&mut self, samples: Vec<i16>, response_active: bool) -> Vec<Vec<i16>> {
         if samples.is_empty() {
             return Vec::new();
         }
-        let voiced = pcm_rms(&samples) >= NATIVE_REMOTE_VOICE_RMS;
-        if !self.active {
-            self.pre_roll_samples = self.pre_roll_samples.saturating_add(samples.len());
-            self.pre_roll.push_back(samples);
-            while self.pre_roll_samples > NATIVE_REMOTE_PRE_ROLL_SAMPLES {
-                let overflow = self.pre_roll_samples - NATIVE_REMOTE_PRE_ROLL_SAMPLES;
-                let Some(front) = self.pre_roll.front_mut() else {
-                    self.pre_roll_samples = 0;
-                    break;
-                };
-                if front.len() <= overflow {
-                    self.pre_roll_samples = self.pre_roll_samples.saturating_sub(front.len());
-                    self.pre_roll.pop_front();
-                } else {
-                    front.drain(..overflow);
-                    self.pre_roll_samples = self.pre_roll_samples.saturating_sub(overflow);
-                }
-            }
-            if !voiced {
-                return Vec::new();
-            }
-            self.active = true;
-            self.quiet_samples = 0;
-            self.pre_roll_samples = 0;
-            return self.pre_roll.drain(..).collect();
+        if response_active {
+            return vec![samples];
         }
 
-        if voiced {
-            self.quiet_samples = 0;
-        } else {
-            self.quiet_samples = self.quiet_samples.saturating_add(samples.len());
+        let voiced = pcm_rms(&samples) >= NATIVE_REMOTE_START_RMS;
+        self.pre_roll_samples = self.pre_roll_samples.saturating_add(samples.len());
+        self.pre_roll.push_back(samples);
+        while self.pre_roll_samples > NATIVE_REMOTE_PRE_ROLL_SAMPLES {
+            let overflow = self.pre_roll_samples - NATIVE_REMOTE_PRE_ROLL_SAMPLES;
+            let Some(front) = self.pre_roll.front_mut() else {
+                self.pre_roll_samples = 0;
+                break;
+            };
+            if front.len() <= overflow {
+                self.pre_roll_samples = self.pre_roll_samples.saturating_sub(front.len());
+                self.pre_roll.pop_front();
+            } else {
+                front.drain(..overflow);
+                self.pre_roll_samples = self.pre_roll_samples.saturating_sub(overflow);
+            }
         }
-        if self.quiet_samples >= NATIVE_REMOTE_TAIL_SAMPLES {
-            self.active = false;
-            self.quiet_samples = 0;
-            self.pre_roll.clear();
-            self.pre_roll_samples = 0;
+        if !voiced {
+            return Vec::new();
         }
-        vec![samples]
+
+        self.pre_roll_samples = 0;
+        self.pre_roll.drain(..).collect()
+    }
+
+    fn reset(&mut self) {
+        self.pre_roll.clear();
+        self.pre_roll_samples = 0;
     }
 }
 
@@ -1311,6 +1309,26 @@ impl CodexLiveState {
             let _ = events.send(Event::SpeechStarted);
         }
         let _ = events.send(Event::InputCommitted { item_id });
+    }
+
+    fn finish_input(
+        &mut self,
+        final_text: Option<&str>,
+        events: &std::sync::mpsc::Sender<Event>,
+    ) -> bool {
+        let Some(item_id) = self.input_item_id.take() else {
+            return false;
+        };
+        let text = final_text
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.input_text.clone());
+        self.input_text.clear();
+        if !text.is_empty() {
+            let _ = events.send(Event::InputTranscript { item_id, text });
+        }
+        let _ = events.send(Event::SpeechStopped);
+        true
     }
 
     fn ensure_response(&mut self, events: &std::sync::mpsc::Sender<Event>) -> String {
@@ -1373,7 +1391,12 @@ fn emit_codex_live_remote_audio(
         return false;
     }
     let response_id = state.ensure_response(events);
-    state.note_assistant_audio_activity();
+    // NetEQ emits a continuous low-level comfort-noise stream. Preserve those
+    // samples inside an active reply for gapless playback/replay, but do not let
+    // near-silence keep the logical response open forever after transcript/done.
+    if pcm_rms(&samples) >= NATIVE_REMOTE_START_RMS {
+        state.note_assistant_audio_activity();
+    }
     events
         .send(Event::AssistantAudio {
             response_id,
@@ -1421,6 +1444,14 @@ impl CodexHandoffState {
         }
         self.fallback.take().map(|fallback| fallback.text)
     }
+}
+
+#[derive(Default)]
+struct ManualGptLiveTurn {
+    turn_id: Option<String>,
+    response_id: String,
+    text: String,
+    speech_requested: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1669,6 +1700,8 @@ async fn run_codex_live_connection(
     let mut latest_ready_context_image_upload_id: Option<u64> = None;
     let mut pending_dynamic_tools: HashMap<String, PendingDynamicTool> = HashMap::new();
     let mut response_watchdog: Option<Instant> = None;
+    let mut manual_typed_turn: Option<ManualGptLiveTurn> = None;
+    let mut suppress_manual_spoken_transcript = false;
     // The WebRTC receive task filters continuous comfort noise and emits only
     // reordered speech packets. Start UI/playback from the first real audio
     // packet instead of waiting for the slower sideband transcript notification.
@@ -1695,12 +1728,21 @@ async fn run_codex_live_connection(
                         attachments,
                         ..
                     }) => {
-                        let has_image = attachments
-                            .iter()
-                            .any(|attachment| matches!(attachment, Attachment::Image { .. }));
-                        if has_image {
+                        let has_text_or_image = !text.trim().is_empty()
+                            || attachments
+                                .iter()
+                                .any(|attachment| matches!(attachment, Attachment::Image { .. }));
+                        if has_text_or_image {
+                            // Typed GPT-Live turns are delegated through Codex, then
+                            // handed to the live speech model as soon as the completed
+                            // assistant item arrives. Keeping the response open here
+                            // also guarantees a visible text reply if speech fails.
+                            if state.active_response_id.is_some() {
+                                state.finish_response(events);
+                            }
+                            let response_id = state.ensure_response(events);
                             let input = codex_turn_input(&text, &attachments);
-                            server
+                            let started = server
                                 .call(
                                     "turn/start",
                                     json!({
@@ -1709,17 +1751,22 @@ async fn run_codex_live_connection(
                                     }),
                                 )
                                 .await?;
-                        } else if !text.trim().is_empty() {
-                            server
-                                .call(
-                                    "thread/realtime/appendText",
-                                    json!({
-                                        "threadId": thread_id,
-                                        "text": text.trim(),
-                                        "role": "user"
-                                    }),
-                                )
-                                .await?;
+                            let turn_id = started
+                                .pointer("/turn/id")
+                                .or_else(|| started.get("id"))
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
+                            handoff_state.clear_turn();
+                            handoff_state.fallback = None;
+                            manual_typed_turn = Some(ManualGptLiveTurn {
+                                turn_id,
+                                response_id,
+                                text: String::new(),
+                                speech_requested: false,
+                            });
+                            suppress_manual_spoken_transcript = false;
+                            response_watchdog =
+                                Some(Instant::now() + Duration::from_millis(12_000));
                         }
                         for attachment in attachments {
                             if let Attachment::Audio { pcm24k, .. } = attachment
@@ -1905,13 +1952,20 @@ async fn run_codex_live_connection(
                 match audio {
                     Some(Ok(samples)) if !samples.is_empty() => {
                         let chunks = if let Some(gate) = &mut native_remote_audio {
-                            gate.push(samples)
+                            gate.push(samples, state.active_response_id.is_some())
                         } else {
                             vec![samples]
                         };
                         for samples in chunks {
                             response_watchdog = None;
                             handoff_state.note_spoken_output();
+                            if state.active_response_id.is_none() {
+                                // Some GPT-Live builds omit user transcript/done. The
+                                // first audio of a new reply is still a reliable turn
+                                // boundary. Do not use this while an assistant response
+                                // is already active, which preserves user barge-in audio.
+                                state.finish_input(None, events);
+                            }
                             emit_codex_live_remote_audio(&mut state, events, samples);
                         }
                     }
@@ -1929,6 +1983,148 @@ async fn run_codex_live_connection(
                 };
                 eprintln!("[live-assistant codex] {}", codex_message_summary(&message));
                 latency_trace.observe(&message);
+
+                let method = message
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let assistant_sideband = matches!(
+                    method,
+                    "thread/realtime/transcript/delta" | "thread/realtime/transcript/done"
+                ) && message.pointer("/params/role").and_then(Value::as_str)
+                    == Some("assistant");
+                if suppress_manual_spoken_transcript && assistant_sideband {
+                    response_watchdog = None;
+                    handoff_state.note_spoken_output();
+                    state.ensure_response(events);
+                    if method == "thread/realtime/transcript/done" {
+                        suppress_manual_spoken_transcript = false;
+                        handle_codex_live_message(&message, events, &mut state)?;
+                    }
+                    continue;
+                }
+
+                let mut manual_message_handled = false;
+                let mut manual_speech = None::<String>;
+                let mut manual_error = None::<String>;
+                if let Some(manual) = &mut manual_typed_turn {
+                    match method {
+                        "turn/started" => {
+                            let turn_id = message
+                                .pointer("/params/turn/id")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned);
+                            if manual.turn_id.is_none() {
+                                manual.turn_id = turn_id;
+                            }
+                            manual_message_handled = true;
+                        }
+                        "item/agentMessage/delta" => {
+                            if let Some(delta) = message
+                                .pointer("/params/delta")
+                                .and_then(Value::as_str)
+                                .filter(|delta| !delta.is_empty())
+                            {
+                                manual.text.push_str(delta);
+                                state.assistant_text.push_str(delta);
+                                let _ = events.send(Event::AssistantTranscriptDelta {
+                                    response_id: manual.response_id.clone(),
+                                    delta: delta.to_owned(),
+                                });
+                            }
+                            manual_message_handled = true;
+                        }
+                        "item/completed" => {
+                            let item = message.pointer("/params/item").unwrap_or(&Value::Null);
+                            if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
+                                let final_text = item
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .trim()
+                                    .to_owned();
+                                if !final_text.is_empty() {
+                                    if manual.text.is_empty() {
+                                        let _ = events.send(Event::AssistantTranscriptDelta {
+                                            response_id: manual.response_id.clone(),
+                                            delta: final_text.clone(),
+                                        });
+                                    } else if let Some(remainder) = final_text.strip_prefix(&manual.text)
+                                        && !remainder.is_empty()
+                                    {
+                                        let _ = events.send(Event::AssistantTranscriptDelta {
+                                            response_id: manual.response_id.clone(),
+                                            delta: remainder.to_owned(),
+                                        });
+                                    }
+                                    manual.text = final_text.clone();
+                                    state.assistant_text = final_text.clone();
+                                    if !manual.speech_requested {
+                                        manual.speech_requested = true;
+                                        manual_speech = Some(final_text);
+                                    }
+                                }
+                                manual_message_handled = true;
+                            }
+                        }
+                        "turn/completed" => {
+                            let turn = message.pointer("/params/turn").unwrap_or(&Value::Null);
+                            let status = turn
+                                .get("status")
+                                .and_then(Value::as_str)
+                                .unwrap_or("failed");
+                            if status != "completed" {
+                                manual_error = Some(
+                                    turn.pointer("/error/message")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("The GPT-Live text turn failed")
+                                        .to_owned(),
+                                );
+                            } else if !manual.speech_requested && !manual.text.trim().is_empty() {
+                                manual.speech_requested = true;
+                                manual_speech = Some(manual.text.trim().to_owned());
+                            }
+                            manual_message_handled = true;
+                        }
+                        "error" => {
+                            manual_error = Some(
+                                message.pointer("/params/error/message")
+                                    .or_else(|| message.pointer("/error/message"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("GPT-Live text turn failed")
+                                    .to_owned(),
+                            );
+                            manual_message_handled = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(text) = manual_speech {
+                    latency_trace.log(
+                        "typed_reply.append_speech",
+                        &format!("chars={}", text.chars().count()),
+                    );
+                    server.send_request(
+                        "thread/realtime/appendSpeech",
+                        json!({"threadId": thread_id, "text": text}),
+                    )?;
+                    suppress_manual_spoken_transcript = true;
+                    response_watchdog =
+                        Some(Instant::now() + Duration::from_millis(12_000));
+                }
+                if let Some(detail) = manual_error {
+                    let _ = events.send(Event::Error(detail));
+                    state.finish_response(events);
+                    manual_typed_turn = None;
+                    suppress_manual_spoken_transcript = false;
+                    response_watchdog = None;
+                } else if method == "turn/completed" && manual_message_handled {
+                    manual_typed_turn = None;
+                }
+                if manual_message_handled {
+                    continue;
+                }
+
                 match handle_codex_context_image_response(
                     &message,
                     &mut in_flight_context_images,
@@ -2082,10 +2278,18 @@ async fn run_codex_live_connection(
                     );
                 }
                 if state.finish_response_if_due(now, events) {
+                    if let Some(gate) = &mut native_remote_audio {
+                        gate.reset();
+                    }
                     eprintln!("[live-assistant reply] finalized GPT-Live response after quiet speech tail");
                 }
                 if response_watchdog.is_some_and(|deadline| now >= deadline) {
                     response_watchdog = None;
+                    if suppress_manual_spoken_transcript || manual_typed_turn.is_some() {
+                        suppress_manual_spoken_transcript = false;
+                        manual_typed_turn = None;
+                        state.finish_response(events);
+                    }
                     eprintln!(
                         "[live-assistant reply] no GPT-Live output or delegation after completed user turn"
                     );
@@ -4593,6 +4797,9 @@ fn handle_codex_live_message(
                     text: state.input_text.clone(),
                 });
             } else if role == "assistant" && !delta.is_empty() {
+                if state.active_response_id.is_none() {
+                    state.finish_input(None, events);
+                }
                 let response_id = state.ensure_response(events);
                 state.response_finish_deadline = None;
                 state.assistant_text.push_str(delta);
@@ -4612,19 +4819,8 @@ fn handle_codex_live_message(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if role == "user" {
-                let item_id = state.ensure_input(events);
-                let final_text = if text.is_empty() {
-                    state.input_text.clone()
-                } else {
-                    text.to_owned()
-                };
-                state.input_text.clear();
-                state.input_item_id = None;
-                let _ = events.send(Event::InputTranscript {
-                    item_id,
-                    text: final_text,
-                });
-                let _ = events.send(Event::SpeechStopped);
+                state.ensure_input(events);
+                state.finish_input((!text.is_empty()).then_some(text), events);
             } else if role == "assistant" {
                 // GPT-Live's transcript/done is a natural spoken-reply boundary.
                 // Keep the transport response open, but let the UI finalize a WAV
@@ -5199,6 +5395,56 @@ enum ServerSignal {
     ResponseDone,
 }
 
+#[derive(Default)]
+struct OpenAiAudioDeltaDeduper {
+    last_fingerprint: Option<u64>,
+    last_kind: Option<String>,
+    last_seen_at: Option<Instant>,
+}
+
+impl OpenAiAudioDeltaDeduper {
+    fn clear(&mut self) {
+        self.last_fingerprint = None;
+        self.last_kind = None;
+        self.last_seen_at = None;
+    }
+
+    fn should_emit(&mut self, kind: &str, value: &Value, delta: &str) -> bool {
+        let mut hasher = DefaultHasher::new();
+        value
+            .get("response_id")
+            .and_then(Value::as_str)
+            .hash(&mut hasher);
+        value
+            .get("item_id")
+            .and_then(Value::as_str)
+            .hash(&mut hasher);
+        value
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .hash(&mut hasher);
+        value
+            .get("content_index")
+            .and_then(Value::as_u64)
+            .hash(&mut hasher);
+        delta.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        let now = Instant::now();
+        let duplicate_alias = self.last_fingerprint == Some(fingerprint)
+            && self
+                .last_kind
+                .as_deref()
+                .is_some_and(|previous| previous != kind)
+            && self.last_seen_at.is_some_and(|seen| {
+                now.saturating_duration_since(seen) <= Duration::from_millis(250)
+            });
+        self.last_fingerprint = Some(fingerprint);
+        self.last_kind = Some(kind.to_owned());
+        self.last_seen_at = Some(now);
+        !duplicate_alias
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PendingOpenAiContextUpload {
     upload_id: u64,
@@ -5282,12 +5528,32 @@ fn handle_context_image_server_value(
     false
 }
 
+#[cfg(test)]
 fn handle_server_event(
     raw: &str,
     events: &std::sync::mpsc::Sender<Event>,
     handled_call_ids: &mut HashSet<String>,
     pending_context_uploads: &mut HashMap<String, PendingOpenAiContextUpload>,
     input_transcripts: &mut HashMap<String, String>,
+) -> Result<ServerSignal> {
+    let mut audio_delta_deduper = OpenAiAudioDeltaDeduper::default();
+    handle_server_event_with_audio_dedupe(
+        raw,
+        events,
+        handled_call_ids,
+        pending_context_uploads,
+        input_transcripts,
+        &mut audio_delta_deduper,
+    )
+}
+
+fn handle_server_event_with_audio_dedupe(
+    raw: &str,
+    events: &std::sync::mpsc::Sender<Event>,
+    handled_call_ids: &mut HashSet<String>,
+    pending_context_uploads: &mut HashMap<String, PendingOpenAiContextUpload>,
+    input_transcripts: &mut HashMap<String, String>,
+    audio_delta_deduper: &mut OpenAiAudioDeltaDeduper,
 ) -> Result<ServerSignal> {
     let value: Value = serde_json::from_str(raw).context("Invalid Realtime server event")?;
     if handle_context_image_server_value(&value, pending_context_uploads, events) {
@@ -5354,6 +5620,7 @@ fn handle_server_event(
             let _ = events.send(Event::InputTranscript { item_id, text });
         }
         "response.created" => {
+            audio_delta_deduper.clear();
             signal = ServerSignal::ResponseStarted;
             let response_id = value
                 .pointer("/response/id")
@@ -5389,6 +5656,7 @@ fn handle_server_event(
         }
         "response.output_audio.delta" | "response.audio.delta" => {
             if let Some(delta) = value.get("delta").and_then(Value::as_str)
+                && audio_delta_deduper.should_emit(kind, &value, delta)
                 && let Ok(bytes) = STANDARD.decode(delta)
             {
                 let response_id = value
@@ -5534,8 +5802,8 @@ mod tests {
         CODEX_HANDOFF_FALLBACK_DELAY, CONNECT_AUDIO_BUFFER_MAX_SAMPLES,
         CONTEXT_IMAGE_UPLOAD_TIMEOUT, CodexContextImageResponse, CodexHandoffAction,
         CodexHandoffState, CodexLiveState, CodexTextState, ConnectOptions, Event,
-        InFlightContextImage, NATIVE_REMOTE_TAIL_SAMPLES, NativeRemoteAudioGate,
-        OPENAI_VAD_SILENCE_MS, PendingAudioBuffer, PendingOpenAiContextUpload, RealtimeBackend,
+        InFlightContextImage, NativeRemoteAudioGate, OPENAI_VAD_SILENCE_MS,
+        OpenAiAudioDeltaDeduper, PendingAudioBuffer, PendingOpenAiContextUpload, RealtimeBackend,
         ServerSignal, codex_context_image_inject_params, codex_dynamic_tools,
         codex_live_initialize_capabilities, codex_live_realtime_start_params,
         codex_live_start_error, codex_live_thread_start_params,
@@ -5548,10 +5816,11 @@ mod tests {
         gpt_live_context_image_failed_params, gpt_live_context_image_pending_params,
         gpt_live_context_image_ready_params, handle_codex_context_image_response,
         handle_codex_handoff_message, handle_codex_live_message, handle_codex_text_message,
-        handle_context_image_server_value, handle_server_event, input_image_content,
-        local_tool_fast_speech, mcp_tool_fast_speech, openai_context_response_blockers,
-        openai_deferred_response_is_ready, openai_function_output, response_total_tokens,
-        shared_system_prompt, take_latest_ready_codex_context_image, voice_tools,
+        handle_context_image_server_value, handle_server_event,
+        handle_server_event_with_audio_dedupe, input_image_content, local_tool_fast_speech,
+        mcp_tool_fast_speech, openai_context_response_blockers, openai_deferred_response_is_ready,
+        openai_function_output, response_total_tokens, shared_system_prompt,
+        take_latest_ready_codex_context_image, voice_tools,
     };
     use crate::media::{Attachment, ScreenInfo, jpeg_upload_probe_attachment};
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -5559,18 +5828,20 @@ mod tests {
     use serde_json::{Value, json};
 
     #[test]
-    fn native_remote_audio_gate_ignores_comfort_noise_and_keeps_one_tail() {
+    fn native_remote_audio_gate_only_filters_before_response_start() {
         let mut gate = NativeRemoteAudioGate::default();
-        assert!(gate.push(vec![0; 240]).is_empty());
+        assert!(gate.push(vec![0; 240], false).is_empty());
 
-        let started = gate.push(vec![100; 240]);
+        let started = gate.push(vec![100; 240], false);
         assert_eq!(started, vec![vec![0; 240], vec![100; 240]]);
 
-        assert_eq!(
-            gate.push(vec![0; NATIVE_REMOTE_TAIL_SAMPLES]),
-            vec![vec![0; NATIVE_REMOTE_TAIL_SAMPLES]]
-        );
-        assert!(gate.push(vec![0; 240]).is_empty());
+        // Once a response is active, quiet frames and long pauses must remain
+        // byte-for-byte intact for both live playback and WAV replay.
+        let quiet = vec![0; 24_000 * 2];
+        assert_eq!(gate.push(quiet.clone(), true), vec![quiet]);
+
+        gate.reset();
+        assert!(gate.push(vec![0; 240], false).is_empty());
     }
 
     #[test]
@@ -5631,6 +5902,64 @@ mod tests {
     #[test]
     fn openai_voice_end_detection_is_low_latency() {
         assert_eq!(OPENAI_VAD_SILENCE_MS, 300);
+    }
+
+    #[test]
+    fn openai_audio_aliases_emit_each_pcm_delta_once() {
+        let (events, received) = std::sync::mpsc::channel();
+        let mut handled = HashSet::new();
+        let mut pending = HashMap::new();
+        let mut transcripts = HashMap::new();
+        let mut deduper = OpenAiAudioDeltaDeduper::default();
+        let delta = encode_pcm(&[100, -200, 300, -400]);
+
+        for kind in ["response.output_audio.delta", "response.audio.delta"] {
+            handle_server_event_with_audio_dedupe(
+                &json!({
+                    "type": kind,
+                    "response_id": "response-1",
+                    "item_id": "item-1",
+                    "output_index": 0,
+                    "content_index": 0,
+                    "delta": delta,
+                })
+                .to_string(),
+                &events,
+                &mut handled,
+                &mut pending,
+                &mut transcripts,
+                &mut deduper,
+            )
+            .unwrap();
+        }
+
+        assert!(matches!(
+            received.recv().unwrap(),
+            Event::AssistantAudio { response_id, samples }
+                if response_id == "response-1" && samples == vec![100, -200, 300, -400]
+        ));
+        assert!(received.try_recv().is_err());
+
+        handle_server_event_with_audio_dedupe(
+            &json!({
+                "type": "response.output_audio.delta",
+                "response_id": "response-1",
+                "item_id": "item-1",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": encode_pcm(&[500, -500]),
+            })
+            .to_string(),
+            &events,
+            &mut handled,
+            &mut pending,
+            &mut transcripts,
+            &mut deduper,
+        )
+        .unwrap();
+        assert!(
+            matches!(received.recv().unwrap(), Event::AssistantAudio { samples, .. } if samples == vec![500, -500])
+        );
     }
 
     #[test]
@@ -6445,6 +6774,59 @@ Call me Ecoo."
             Event::InputTranscript { item_id, text }
                 if item_id == second_id && text == "second"
         ));
+    }
+
+    #[test]
+    fn codex_live_new_reply_finishes_user_turn_without_transcript_done() {
+        let (events, received) = std::sync::mpsc::channel();
+        let mut state = CodexLiveState::default();
+
+        handle_codex_live_message(
+            &json!({
+                "method": "thread/realtime/transcript/delta",
+                "params": {"role": "user", "delta": "complete request"}
+            }),
+            &events,
+            &mut state,
+        )
+        .unwrap();
+        assert!(matches!(received.recv().unwrap(), Event::SpeechStarted));
+        let item_id = match received.recv().unwrap() {
+            Event::InputCommitted { item_id } => item_id,
+            other => panic!("expected InputCommitted, got {other:?}"),
+        };
+        assert!(matches!(
+            received.recv().unwrap(),
+            Event::InputTranscript { item_id: id, text }
+                if id == item_id && text == "complete request"
+        ));
+
+        handle_codex_live_message(
+            &json!({
+                "method": "thread/realtime/transcript/delta",
+                "params": {"role": "assistant", "delta": "okay"}
+            }),
+            &events,
+            &mut state,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            received.recv().unwrap(),
+            Event::InputTranscript { item_id: id, text }
+                if id == item_id && text == "complete request"
+        ));
+        assert!(matches!(received.recv().unwrap(), Event::SpeechStopped));
+        let response_id = match received.recv().unwrap() {
+            Event::AssistantResponseStarted { response_id } => response_id,
+            other => panic!("expected AssistantResponseStarted, got {other:?}"),
+        };
+        assert!(matches!(
+            received.recv().unwrap(),
+            Event::AssistantTranscriptDelta { response_id: id, delta }
+                if id == response_id && delta == "okay"
+        ));
+        assert!(state.input_item_id.is_none());
     }
 
     #[test]

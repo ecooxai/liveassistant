@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{Arc, RwLock, mpsc},
+    sync::{Arc, Mutex, RwLock, mpsc},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -549,12 +549,53 @@ struct Backend {
     state: Arc<RwLock<AppState>>,
     actions: mpsc::Sender<Action>,
     push: broadcast::Sender<PushEvent>,
+    audio_clients: Arc<Mutex<AudioClientRegistry>>,
+}
+
+#[derive(Default)]
+struct AudioClientRegistry {
+    next_id: u64,
+    clients: Vec<u64>,
+    owner: u64,
+}
+
+impl AudioClientRegistry {
+    fn register(&mut self) -> (u64, bool) {
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let id = self.next_id;
+        self.clients.push(id);
+        let became_owner = self.owner == 0;
+        if became_owner {
+            self.owner = id;
+        }
+        (id, became_owner)
+    }
+
+    fn claim(&mut self, id: u64) -> bool {
+        if !self.clients.contains(&id) || self.owner == id {
+            return false;
+        }
+        self.owner = id;
+        true
+    }
+
+    fn unregister(&mut self, id: u64) -> bool {
+        self.clients.retain(|client| *client != id);
+        if self.owner != id {
+            return false;
+        }
+        self.owner = self.clients.last().copied().unwrap_or_default();
+        true
+    }
 }
 
 #[derive(Clone, Debug)]
 enum PushEvent {
     StateChanged,
     Audio(Vec<i16>),
+    AudioReset,
+    AudioEnd,
+    AudioOwnerChanged(u64),
 }
 
 enum Action {
@@ -724,6 +765,7 @@ pub async fn run(port: u16, open_browser: bool) -> anyhow::Result<()> {
         .route("/api/notes/import", post(api_note_import))
         .route("/api/notes/save", post(api_note_save))
         .route("/ws", get(ws_handler))
+        .route("/ws/audio", get(ws_audio_handler))
         .with_state(backend.clone());
 
     let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
@@ -752,11 +794,12 @@ impl Backend {
         let worker = WorkerState::new();
         let state = Arc::new(RwLock::new(worker.app.clone()));
         let (actions, action_rx) = mpsc::channel();
-        let (push, _) = broadcast::channel(128);
+        let (push, _) = broadcast::channel(2048);
         let backend = Self {
             state: state.clone(),
             actions: actions.clone(),
             push: push.clone(),
+            audio_clients: Arc::new(Mutex::new(AudioClientRegistry::default())),
         };
         let startup_actions = actions.clone();
         thread::spawn(move || worker_loop(worker, state, action_rx, actions, push));
@@ -766,6 +809,51 @@ impl Backend {
 
     fn snapshot(&self) -> AppState {
         self.state.read().expect("app state read lock").clone()
+    }
+
+    fn register_audio_client(&self) -> u64 {
+        let (id, became_owner) = self
+            .audio_clients
+            .lock()
+            .expect("audio client registry lock")
+            .register();
+        if became_owner {
+            let _ = self.push.send(PushEvent::AudioOwnerChanged(id));
+        }
+        id
+    }
+
+    fn claim_audio_client(&self, id: u64) {
+        let changed = self
+            .audio_clients
+            .lock()
+            .expect("audio client registry lock")
+            .claim(id);
+        if changed {
+            let _ = self.push.send(PushEvent::AudioOwnerChanged(id));
+        }
+    }
+
+    fn unregister_audio_client(&self, id: u64) {
+        let (changed, owner) = {
+            let mut registry = self
+                .audio_clients
+                .lock()
+                .expect("audio client registry lock");
+            let changed = registry.unregister(id);
+            (changed, registry.owner)
+        };
+        if changed {
+            let _ = self.push.send(PushEvent::AudioOwnerChanged(owner));
+        }
+    }
+
+    fn is_audio_owner(&self, id: u64) -> bool {
+        self.audio_clients
+            .lock()
+            .expect("audio client registry lock")
+            .owner
+            == id
     }
 }
 
@@ -778,17 +866,22 @@ fn worker_loop(
 ) {
     publish(&mut worker, &shared, &push);
     'worker: loop {
+        let mut public_state_changed = false;
         match action_rx.recv_timeout(Duration::from_millis(10)) {
             Ok(action) => {
+                public_state_changed |= action_updates_public_state(&action);
                 if handle_action(action, &mut worker, &action_tx, &push) {
                     break 'worker;
                 }
                 while let Ok(action) = action_rx.try_recv() {
+                    public_state_changed |= action_updates_public_state(&action);
                     if handle_action(action, &mut worker, &action_tx, &push) {
                         break 'worker;
                     }
                 }
-                publish(&mut worker, &shared, &push);
+                if public_state_changed {
+                    publish(&mut worker, &shared, &push);
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -803,8 +896,8 @@ fn worker_loop(
                     .get(&tab_id)
                     .and_then(|runtime| runtime.client.events.try_recv().ok());
                 let Some(event) = event else { break };
+                changed |= realtime_event_updates_public_state(&event);
                 handle_realtime_event(event, tab_id, &mut worker, &action_tx, &push);
-                changed = true;
             }
         }
         if changed {
@@ -815,6 +908,14 @@ fn worker_loop(
     for runtime in worker.runtimes.values() {
         let _ = runtime.client.commands.send(Command::Shutdown);
     }
+}
+
+fn action_updates_public_state(action: &Action) -> bool {
+    !matches!(action, Action::Audio { .. })
+}
+
+fn realtime_event_updates_public_state(event: &Event) -> bool {
+    !matches!(event, Event::AssistantAudio { .. })
 }
 
 fn handle_action(
@@ -865,7 +966,7 @@ fn handle_action(
                     runtime.voice_audio.extend_from_slice(&samples);
                 }
                 runtime.microphone_preroll.extend_from_slice(&samples);
-                let max_preroll = 24_000 / 2;
+                let max_preroll = 24_000 * 2;
                 if runtime.microphone_preroll.len() > max_preroll {
                     let excess = runtime.microphone_preroll.len() - max_preroll;
                     runtime.microphone_preroll.drain(..excess);
@@ -1311,6 +1412,16 @@ fn handle_realtime_event(
             }
         }
         Event::SpeechStarted => {
+            if worker.active_tab_id() == tab_id {
+                let _ = push.send(PushEvent::AudioReset);
+            }
+            if worker
+                .runtimes
+                .get(&tab_id)
+                .is_some_and(|runtime| runtime.active_voice_message.is_some())
+            {
+                return;
+            }
             let message_id = worker.take_message_id();
             let settings = worker.tab(tab_id).map(|tab| tab.settings.clone());
             if let Some(tab) = worker.tab_mut(tab_id) {
@@ -1349,6 +1460,7 @@ fn handle_realtime_event(
                 let index = runtime.active_voice_message.take()?;
                 Some((index, std::mem::take(&mut runtime.voice_audio)))
             });
+            let completed_voice_turn = captured.is_some();
             if let Some((index, audio)) = captured {
                 if audio.len() >= 2_400 {
                     attach_recorded_audio(worker, tab_id, index, "Voice message.wav", audio);
@@ -1359,6 +1471,18 @@ fn handle_realtime_event(
                     message.finish();
                     tab.status = "Thinking".to_owned();
                 }
+            }
+
+            // OpenAI Realtime is configured with server VAD create_response=false
+            // so it never replies to startup noise. A real completed voice turn
+            // therefore needs one explicit response.create. The transport will
+            // defer this internally if an automatic screenshot is still uploading.
+            let needs_response = completed_voice_turn
+                && worker
+                    .tab(tab_id)
+                    .is_some_and(|tab| tab.settings.backend == RealtimeBackend::OpenAiRealtime);
+            if needs_response && let Some(runtime) = worker.runtimes.get(&tab_id) {
+                let _ = runtime.client.commands.send(Command::CreateResponse);
             }
         }
         Event::InputCommitted { item_id } => {
@@ -1407,6 +1531,9 @@ fn handle_realtime_event(
             set_tab_status(worker, tab_id, "Screen upload failed", Some(detail));
         }
         Event::AssistantResponseStarted { response_id } => {
+            if worker.active_tab_id() == tab_id {
+                let _ = push.send(PushEvent::AudioReset);
+            }
             let message_id = worker.take_message_id();
             let mut message =
                 ChatMessage::new(message_id, MessageRole::Assistant, String::new(), true);
@@ -1441,6 +1568,9 @@ fn handle_realtime_event(
             }
         }
         Event::AssistantDone { response_id } => {
+            if worker.active_tab_id() == tab_id {
+                let _ = push.send(PushEvent::AudioEnd);
+            }
             let runtime_result = worker.runtimes.get_mut(&tab_id).map(|runtime| {
                 (
                     runtime.active_assistant.take(),
@@ -1462,7 +1592,16 @@ fn handle_realtime_event(
                 if let Some((_, audio)) = runtime_result
                     && audio.len() >= 2_400
                 {
-                    attach_recorded_audio(worker, tab_id, index, "Assistant reply.wav", audio);
+                    let replay_audio = trim_replay_silence(&audio);
+                    if replay_audio.len() >= 2_400 {
+                        attach_recorded_audio(
+                            worker,
+                            tab_id,
+                            index,
+                            "Assistant reply.wav",
+                            replay_audio,
+                        );
+                    }
                 }
                 if let Some(tab) = worker.tab_mut(tab_id)
                     && let Some(message) = tab.messages.get_mut(index)
@@ -1716,6 +1855,47 @@ fn attachment_view(
             upload_id,
         },
     }
+}
+
+fn trim_replay_silence(samples: &[i16]) -> Vec<i16> {
+    const FRAME: usize = 240; // 10 ms at 24 kHz
+    const THRESHOLD_RMS: f64 = 32.0;
+    const PAD_FRAMES: usize = 20; // keep 200 ms around speech
+
+    if samples.len() <= FRAME {
+        return samples.to_vec();
+    }
+    let frame_rms = |frame: &[i16]| -> f64 {
+        if frame.is_empty() {
+            return 0.0;
+        }
+        let sum = frame
+            .iter()
+            .map(|sample| {
+                let value = f64::from(*sample);
+                value * value
+            })
+            .sum::<f64>();
+        (sum / frame.len() as f64).sqrt()
+    };
+
+    let first_voiced = samples
+        .chunks(FRAME)
+        .position(|frame| frame_rms(frame) >= THRESHOLD_RMS);
+    let last_voiced = samples
+        .rchunks(FRAME)
+        .position(|frame| frame_rms(frame) >= THRESHOLD_RMS);
+    let (Some(first_voiced), Some(last_from_end)) = (first_voiced, last_voiced) else {
+        return Vec::new();
+    };
+
+    let total_frames = samples.len().div_ceil(FRAME);
+    let last_voiced = total_frames.saturating_sub(1 + last_from_end);
+    let start_frame = first_voiced.saturating_sub(PAD_FRAMES);
+    let end_frame = (last_voiced + 1 + PAD_FRAMES).min(total_frames);
+    let start = start_frame * FRAME;
+    let end = (end_frame * FRAME).min(samples.len());
+    samples[start..end].to_vec()
 }
 
 fn attach_recorded_audio(
@@ -2406,10 +2586,14 @@ fn send_action(backend: &Backend, action: Action) -> (StatusCode, Json<Value>) {
 }
 
 async fn ws_handler(ws: WebSocketUpgrade, State(backend): State<Backend>) -> Response {
-    ws.on_upgrade(move |socket| ws_session(socket, backend))
+    ws.on_upgrade(move |socket| ws_state_session(socket, backend))
 }
 
-async fn ws_session(socket: WebSocket, backend: Backend) {
+async fn ws_audio_handler(ws: WebSocketUpgrade, State(backend): State<Backend>) -> Response {
+    ws.on_upgrade(move |socket| ws_audio_session(socket, backend))
+}
+
+async fn ws_state_session(socket: WebSocket, backend: Backend) {
     let (mut sender, mut receiver) = socket.split();
     if send_state_ws(&mut sender, &backend.snapshot())
         .await
@@ -2422,12 +2606,6 @@ async fn ws_session(socket: WebSocket, backend: Backend) {
         tokio::select! {
             incoming = receiver.next() => {
                 match incoming {
-                    Some(Ok(WsMessage::Binary(bytes))) => {
-                        let _ = backend.actions.send(Action::Audio {
-                            tab_id: None,
-                            samples: pcm16_from_bytes(&bytes),
-                        });
-                    }
                     Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
                     _ => {}
                 }
@@ -2439,15 +2617,10 @@ async fn ws_session(socket: WebSocket, backend: Backend) {
                             break;
                         }
                     }
-                    Ok(PushEvent::Audio(samples)) => {
-                        if sender
-                            .send(WsMessage::Binary(pcm16_to_bytes(&samples).into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
+                    Ok(PushEvent::Audio(_))
+                    | Ok(PushEvent::AudioReset)
+                    | Ok(PushEvent::AudioEnd)
+                    | Ok(PushEvent::AudioOwnerChanged(_)) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         if send_state_ws(&mut sender, &backend.snapshot()).await.is_err() {
                             break;
@@ -2458,6 +2631,114 @@ async fn ws_session(socket: WebSocket, backend: Backend) {
             }
         }
     }
+}
+
+async fn ws_audio_session(socket: WebSocket, backend: Backend) {
+    let client_id = backend.register_audio_client();
+    let (mut sender, mut receiver) = socket.split();
+    if send_audio_owner_ws(&mut sender, backend.is_audio_owner(client_id))
+        .await
+        .is_err()
+    {
+        backend.unregister_audio_client(client_id);
+        return;
+    }
+    let mut push = backend.push.subscribe();
+    loop {
+        tokio::select! {
+            incoming = receiver.next() => {
+                match incoming {
+                    Some(Ok(WsMessage::Binary(bytes))) => {
+                        if backend.is_audio_owner(client_id) {
+                            let samples = pcm16_from_bytes(&bytes);
+                            if !samples.is_empty() {
+                                let _ = backend.actions.send(Action::Audio {
+                                    tab_id: None,
+                                    samples,
+                                });
+                            }
+                        }
+                    }
+                    Some(Ok(WsMessage::Text(text))) => {
+                        if serde_json::from_str::<Value>(text.as_ref())
+                            .ok()
+                            .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
+                            .as_deref()
+                            == Some("claim_audio")
+                        {
+                            backend.claim_audio_client(client_id);
+                        }
+                    }
+                    Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
+                    _ => {}
+                }
+            }
+            event = push.recv() => {
+                match event {
+                    Ok(PushEvent::Audio(samples)) => {
+                        if backend.is_audio_owner(client_id)
+                            && sender
+                                .send(WsMessage::Binary(pcm16_to_bytes(&samples).into()))
+                                .await
+                                .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(PushEvent::AudioReset) => {
+                        if backend.is_audio_owner(client_id)
+                            && send_audio_control_ws(&mut sender, "audio_reset").await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(PushEvent::AudioEnd) => {
+                        if backend.is_audio_owner(client_id)
+                            && send_audio_control_ws(&mut sender, "audio_end").await.is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(PushEvent::AudioOwnerChanged(owner)) => {
+                        if send_audio_owner_ws(&mut sender, owner == client_id).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(PushEvent::StateChanged) => {}
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        eprintln!("[live-assistant audio] websocket lagged skipped_events={skipped}");
+                        if send_audio_owner_ws(&mut sender, backend.is_audio_owner(client_id)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
+    backend.unregister_audio_client(client_id);
+}
+
+async fn send_audio_control_ws<S>(sender: &mut S, kind: &str) -> Result<(), axum::Error>
+where
+    S: Sink<WsMessage, Error = axum::Error> + Unpin,
+{
+    sender
+        .send(WsMessage::Text(json!({"type": kind}).to_string().into()))
+        .await
+}
+
+async fn send_audio_owner_ws<S>(sender: &mut S, active: bool) -> Result<(), axum::Error>
+where
+    S: Sink<WsMessage, Error = axum::Error> + Unpin,
+{
+    sender
+        .send(WsMessage::Text(
+            json!({"type": "audio_owner", "active": active})
+                .to_string()
+                .into(),
+        ))
+        .await
 }
 
 async fn send_state_ws<S>(sender: &mut S, state: &AppState) -> Result<(), axum::Error>
@@ -2487,6 +2768,45 @@ fn pcm16_to_bytes(samples: &[i16]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_client_registry_keeps_one_focus_owner() {
+        let mut registry = AudioClientRegistry::default();
+        let (first, first_became_owner) = registry.register();
+        let (second, second_became_owner) = registry.register();
+        assert!(first_became_owner);
+        assert!(!second_became_owner);
+        assert_eq!(registry.owner, first);
+        assert!(registry.claim(second));
+        assert_eq!(registry.owner, second);
+        assert!(registry.claim(first));
+        assert_eq!(registry.owner, first);
+        assert!(!registry.claim(first));
+        assert!(registry.unregister(first));
+        assert_eq!(registry.owner, second);
+        assert!(registry.unregister(second));
+        assert_eq!(registry.owner, 0);
+    }
+
+    #[test]
+    fn streaming_pcm_does_not_trigger_full_state_publish() {
+        assert!(!action_updates_public_state(&Action::Audio {
+            tab_id: Some(1),
+            samples: vec![1, 2, 3],
+        }));
+        assert!(!realtime_event_updates_public_state(
+            &Event::AssistantAudio {
+                response_id: "response-1".to_owned(),
+                samples: vec![1, 2, 3],
+            }
+        ));
+        assert!(realtime_event_updates_public_state(
+            &Event::AssistantTranscriptDelta {
+                response_id: "response-1".to_owned(),
+                delta: "hello".to_owned(),
+            }
+        ));
+    }
 
     #[test]
     fn default_state_has_independent_voice_tabs() {
@@ -2578,6 +2898,19 @@ mod tests {
         assert_eq!(u16::from_le_bytes(bytes[34..36].try_into().unwrap()), 16);
         assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 6);
         assert_eq!(bytes.len(), 50);
+    }
+
+    #[test]
+    fn assistant_replay_trim_removes_only_outer_comfort_noise() {
+        let mut samples = vec![1_i16; 24_000];
+        samples.extend(std::iter::repeat_n(3_000_i16, 24_000));
+        samples.extend(std::iter::repeat_n(1_i16, 24_000));
+        let trimmed = trim_replay_silence(&samples);
+        assert!(trimmed.len() >= 24_000);
+        assert!(trimmed.len() <= 24_000 + 24_000 / 2);
+        assert!(trimmed.iter().any(|sample| *sample == 3_000));
+        assert!(trimmed.first().is_some_and(|sample| sample.abs() <= 1));
+        assert!(trimmed.last().is_some_and(|sample| sample.abs() <= 1));
     }
 
     #[test]

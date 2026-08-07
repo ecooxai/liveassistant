@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
-use std::{collections::VecDeque, fmt::Display, sync::mpsc, thread, time::Duration};
+use std::{fmt::Display, sync::mpsc, thread, time::Duration};
 use tokio::sync::mpsc::{self as tokio_mpsc, UnboundedReceiver, UnboundedSender};
 
 use libwebrtc::{
@@ -20,7 +20,11 @@ use libwebrtc::{
 
 const ICE_GATHER_TIMEOUT: Duration = Duration::from_secs(15);
 const AUDIO_SAMPLE_RATE: u32 = 24_000;
-const AUDIO_FRAME_SAMPLES: usize = AUDIO_SAMPLE_RATE as usize / 100;
+// The browser sends continuously clocked 24 kHz PCM. Feed libWebRTC its native
+// 10 ms frame size directly so there is no second buffering clock between the
+// browser and the Opus encoder.
+const LOCAL_AUDIO_QUEUE_MS: u32 = 0;
+const LOCAL_AUDIO_FRAME_SAMPLES: usize = (AUDIO_SAMPLE_RATE as usize) / 100;
 
 enum Command {
     ApplyAnswer {
@@ -89,8 +93,7 @@ impl GptLivePeer {
         .context("GPT-Live native WebRTC answer task panicked")?
     }
 
-    /// Inject VoiceProcessingIO-cleaned 24 kHz mono microphone PCM into
-    /// libWebRTC's encoder.
+    /// Inject app-processed 24 kHz mono microphone PCM into libWebRTC's encoder.
     pub async fn send_pcm24k(&self, samples: &[i16]) -> Result<()> {
         if samples.is_empty() {
             return Ok(());
@@ -211,18 +214,18 @@ async fn create_peer_connection_and_offer(
         .map_err(|error| message_error("Could not add native GPT-Live audio transceiver", error))?;
     let local_audio_source = NativeAudioSource::new(
         AudioSourceOptions {
-            // VoiceProcessingIO already performed input processing. A second
-            // APM pass causes pumping, clipping, and intelligibility loss.
+            // Browser/native capture already performed input processing. A
+            // second APM pass causes pumping, clipping, and intelligibility loss.
             echo_cancellation: false,
             noise_suppression: false,
             auto_gain_control: false,
         },
         AUDIO_SAMPLE_RATE,
         1,
-        // VoiceProcessingIO already delivers clocked 10 ms-equivalent audio.
-        // A buffered source paces historical frames in real time and lets the
-        // unbounded input channel grow into multi-second recognition latency.
-        0,
+        // Zero enables NativeAudioSource's direct 10 ms fast path. The browser
+        // already clocks capture, and the dedicated audio WebSocket isolates it
+        // from UI/state traffic.
+        LOCAL_AUDIO_QUEUE_MS,
     );
     let local_audio_track = factory.create_audio_track("realtime-mic", local_audio_source.clone());
     audio_transceiver
@@ -233,16 +236,21 @@ async fn create_peer_connection_and_offer(
     let local_audio_writer = local_audio_source.clone();
     let local_audio_errors = remote_audio_tx.clone();
     tokio::spawn(async move {
-        let mut pending = VecDeque::<i16>::new();
+        let mut pending = Vec::<i16>::with_capacity(LOCAL_AUDIO_FRAME_SAMPLES * 2);
         while let Some(samples) = local_audio_rx.recv().await {
-            pending.extend(samples);
-            while pending.len() >= AUDIO_FRAME_SAMPLES {
-                let frame_samples = pending.drain(..AUDIO_FRAME_SAMPLES).collect::<Vec<_>>();
+            if samples.is_empty() {
+                continue;
+            }
+            pending.extend_from_slice(&samples);
+            while pending.len() >= LOCAL_AUDIO_FRAME_SAMPLES {
+                let frame_samples = pending
+                    .drain(..LOCAL_AUDIO_FRAME_SAMPLES)
+                    .collect::<Vec<_>>();
                 let frame = AudioFrame {
                     data: frame_samples.into(),
                     sample_rate: AUDIO_SAMPLE_RATE,
                     num_channels: 1,
-                    samples_per_channel: AUDIO_FRAME_SAMPLES as u32,
+                    samples_per_channel: LOCAL_AUDIO_FRAME_SAMPLES as u32,
                 };
                 if let Err(error) = local_audio_writer.capture_frame(&frame).await {
                     let _ = local_audio_errors.send(Err(format!(
@@ -250,6 +258,24 @@ async fn create_peer_connection_and_offer(
                     )));
                     return;
                 }
+            }
+        }
+
+        // Do not strand the last fraction of a 10 ms frame when an uploaded clip
+        // or microphone stream ends. Padding only the sub-frame tail preserves
+        // all real samples while satisfying NativeAudioSource's fast-path contract.
+        if !pending.is_empty() {
+            pending.resize(LOCAL_AUDIO_FRAME_SAMPLES, 0);
+            let frame = AudioFrame {
+                data: pending.into(),
+                sample_rate: AUDIO_SAMPLE_RATE,
+                num_channels: 1,
+                samples_per_channel: LOCAL_AUDIO_FRAME_SAMPLES as u32,
+            };
+            if let Err(error) = local_audio_writer.capture_frame(&frame).await {
+                let _ = local_audio_errors.send(Err(format!(
+                    "Could not flush microphone PCM into GPT-Live libWebRTC: {error}"
+                )));
             }
         }
     });

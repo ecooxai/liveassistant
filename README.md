@@ -6,20 +6,20 @@ The browser is an interaction and rendering surface. Rust owns credentials, inde
 
 ## Restored web features
 
-- Independent top tabs, each with its own Rust transport, settings, messages, uploads, and connection state.
+- Two compact recent-session tabs live in the topbar; the adjacent overflow menu switches, closes, or creates any opened tab.
 - GPT Live (`gpt-live-*`), OpenAI Realtime API (`gpt-realtime-*`), and Codex text tabs with separate model catalogs.
 - Dynamic model discovery from the connected Codex account and, when an API key is supplied, the OpenAI Models API.
 - Radio-card model and transport selection in Settings and in the Add model tab dialog.
 - Dynamic voice persona lists for GPT Live and OpenAI Realtime.
 - Automatic active-tab connection when the page opens, with the browser microphone enabled by default after a voice transport connects.
-- Typed messages and browser microphone input with assistant audio playback.
+- Typed messages and browser microphone input with assistant audio playback; a stable single-window audio lease prevents duplicate microphones/speakers, microphone PCM uses a dedicated `/ws/audio` stream at 24 kHz, and GPT Live uses WebRTC's own bounded realtime audio queue.
 - Image and audio upload, manual screen capture, and removable pending attachment previews.
 - Optional automatic current-screen context for typed and voice turns.
 - Screenshot upload lifecycle states: preparing, uploading, uploaded, and failed.
 - Incremental keyed message rendering: streaming snapshots update only the affected card and preserve audio controls, selection, scroll context, and microphone state.
 - Message start and end clocks, elapsed time, token totals, estimated-token marking, and completed assistant tokens per second.
-- Replayable and downloadable WAV cards for uploaded audio and recorded user/assistant PCM when the transport exposes it.
-- A resizable bottom workspace matching the native layout, with Chat, workspace Markdown/text files, local file import, editing, and autosave.
+- Replayable and downloadable WAV cards for uploaded audio and recorded user/assistant PCM, plus Realtime audio-alias de-duplication and a continuous 24 kHz playback AudioWorklet with a small jitter buffer.
+- A compact resizable bottom workspace with one shared editor surface for Chat and Markdown/text files, shared attachment/voice controls, autosave, and Ctrl/Cmd+Enter current-line sending from notes.
 - Codex account rate limits, reset times, credit state, and token-usage snapshots in Settings.
 - Generated-image previews and local computer-tool progress/results.
 - In-memory API keys; credentials are never returned in browser state snapshots or persisted by the web UI.

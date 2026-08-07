@@ -8,7 +8,7 @@ cd "$ROOT_DIR"
 
 DEBOUNCE_SECONDS=5
 POLL_INTERVAL_SECONDS=0.5
-WATCH_PATHS=("$ROOT_DIR/src" "$ROOT_DIR/vendor")
+WATCH_PATHS=("$ROOT_DIR/src" "$ROOT_DIR/web" "$ROOT_DIR/vendor")
 WATCH_FILES=("$ROOT_DIR/Cargo.toml" "$ROOT_DIR/Cargo.lock" "$ROOT_DIR/build.rs")
 
 if ! command -v cksum >/dev/null 2>&1; then

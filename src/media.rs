@@ -1,7 +1,12 @@
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use image::{DynamicImage, ImageFormat, codecs::jpeg::JpegEncoder, imageops::FilterType};
-use std::{fs::File, io::Cursor, path::Path};
+use std::{
+    fs::{self, File},
+    io::Cursor,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use symphonia::core::{
     audio::SampleBuffer, codecs::DecoderOptions, formats::FormatOptions, io::MediaSourceStream,
     meta::MetadataOptions, probe::Hint,
@@ -325,6 +330,66 @@ fn constrain_image(image: DynamicImage, max_side: u32) -> DynamicImage {
     }
 }
 
+pub fn audio_from_data_url(name: impl Into<String>, data_url: &str) -> Result<Attachment> {
+    let name = name.into();
+    let (header, encoded) = data_url
+        .trim()
+        .split_once(',')
+        .context("Audio input must be a data URL")?;
+    anyhow::ensure!(
+        header.starts_with("data:audio/") && header.ends_with(";base64"),
+        "Audio input must be a base64-encoded audio data URL"
+    );
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .context("Audio data URL contained invalid base64")?;
+    anyhow::ensure!(!bytes.is_empty(), "Audio data URL was empty");
+
+    let mime_subtype = header
+        .strip_prefix("data:audio/")
+        .and_then(|value| value.strip_suffix(";base64"))
+        .unwrap_or("audio");
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension)
+        .filter(|extension| {
+            extension
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+        })
+        .or_else(|| match mime_subtype {
+            "wav" | "x-wav" | "wave" => Some("wav"),
+            "mpeg" | "mp3" => Some("mp3"),
+            "mp4" | "m4a" | "x-m4a" => Some("m4a"),
+            "ogg" => Some("ogg"),
+            "flac" => Some("flac"),
+            "webm" => Some("webm"),
+            _ => None,
+        })
+        .unwrap_or("audio");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "live-assistant-audio-{}-{nonce}.{extension}",
+        std::process::id()
+    ));
+    fs::write(&path, &bytes).context("Could not stage uploaded audio")?;
+    let result = load_audio(&path).map(|attachment| match attachment {
+        Attachment::Audio {
+            pcm24k, seconds, ..
+        } => Attachment::Audio {
+            name,
+            pcm24k,
+            seconds,
+        },
+        image => image,
+    });
+    let _ = fs::remove_file(path);
+    result
+}
+
 pub fn load_audio(path: &Path) -> Result<Attachment> {
     let file =
         File::open(path).with_context(|| format!("Could not open audio {}", path.display()))?;
@@ -442,13 +507,57 @@ pub fn wav_file_size(sample_count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        Attachment, DynamicImage, MAX_JPEG_UPLOAD_BYTES, encode_image_attachment,
-        image_from_data_url, jpeg_animal_probe_attachments, jpeg_attachment_name,
-        jpeg_latest_image_probe_attachments, jpeg_upload_probe_attachment, resample_to_24k,
-        save_image, wav_file_size,
+        Attachment, DynamicImage, MAX_JPEG_UPLOAD_BYTES, audio_from_data_url,
+        encode_image_attachment, image_from_data_url, jpeg_animal_probe_attachments,
+        jpeg_attachment_name, jpeg_latest_image_probe_attachments, jpeg_upload_probe_attachment,
+        resample_to_24k, save_image, wav_file_size,
     };
     use base64::{Engine, engine::general_purpose::STANDARD};
     use image::{ImageFormat, Rgba, RgbaImage};
+
+    #[test]
+    fn audio_data_url_decodes_to_24k_pcm() {
+        let samples = (0..2_400)
+            .map(|index| {
+                if index % 48 < 24 {
+                    4_000_i16
+                } else {
+                    -4_000_i16
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut wav = Vec::with_capacity(44 + samples.len() * 2);
+        let data_bytes = (samples.len() * 2) as u32;
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16_u32.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&1_u16.to_le_bytes());
+        wav.extend_from_slice(&24_000_u32.to_le_bytes());
+        wav.extend_from_slice(&(24_000_u32 * 2).to_le_bytes());
+        wav.extend_from_slice(&2_u16.to_le_bytes());
+        wav.extend_from_slice(&16_u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&data_bytes.to_le_bytes());
+        for sample in &samples {
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+        let data_url = format!("data:audio/wav;base64,{}", STANDARD.encode(wav));
+        let Attachment::Audio {
+            name,
+            pcm24k,
+            seconds,
+        } = audio_from_data_url("probe.wav", &data_url).unwrap()
+        else {
+            panic!("expected an audio attachment");
+        };
+        assert_eq!(name, "probe.wav");
+        assert_eq!(pcm24k.len(), 2_400);
+        assert!((seconds - 0.1).abs() < 0.001);
+        assert!(pcm24k.iter().any(|sample| *sample > 1_000));
+        assert!(pcm24k.iter().any(|sample| *sample < -1_000));
+    }
 
     #[test]
     fn resampling_preserves_duration() {

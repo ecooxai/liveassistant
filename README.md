@@ -1,167 +1,111 @@
 # Live Assistant
 
-A native Rust desktop assistant for macOS and Linux using the OpenAI Realtime
-WebSocket API. It supports:
+A local Rust assistant backend with a lightweight browser interface for OpenAI Realtime, GPT Live, and Codex text sessions.
 
-- `gpt-realtime-2.1` and `gpt-realtime-2`
-- full-duplex microphone/audio: the mic stays live while the assistant speaks
-- instant barge-in that stops and truncates assistant playback when the user talks
-- OS voice-processing capture with acoustic echo cancellation for speaker/system audio
-- one primary-display screenshot per detected voice turn
-- logical-resolution screenshots on Retina/HiDPI displays
-- transparent Live pointer overlay with one-second left/right click colors and
-  bottom-right coordinates while a mouse button is held
-- visible and replayable user audio for OpenAI Realtime and GPT-Live
-- typed text, Command/Ctrl+V image paste, uploaded images/audio, and drag-and-drop
-- sent image and screen-context previews directly in user message bubbles
-- click-to-enlarge viewing of the exact encoded image payload sent to the model
-- compact per-message start/end timing and elapsed cost, plus token totals and completed assistant token rate
-- GPT-Live and Realtime tabs open by default with GPT-Live first and auto-connecting, plus a manual down-arrow control instead of automatic transcript scrolling
-- OpenAI Realtime has an optional tool-first prompt appendix, delegates screenshot-backed clicks to a text model for accuracy, and GPT-Live clicks directly
-- OpenAI Realtime retains its conservative one-second playback gate
-- on macOS, VoiceProcessingIO keeps system-audio cancellation while native libWebRTC NetEQ supplies smooth decoded assistant PCM for both live playback and WAV replay
-- hold either Command key for one second to temporarily let the microphone hear system audio; release Command to restore cancellation immediately
-- GPT-Live suppresses duplicate sideband PCM notifications while WebRTC owns audio
-- Realtime function tools for screenshot-relative clicks, Bash commands, and text insertion
-- light interface theme
-- a persistent conversation until the voice session is stopped
+The browser is an interaction and rendering surface. Rust owns credentials, independent model transports, conversation state, screenshots, uploads, timing and usage data, tools, and image generation.
+
+## Restored web features
+
+- Two compact recent-session tabs live in the topbar; the adjacent overflow menu switches, closes, or creates any opened tab.
+- GPT Live (`gpt-live-*`), OpenAI Realtime API (`gpt-realtime-*`), and Codex text tabs with separate model catalogs.
+- Dynamic model discovery from the connected Codex account and, when an API key is supplied, the OpenAI Models API.
+- Radio-card model and transport selection in Settings and in the Add model tab dialog.
+- Dynamic voice persona lists for GPT Live and OpenAI Realtime.
+- Automatic active-tab connection when the page opens, with the browser microphone enabled by default after a voice transport connects.
+- Typed messages and browser microphone input with assistant audio playback; a stable single-window audio lease prevents duplicate microphones/speakers, microphone PCM uses a dedicated `/ws/audio` stream at 24 kHz, and GPT Live uses WebRTC's own bounded realtime audio queue.
+- Image and audio upload, manual screen capture, and removable pending attachment previews.
+- Optional automatic current-screen context for typed and voice turns.
+- Screenshot upload lifecycle states: preparing, uploading, uploaded, and failed.
+- Incremental keyed message rendering: streaming snapshots update only the affected card and preserve audio controls, selection, scroll context, and microphone state.
+- Message start and end clocks, elapsed time, token totals, estimated-token marking, and completed assistant tokens per second.
+- Replayable and downloadable WAV cards for uploaded audio and recorded user/assistant PCM, plus Realtime audio-alias de-duplication and a continuous 24 kHz playback AudioWorklet with a 1s/2s low/high-watermark jitter buffer; playback-only silence is never written into replay WAVs.
+- A compact resizable bottom workspace with one shared editor surface for Chat and Markdown/text files, shared attachment/voice controls, autosave, and Ctrl/Cmd+Enter current-line sending from notes.
+- Codex account rate limits, reset times, credit state, and token-usage snapshots in Settings.
+- Generated-image previews and local computer-tool progress/results.
+- In-memory API keys; credentials are never returned in browser state snapshots or persisted by the web UI.
+
+## Architecture
+
+- **Axum server:** binds only to `127.0.0.1`, serves the embedded interface, and accepts explicit action requests.
+- **Rust state worker:** owns every tab and polls each tab's independent Realtime client.
+- **WebSocket:** sends Rust state snapshots and assistant PCM to the browser; a keyed DOM reconciler applies only changed tabs/cards, while microphone PCM travels back to the active Rust tab.
+- **Model catalog:** merges account/API discoveries with built-in official fallbacks while preserving the source of each model option.
+- **Attachments:** browser images are decoded and normalized in Rust before entering a turn. Screenshots are captured by Rust.
 
 ## Run
-
-Install the platform dependencies, then:
 
 ```sh
 cargo run --release
 ```
 
-On macOS, the first use should prompt for Microphone, Screen Recording, and
-Accessibility permissions. Screen clicks and text insertion require
-**System Settings → Privacy & Security → Accessibility**. If screen capture
-remains unavailable, enable Screen Recording for the built application or
-terminal there as well.
+The app starts at `http://127.0.0.1:4317` and opens that address in the default browser.
 
-To verify the complete screenshot-coordinate → native-click path, run:
+Choose another port:
+
+```sh
+cargo run --release -- --port 8080
+```
+
+or:
+
+```sh
+LIVE_ASSISTANT_PORT=8080 cargo run --release
+```
+
+Prevent automatic browser launch:
+
+```sh
+cargo run --release -- --no-open
+```
+
+For automatic rebuilds while editing Rust or browser assets:
+
+```sh
+./dev.sh
+```
+
+## Authentication and model discovery
+
+Use either:
+
+1. **Reuse Codex login** — the default for GPT Live, Realtime, and text tabs. It reads existing Codex credentials from `~/.codex/auth.json` or `$CODEX_HOME/auth.json` and discovers the account's models and voice personas.
+2. **OpenAI API key** — enter a key in Settings or set `OPENAI_API_KEY`. The **Find available** action asks the Rust backend to refresh the model catalog from the OpenAI Models API.
+
+A key entered in the browser is sent only to the localhost Rust process and retained in memory.
+
+## Permissions
+
+On macOS, allow the built application or terminal to use:
+
+- Microphone
+- Screen Recording
+- Accessibility
+
+Accessibility is required for screen clicks and text insertion. Screen Recording is required for manual or automatic screen context. Browser microphone access also requires permission for the browser.
+
+## Validation
+
+```sh
+node --check web/app.js
+cargo check --locked
+cargo test --no-fail-fast
+```
+
+Backend transport probes remain available:
 
 ```sh
 cargo run -- --test-click
-```
-
-This opens a small target window, clicks its center through the production
-`click_screen` implementation, and fails if the target does not receive the
-click or macOS reports a different pointer position.
-
-To verify the production macOS GPT-Live native audio path, run:
-
-```sh
 cargo run -- --test-gpt-live-native
-```
-
-This creates a real platform-ADM WebRTC session, sends a text turn, plays the
-remote track through native libWebRTC, and requires an assistant transcript.
-The deterministic raw-RTP transport diagnostic remains available as
-`cargo run -- --test-gpt-live`.
-
-To verify JPEG screenshot upload and latest-image ordering on both OpenAI
-Realtime and GPT-Live, run:
-
-```sh
+cargo run -- --test-gpt-live
+cargo run -- --test-gpt-live-tool-latency
 cargo run -- --test-image-upload
 ```
 
-The probe keeps one connection open per backend, uploads a real cat JPEG and
-requires the first voice turn to identify the cat, then uploads a real dog JPEG
-and requires the following voice turn to identify the dog rather than the stale
-cat. It fails if either upload exceeds the deadline or either backend sees the
-wrong image.
+## Linux build dependencies
 
-On Debian/Ubuntu Linux, the typical build dependencies are:
+On Debian/Ubuntu:
 
 ```sh
-sudo apt install build-essential pkg-config libasound2-dev libx11-dev \
-  libxcb-shape0-dev libxcb-xfixes0-dev libgtk-3-dev
+sudo apt install build-essential pkg-config libasound2-dev \
+  libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev libgtk-3-dev
 ```
-
-Wayland screenshot support depends on the desktop portal/compositor. X11 is
-supported directly by the screenshot library and is currently required for the
-global pointer/click overlay on Linux.
-
-## Authentication
-
-Open **Settings** and choose one of:
-
-1. **OpenAI Platform API key** — paste a key (or launch with `OPENAI_API_KEY`).
-   The app keeps it in memory only and does not write it to disk.
-2. **Reuse Codex login** — reads `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`).
-   Supports both:
-   - Platform API-key Codex logins (`sk-…`)
-   - ChatGPT/Codex OAuth (`access_token` + optional `account_id`)
-
-For OpenAI Realtime, Platform API keys connect directly to
-`wss://api.openai.com/v1/realtime`. For GPT-Live V3, Codex app-server manages
-ChatGPT OAuth and call creation while Live Assistant supplies the WebRTC audio peer. If the stored OAuth access token is near expiry and a `refresh_token`
-is present, Live Assistant refreshes it via `https://auth.openai.com/oauth/token`
-and updates `auth.json`.
-
-When Codex authentication is selected, Settings also uses the installed
-`codex app-server` to show the complete model catalog visible to that account,
-rolling usage-limit percentages and reset times, credit state, and reported
-token usage. It also loads the Codex v1/v2 voice-persona catalog. Set
-`CODEX_BIN` if the `codex` executable is not on the app's `PATH`. Codex coding
-models and GPT-Live information are displayed separately from the selectable
-Realtime voice model because the Realtime WebSocket requires a Realtime model
-ID. Settings is scrollable, and the complete system prompt is editable directly
-with a Reset to default button. Settings can also disable the OpenAI Realtime
-fast tool-call appendix without changing the editable base prompt. Message timing uses a compact form such as
-`12:01:01-06,5s`; assistant end time is recorded when the backend finishes the
-reply, not when audio playback drains. Token totals use backend usage when a
-transport reports it and a visibly marked local estimate otherwise.
-
-## Privacy and behavior
-
-For OpenAI Realtime and GPT-Live, microphone capture starts as soon as **Start
-voice** is clicked. OpenAI Realtime keeps up to the latest 60 seconds while it
-connects. GPT-Live retains only the latest second so stale startup silence cannot
-sit ahead of the current utterance and delay server VAD. A screen
-capture is taken after the first live transcript token (or the local clear-speech
-fallback where available), not continuously. Disable per-turn screenshots in
-Settings. Press **Stop** to close the transport and audio devices.
-
-On macOS, GPT-Live keeps microphone capture and assistant playback paired in
-one VoiceProcessingIO unit so acoustic echo cancellation receives the exact
-far-end signal. The cleaned microphone PCM is injected into native libWebRTC,
-and assistant audio comes back through libWebRTC NetEQ for adaptive jitter
-buffering, packet-loss concealment, clock correction, and clean WAV replay.
-App-server `thread/realtime/outputAudio/delta` notifications remain opted out to
-prevent duplicate audio.
-
-Computer tools run with the current user's permissions. The session prompt
-treats screenshot/application text as untrusted content. Bash commands time out
-after 30 seconds, and their stdout and stderr are capped before being returned
-to the model.
-
-During a voice session, assistant speech is played at unity gain through the
-same OS voice-processing engine that owns microphone capture. This paired path
-provides the strongest available echo reference while keeping the microphone
-fully duplex for barge-in. On Linux, system-wide AEC requires PulseAudio
-`module-echo-cancel`; macOS uses VoiceProcessingIO and Windows uses WASAPI AEC.
-On macOS 14 and newer, the app requests activity-aware near-unity media ducking
-so cancellation does not make normal playback noticeably quieter. Hold either
-Command key for one second to bypass voice processing and include system audio
-in the microphone only while the key remains held. Offline WAV replay uses the
-normal output device.
-
-Uploaded audio is decoded locally, converted to mono 24 kHz PCM, and then sent
-as an `input_audio` conversation item. User voice turns can be replayed or
-saved as WAV from the chat.
-
-## Package
-
-For a distributable macOS `.app`, install `cargo-bundle` and run:
-
-```sh
-cargo install cargo-bundle
-cargo bundle --release
-```
-
-Linux can run the release binary from `target/release/live-assistant` or package
-it with your distribution's preferred format.

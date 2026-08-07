@@ -1,0 +1,42 @@
+name: Web UI check
+
+on:
+  push:
+    branches: [web-ui-aurora]
+  pull_request:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Compile
+        run: cargo check --all-targets
+      - name: Start localhost server
+        run: |
+          cargo run -- --no-open --port 4317 > /tmp/live-assistant-web.log 2>&1 &
+          echo $! > /tmp/live-assistant-web.pid
+          for attempt in {1..90}; do
+            if curl --fail --silent http://127.0.0.1:4317/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat /tmp/live-assistant-web.log
+          exit 1
+      - name: Verify state endpoint
+        run: curl --fail --silent http://127.0.0.1:4317/api/state
+      - name: Stop localhost server
+        if: always()
+        run: |
+          if test -f /tmp/live-assistant-web.pid; then
+            kill "$(cat /tmp/live-assistant-web.pid)" || true
+          fi

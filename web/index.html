@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f7fbff">
+  <title>Live Assistant</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="aurora aurora-one" aria-hidden="true"></div>
+  <div class="aurora aurora-two" aria-hidden="true"></div>
+  <div class="aurora aurora-three" aria-hidden="true"></div>
+
+  <main class="app-shell">
+    <header class="topbar">
+      <div class="brand" aria-label="Live Assistant">
+        <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div><h1>Live Assistant</h1><p>Local Rust workspace</p></div>
+      </div>
+
+      <div class="topbar-tabs" aria-label="Recent model sessions">
+        <div class="tabs-scroll" id="tabs-list"></div>
+        <button class="tabs-menu-button" id="tabs-menu-button" type="button" aria-label="Show opened tabs" title="Opened tabs" aria-expanded="false">•••</button>
+        <div class="tabs-popover" id="tabs-popover" hidden>
+          <div class="tabs-menu-list" id="tabs-menu-list"></div>
+          <button class="tabs-menu-add" id="add-tab-button" type="button">+ New tab</button>
+        </div>
+      </div>
+
+      <div class="topbar-actions">
+        <div class="status-chip" id="status-chip" data-state="offline">
+          <span class="status-dot"></span><span id="status-text">Ready</span>
+        </div>
+        <button class="icon-button" id="clear-button" type="button" aria-label="Clear conversation" title="Clear conversation">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m-8 0 1 13h8l1-13M10 11v5m4-5v5"/></svg>
+        </button>
+        <button class="icon-button" id="settings-button" type="button" aria-label="Open settings" title="Settings">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.3a3.3 3.3 0 1 0 0-6.6 3.3 3.3 0 0 0 0 6.6Z"/><path d="m19.4 15 .1.1 1.4 2.4-2.4 2.4-2.4-1.4-.1-.1a7.8 7.8 0 0 1-2 .8V22h-4v-2.8a7.8 7.8 0 0 1-2-.8l-.1.1-2.4 1.4-2.4-2.4 1.4-2.4.1-.1a7.8 7.8 0 0 1-.8-2H2V9h2.8a7.8 7.8 0 0 1 .8-2l-.1-.1-1.4-2.4 2.4-2.4 2.4 1.4.1.1a7.8 7.8 0 0 1 2-.8V0h4v2.8a7.8 7.8 0 0 1 2 .8l.1-.1 2.4-1.4 2.4 2.4-1.4 2.4-.1.1a7.8 7.8 0 0 1 .8 2H22v4h-2.8a7.8 7.8 0 0 1-.8 2Z"/></svg>
+        </button>
+        <button class="connect-button" id="connect-button" type="button">
+          <span class="connect-label">Connect</span><span class="connect-arrow" aria-hidden="true">↗</span>
+        </button>
+      </div>
+    </header>
+
+    <section class="workspace" id="workspace">
+      <div class="conversation" id="conversation" aria-live="polite">
+        <section class="empty-state" id="empty-state">
+          <div class="orb" aria-hidden="true"><div></div></div>
+          <p class="eyebrow" id="empty-eyebrow">Model session</p>
+          <h2>What can we work on?</h2>
+          <p class="empty-copy">Each tab owns its Rust transport, conversation, uploads, timing, and usage state.</p>
+          <div class="suggestions">
+            <button type="button" data-prompt="Summarize what is currently on my screen.">Summarize my screen</button>
+            <button type="button" data-prompt="Help me plan the next steps for this project.">Plan next steps</button>
+            <button type="button" data-prompt="Review the current app architecture and suggest improvements.">Review architecture</button>
+          </div>
+        </section>
+        <div class="message-list" id="message-list"></div>
+      </div>
+
+      <section class="bottom-workspace" id="bottom-workspace">
+        <button class="dock-resize-handle" id="dock-resize-handle" type="button" aria-label="Resize bottom workspace" title="Drag to resize"></button>
+        <div class="dock-body">
+          <aside class="note-sidebar" id="note-sidebar">
+            <div class="note-sidebar-actions">
+              <button type="button" id="new-note-button" title="New note" aria-label="New note">+</button>
+              <button type="button" id="open-note-button" title="Open Markdown or text file" aria-label="Open Markdown or text file">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2 2h9v10H3z"/><path d="M3 7V5h7l2 2"/></svg>
+              </button>
+              <input id="note-file-input" type="file" accept=".md,.markdown,.txt,.text,text/plain,text/markdown" hidden>
+            </div>
+            <button class="workspace-choice" id="chat-workspace-button" type="button" data-active="true">Chat</button>
+            <div class="note-list" id="note-list" aria-label="Workspace notes"></div>
+          </aside>
+          <button class="sidebar-resize-handle" id="sidebar-resize-handle" type="button" aria-label="Resize note sidebar" title="Drag to resize"></button>
+
+          <div class="dock-content">
+            <div class="editor-shell" id="editor-shell">
+              <div class="error-banner" id="error-banner" hidden>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8v5m0 3.5v.1M10.2 3.7 2.8 17a2 2 0 0 0 1.8 3h14.8a2 2 0 0 0 1.8-3L13.8 3.7a2 2 0 0 0-3.6 0Z"/></svg>
+                <span id="error-text"></span><button type="button" id="dismiss-error" aria-label="Dismiss error">×</button>
+              </div>
+
+              <section class="editor-workspace chat-workspace" id="chat-workspace">
+                <textarea class="workspace-editor" id="composer-input" spellcheck="true" placeholder="Message Live Assistant…" aria-label="Message Live Assistant"></textarea>
+              </section>
+
+              <section class="editor-workspace note-editor-workspace" id="note-editor-workspace" hidden>
+                <textarea class="workspace-editor" id="note-editor" spellcheck="true" placeholder="Write Markdown…" disabled></textarea>
+                <small class="editor-save-status" id="note-save-status">Select or open a file</small>
+              </section>
+
+              <form class="editor-toolbar" id="composer-form">
+                <div class="pending-attachments" id="pending-attachments" hidden></div>
+                <div class="composer-tools">
+                  <input id="file-input" type="file" accept="image/*,audio/*" multiple hidden>
+                  <button class="tool-button" id="upload-button" type="button" aria-label="Upload image or audio" title="Upload image or audio">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m0 0L7 9m5-5 5 5M5 15v4h14v-4"/></svg>
+                  </button>
+                  <button class="tool-button" id="capture-button" type="button" aria-label="Capture screen" title="Capture screen">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="13" rx="2"/><path d="M8 21h8M12 18v3M8 10h8"/></svg>
+                  </button>
+                  <button class="tool-button mic-button" id="mic-button" type="button" aria-label="Stop microphone" title="Stop microphone">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a4 4 0 0 0 4-4V6a4 4 0 1 0-8 0v5a4 4 0 0 0 4 4Z"/><path d="M5 10v1a7 7 0 0 0 14 0v-1M12 18v4m-4 0h8"/></svg>
+                    <span class="mic-level" id="mic-level"></span>
+                  </button>
+                  <button class="model-pill" id="model-pill" type="button">GPT Live</button>
+                </div>
+                <button class="send-button" id="send-button" type="submit" aria-label="Send message" disabled>
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 7-7 7 7M12 5v14"/></svg>
+                </button>
+              </form>
+            </div>
+          </div>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <div class="modal-backdrop" id="settings-modal" hidden>
+    <section class="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title">
+      <header class="settings-header">
+        <div><p class="eyebrow">Active tab configuration</p><h2 id="settings-title">Settings</h2></div>
+        <button class="icon-button" id="close-settings" type="button" aria-label="Close settings">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+        </button>
+      </header>
+
+      <form id="settings-form" class="settings-form">
+        <fieldset class="choice-fieldset">
+          <legend>Transport</legend>
+          <div class="backend-radio-grid" id="backend-radio-list"></div>
+        </fieldset>
+
+        <div class="field-grid two">
+          <label class="field"><span>Authentication</span>
+            <select id="auth-select"><option value="codex">Reuse Codex login</option><option value="api_key">OpenAI API key</option></select>
+          </label>
+          <label class="field" id="voice-field"><span>Voice</span><select id="voice-select"></select></label>
+        </div>
+
+        <label class="field api-key-field" id="api-key-field">
+          <span>API key <small>kept in Rust process memory only</small></span>
+          <div class="inline-field"><input id="api-key-input" type="password" autocomplete="off" spellcheck="false" placeholder="sk-…"><button id="refresh-models-button" type="button">Find available</button></div>
+        </label>
+
+        <fieldset class="choice-fieldset">
+          <legend>Model <small id="catalog-status"></small></legend>
+          <div class="model-radio-list" id="model-radio-list"></div>
+        </fieldset>
+
+        <div class="field-grid two">
+          <label class="field"><span>Thinking</span>
+            <select id="thinking-select"><option value="minimal">Minimal</option><option value="low">Light</option><option value="medium">Medium</option><option value="high">High</option><option value="xhigh">Extra high</option><option value="ultra">Ultra</option></select>
+          </label>
+          <label class="field toggle-field"><span>Screen context<small>Capture each typed or voice turn</small></span><input id="screenshot-toggle" type="checkbox"><i aria-hidden="true"></i></label>
+        </div>
+
+        <div class="field-grid two">
+          <label class="field"><span>Image model</span><select id="image-model-select"></select></label>
+          <label class="field"><span>Image resolution</span>
+            <select id="image-resolution-select"><option value="1024x1024">1024 × 1024</option><option value="1024x1536">1024 × 1536</option><option value="1536x1024">1536 × 1024</option><option value="2560x1440">2560 × 1440</option><option value="3840x2160">3840 × 2160</option></select>
+          </label>
+        </div>
+
+        <label class="field"><span>System prompt</span><textarea id="system-prompt-input" rows="7" spellcheck="true"></textarea></label>
+        <div class="catalog-warnings" id="catalog-warnings" hidden></div>
+        <section class="account-usage" id="account-usage" hidden>
+          <div class="usage-heading"><div><span>Codex account</span><strong>Usage and limits</strong></div><small>Loaded by the Rust backend</small></div>
+          <div class="usage-limits" id="usage-limits"></div>
+          <div class="usage-tokens" id="usage-tokens"></div>
+        </section>
+        <div class="settings-actions"><p>Changing a live tab disconnects it so the next connection uses the selected model.</p><button class="secondary-button" type="submit">Save settings</button></div>
+      </form>
+    </section>
+  </div>
+
+  <div class="modal-backdrop" id="model-modal" hidden>
+    <section class="settings-panel model-picker-panel" role="dialog" aria-modal="true" aria-labelledby="model-picker-title">
+      <header class="settings-header">
+        <div><p class="eyebrow">New independent session</p><h2 id="model-picker-title">Add model tab</h2></div>
+        <button class="icon-button" id="close-model-picker" type="button" aria-label="Close model picker"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+      </header>
+      <form class="settings-form" id="model-picker-form">
+        <fieldset class="choice-fieldset"><legend>Transport</legend><div class="backend-radio-grid" id="new-backend-radio-list"></div></fieldset>
+        <fieldset class="choice-fieldset"><legend>Available model</legend><div class="model-radio-list" id="new-model-radio-list"></div></fieldset>
+        <label class="field" id="new-voice-field"><span>Voice</span><select id="new-voice-select"></select></label>
+        <div class="settings-actions"><p>Catalog options are discovered from the Codex account and OpenAI Models API, with official fallbacks.</p><button class="secondary-button" type="submit">Add tab</button></div>
+      </form>
+    </section>
+  </div>
+
+  <template id="message-template">
+    <article class="message">
+      <div class="message-avatar"></div>
+      <div class="message-body">
+        <div class="message-meta"><span class="message-role"></span><span class="message-timing"></span></div>
+        <div class="message-text"></div>
+        <div class="message-attachments"></div>
+        <div class="message-tools"></div>
+        <img class="message-image" alt="Generated image" hidden>
+      </div>
+    </article>
+  </template>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

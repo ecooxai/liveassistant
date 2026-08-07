@@ -2,12 +2,13 @@
 name = "live-assistant"
 version = "0.1.0"
 edition = "2024"
-description = "A native macOS/Linux voice and screen assistant for the OpenAI Realtime API"
+description = "A local Rust voice and screen assistant with a lightweight web interface"
 license = "MIT"
 
 [dependencies]
 anyhow = "1.0"
 arboard = "3.5"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 bytes = "1.10"
 cpal = "0.15"
@@ -26,7 +27,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 symphonia = { version = "0.5", features = ["all"] }
 sys-voice = "0.2"
-tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 ureq = { version = "2.12", features = ["json"] }
 webrtc = "0.17.2"

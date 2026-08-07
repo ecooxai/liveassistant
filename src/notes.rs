@@ -60,6 +60,32 @@ fn normalized_name(name: &str, add_markdown_extension: bool) -> Result<String> {
     Ok(result)
 }
 
+pub fn workspace_note_path(name: &str) -> Result<PathBuf> {
+    let normalized = normalized_name(name, false)?;
+    let path = notes_dir()?.join(normalized);
+    anyhow::ensure!(
+        path.is_file() && is_supported_text_file(&path),
+        "Note does not exist or is not a supported text file"
+    );
+    Ok(path)
+}
+
+pub fn import_text(name: &str, content: &str) -> Result<PathBuf> {
+    let normalized = normalized_name(name, true)?;
+    let extension = Path::new(&normalized)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("md");
+    anyhow::ensure!(
+        matches!(
+            extension.to_ascii_lowercase().as_str(),
+            "md" | "markdown" | "txt" | "text"
+        ),
+        "Select a Markdown or text file"
+    );
+    create_unique_note(&normalized, content)
+}
+
 pub fn read_note(path: &Path) -> Result<String> {
     fs::read_to_string(path).with_context(|| format!("Could not read note {}", path.display()))
 }
@@ -142,7 +168,7 @@ pub fn rename_note(path: &Path, new_name: &str) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalized_name;
+    use super::{import_text, normalized_name, workspace_note_path};
 
     #[test]
     fn markdown_extension_is_added_for_new_notes() {
@@ -154,5 +180,12 @@ mod tests {
     fn directory_traversal_is_rejected() {
         assert!(normalized_name("../secret.md", true).is_err());
         assert!(normalized_name("folder/note.md", true).is_err());
+        assert!(workspace_note_path("../secret.md").is_err());
+    }
+
+    #[test]
+    fn browser_import_rejects_non_text_extensions() {
+        assert!(import_text("script.rs", "fn main() {}").is_err());
+        assert!(import_text("archive.zip", "not really a zip").is_err());
     }
 }

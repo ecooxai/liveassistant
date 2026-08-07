@@ -873,7 +873,12 @@
           this.offset = 0;
           this.bufferedSamples = 0;
           this.playing = false;
-          this.startThreshold = 2880;
+          this.ended = false;
+          this.lowWatermark = 24000;   // 1 second at 24 kHz
+          this.highWatermark = 48000;  // 2 seconds at 24 kHz
+          this.fadeSamples = 240;      // 10 ms click guard
+          this.fadeInRemaining = 0;
+          this.fadeOutRemaining = 0;
           this.port.onmessage = (event) => {
             const data = event.data || {};
             if (data.type === "clear") {
@@ -881,10 +886,26 @@
               this.offset = 0;
               this.bufferedSamples = 0;
               this.playing = false;
+              this.ended = false;
+              this.fadeInRemaining = 0;
+              this.fadeOutRemaining = 0;
               return;
             }
             if (data.type === "flush") {
-              if (this.bufferedSamples > 0) this.playing = true;
+              // A completed short reply may never reach the 2 second high-water
+              // mark. Once the backend closes the response, drain it immediately.
+              this.ended = true;
+              if (this.fadeOutRemaining > 0) {
+                this.fadeInRemaining = Math.min(
+                  this.fadeSamples - this.fadeOutRemaining,
+                  this.bufferedSamples,
+                );
+                this.fadeOutRemaining = 0;
+              }
+              if (this.bufferedSamples > 0 && !this.playing) {
+                this.playing = true;
+                this.fadeInRemaining = Math.min(this.fadeSamples, this.bufferedSamples);
+              }
               return;
             }
             if (data.pcm instanceof ArrayBuffer) {
@@ -897,36 +918,76 @@
           };
         }
 
+        readSample() {
+          while (this.queue.length) {
+            const chunk = this.queue[0];
+            if (this.offset < chunk.length) {
+              const sample = chunk[this.offset++];
+              this.bufferedSamples -= 1;
+              if (this.offset >= chunk.length) {
+                this.queue.shift();
+                this.offset = 0;
+              }
+              return sample;
+            }
+            this.queue.shift();
+            this.offset = 0;
+          }
+          this.bufferedSamples = 0;
+          return null;
+        }
+
         process(_inputs, outputs) {
           const output = outputs[0]?.[0];
           if (!output) return true;
           output.fill(0);
 
           if (!this.playing) {
-            if (this.bufferedSamples < this.startThreshold) return true;
+            const canDrainFinishedReply = this.ended && this.bufferedSamples > 0;
+            if (!canDrainFinishedReply && this.bufferedSamples < this.highWatermark) return true;
             this.playing = true;
+            this.fadeOutRemaining = 0;
+            this.fadeInRemaining = Math.min(this.fadeSamples, this.bufferedSamples);
           }
 
-          let written = 0;
-          while (written < output.length && this.queue.length) {
-            const chunk = this.queue[0];
-            const available = chunk.length - this.offset;
-            const count = Math.min(output.length - written, available);
-            for (let i = 0; i < count; i += 1) {
-              output[written + i] = chunk[this.offset + i] / 32768;
+          // During a live response, do not run the queue close to empty. If jitter
+          // consumes the safety margin, fade out and wait until two seconds have
+          // accumulated again. The flush signal disables this rule for the finished tail.
+          if (!this.ended && this.fadeOutRemaining === 0 && this.bufferedSamples <= this.lowWatermark) {
+            this.fadeOutRemaining = Math.min(this.fadeSamples, this.bufferedSamples);
+            this.fadeInRemaining = 0;
+          }
+
+          for (let i = 0; i < output.length; i += 1) {
+            if (!this.playing) break;
+            const sample = this.readSample();
+            if (sample === null) {
+              this.playing = false;
+              break;
             }
-            written += count;
-            this.offset += count;
-            this.bufferedSamples -= count;
-            if (this.offset >= chunk.length) {
-              this.queue.shift();
-              this.offset = 0;
+
+            let gain = 1;
+            if (this.fadeOutRemaining > 0) {
+              gain = this.fadeOutRemaining / this.fadeSamples;
+              this.fadeOutRemaining -= 1;
+            } else if (this.fadeInRemaining > 0) {
+              gain = 1 - (this.fadeInRemaining / this.fadeSamples);
+              this.fadeInRemaining -= 1;
+            }
+            output[i] = (sample / 32768) * gain;
+
+            if (this.fadeOutRemaining === 0 && !this.ended && this.bufferedSamples <= this.lowWatermark) {
+              this.playing = false;
+              break;
             }
           }
 
           if (this.bufferedSamples <= 0) {
             this.bufferedSamples = 0;
             this.playing = false;
+            this.ended = false;
+            this.fadeInRemaining = 0;
+            this.fadeOutRemaining = 0;
           }
           return true;
         }

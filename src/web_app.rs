@@ -1860,7 +1860,7 @@ fn attachment_view(
 fn trim_replay_silence(samples: &[i16]) -> Vec<i16> {
     const FRAME: usize = 240; // 10 ms at 24 kHz
     const THRESHOLD_RMS: f64 = 32.0;
-    const PAD_FRAMES: usize = 20; // keep 200 ms around speech
+    const PAD_FRAMES: usize = 6; // keep only 60 ms around speech
 
     if samples.len() <= FRAME {
         return samples.to_vec();
@@ -2907,10 +2907,25 @@ mod tests {
         samples.extend(std::iter::repeat_n(1_i16, 24_000));
         let trimmed = trim_replay_silence(&samples);
         assert!(trimmed.len() >= 24_000);
-        assert!(trimmed.len() <= 24_000 + 24_000 / 2);
+        assert!(trimmed.len() <= 24_000 + 2 * 6 * 240);
         assert!(trimmed.iter().any(|sample| *sample == 3_000));
         assert!(trimmed.first().is_some_and(|sample| sample.abs() <= 1));
         assert!(trimmed.last().is_some_and(|sample| sample.abs() <= 1));
+    }
+
+    #[test]
+    fn assistant_replay_trim_preserves_natural_internal_pauses() {
+        let mut samples = vec![1_i16; 24_000];
+        samples.extend(std::iter::repeat_n(3_000_i16, 12_000));
+        samples.extend(std::iter::repeat_n(0_i16, 12_000));
+        samples.extend(std::iter::repeat_n(3_000_i16, 12_000));
+        samples.extend(std::iter::repeat_n(1_i16, 24_000));
+        let trimmed = trim_replay_silence(&samples);
+        assert!(
+            trimmed
+                .windows(12_000)
+                .any(|window| window.iter().all(|sample| *sample == 0))
+        );
     }
 
     #[test]

@@ -18,7 +18,7 @@ The browser is an interaction and rendering surface. Rust owns credentials, inde
 - Screenshot upload lifecycle states: preparing, uploading, uploaded, and failed.
 - Incremental keyed message rendering: streaming snapshots update only the affected card and preserve audio controls, selection, scroll context, and microphone state.
 - Message start and end clocks, elapsed time, token totals, estimated-token marking, and completed assistant tokens per second.
-- Replayable and downloadable WAV cards for uploaded audio and recorded user/assistant PCM, plus Realtime audio-alias de-duplication and a continuous 24 kHz playback AudioWorklet with a small jitter buffer.
+- Replayable and downloadable WAV cards for uploaded audio and recorded user/assistant PCM, plus Realtime audio-alias de-duplication and a continuous 24 kHz playback AudioWorklet with a 1s/2s low/high-watermark jitter buffer; playback-only silence is never written into replay WAVs.
 - A compact resizable bottom workspace with one shared editor surface for Chat and Markdown/text files, shared attachment/voice controls, autosave, and Ctrl/Cmd+Enter current-line sending from notes.
 - Codex account rate limits, reset times, credit state, and token-usage snapshots in Settings.
 - Generated-image previews and local computer-tool progress/results.
